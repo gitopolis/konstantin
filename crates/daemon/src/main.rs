@@ -1,17 +1,17 @@
 //! `screentimed` — privileged daemon for enforcing daily screen-time limits.
 //!
-//! v1 scope (phase 2):
+//! v1 scope (phases 1–3):
 //!   * load TOML config
 //!   * bind a Unix socket and accept connections
 //!   * authenticate clients via `getpeereid(2)`
 //!   * enumerate console sessions via `utmpx` and increment per-user
 //!     counters every `tick_seconds`, persisting to `state.json`
+//!   * scheduled local-midnight reset task (recomputes the boundary
+//!     after every reset to stay correct across DST transitions)
 //!   * answer `GetStatus` with real used / remaining seconds and a
 //!     resolved `SessionState`
 //!
 //! Out of scope until later phases:
-//!   * scheduled midnight reset task (phase 3 — for now the tick path
-//!     resets opportunistically when it notices the date has changed)
 //!   * forced logout via `launchctl bootout` (phase 5)
 //!   * `Subscribe` push channel (phase 4 — returns Error for now)
 
@@ -19,6 +19,7 @@ mod config;
 mod ipc;
 mod sessions;
 mod state;
+mod time;
 
 use anyhow::{Context, Result};
 use std::path::PathBuf;
@@ -74,6 +75,12 @@ async fn main() -> Result<()> {
         run_ticker(ticker_cfg, ticker_state).await;
     });
 
+    let resetter_state = state.clone();
+    let resetter_cfg = cfg.clone();
+    tokio::spawn(async move {
+        run_midnight_resetter(resetter_cfg, resetter_state).await;
+    });
+
     let shutdown = async {
         let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
             .expect("install SIGTERM handler");
@@ -93,6 +100,39 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Sleep until the next local midnight, fire the day rollover, persist,
+/// recompute. Recomputing each iteration (rather than adding 86400 s) is
+/// what keeps us correct across DST.
+async fn run_midnight_resetter(cfg: config::Config, state: Arc<Mutex<state::State>>) {
+    loop {
+        let now = chrono::Local::now();
+        let target = time::next_local_midnight();
+        let wait = (target - now).to_std().unwrap_or(Duration::from_secs(60));
+        tracing::info!(
+            target = %target.format("%Y-%m-%d %H:%M:%S %z"),
+            wait_s = wait.as_secs(),
+            "midnight resetter sleeping"
+        );
+        tokio::time::sleep(wait).await;
+
+        let today = chrono::Local::now().date_naive();
+        let snapshot = {
+            let mut s = state.lock().expect("state mutex");
+            if s.reset_if_new_day(today) {
+                info!(%today, "counters reset (midnight task)");
+            } else {
+                // Shouldn't happen in practice; the ticker may have already
+                // rolled the day over. Either way, no-op is correct.
+                tracing::debug!(%today, "midnight task: state was already on today");
+            }
+            s.clone()
+        };
+        if let Err(e) = snapshot.save_atomic(&cfg.state_path) {
+            warn!(error = %e, "state save failed (midnight task)");
+        }
+    }
 }
 
 /// Periodically: enumerate console sessions, advance counters, persist.

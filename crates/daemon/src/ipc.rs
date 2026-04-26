@@ -7,8 +7,8 @@
 
 use crate::config::Config;
 use crate::state::State;
+use crate::time::next_local_midnight;
 use anyhow::{Context, Result};
-use chrono::{Duration, Local, TimeZone};
 use nix::unistd::User;
 use screentime_proto::{
     read_frame, write_frame, Request, Response, SessionState, UserStatus,
@@ -173,15 +173,6 @@ fn compute_status(username: &str, uid: u32, cfg: &Config, state: &Mutex<State>) 
         remaining_seconds: daily_limit_seconds as i64 - used as i64,
         resets_at: next_local_midnight(),
     }
-}
-
-fn next_local_midnight() -> chrono::DateTime<Local> {
-    let now = Local::now();
-    let tomorrow = (now + Duration::days(1)).date_naive();
-    Local
-        .from_local_datetime(&tomorrow.and_hms_opt(0, 0, 0).unwrap())
-        .single()
-        .unwrap_or(now)
 }
 
 /// macOS / BSD: peer credentials via `getpeereid(2)`. Returns `(uid, gid)`.
