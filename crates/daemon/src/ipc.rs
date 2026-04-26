@@ -6,6 +6,7 @@
 //! queries; not implemented yet.)
 
 use crate::config::Config;
+use crate::state::State;
 use anyhow::{Context, Result};
 use chrono::{Duration, Local, TimeZone};
 use nix::unistd::User;
@@ -14,18 +15,19 @@ use screentime_proto::{
 };
 use std::os::fd::AsRawFd;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tokio::net::{UnixListener, UnixStream};
 use tracing::{debug, info, warn};
 
 pub struct Server {
     cfg: Arc<Config>,
+    state: Arc<Mutex<State>>,
     listener: UnixListener,
     socket_path: PathBuf,
 }
 
 impl Server {
-    pub async fn bind(cfg: Config) -> Result<Self> {
+    pub async fn bind(cfg: Config, state: Arc<Mutex<State>>) -> Result<Self> {
         let socket_path = cfg.socket_path.clone();
 
         // Make sure the parent directory exists (e.g. /var/run on macOS does,
@@ -57,6 +59,7 @@ impl Server {
 
         Ok(Self {
             cfg: Arc::new(cfg),
+            state,
             listener,
             socket_path,
         })
@@ -72,8 +75,9 @@ impl Server {
                 }
             };
             let cfg = self.cfg.clone();
+            let state = self.state.clone();
             tokio::spawn(async move {
-                if let Err(e) = handle_connection(stream, cfg).await {
+                if let Err(e) = handle_connection(stream, cfg, state).await {
                     debug!(error = %e, "connection ended");
                 }
             });
@@ -87,7 +91,11 @@ impl Drop for Server {
     }
 }
 
-async fn handle_connection(mut stream: UnixStream, cfg: Arc<Config>) -> Result<()> {
+async fn handle_connection(
+    mut stream: UnixStream,
+    cfg: Arc<Config>,
+    state: Arc<Mutex<State>>,
+) -> Result<()> {
     let (uid, gid) = peer_creds(&stream).context("reading peer credentials")?;
     let username = User::from_uid(nix::unistd::Uid::from_raw(uid))
         .ok()
@@ -112,14 +120,20 @@ async fn handle_connection(mut stream: UnixStream, cfg: Arc<Config>) -> Result<(
             }
         };
 
-        let resp = handle_request(req, &username, uid, &cfg);
+        let resp = handle_request(req, &username, uid, &cfg, &state);
         write_frame(&mut stream, &resp).await?;
     }
 }
 
-fn handle_request(req: Request, username: &str, uid: u32, cfg: &Config) -> Response {
+fn handle_request(
+    req: Request,
+    username: &str,
+    uid: u32,
+    cfg: &Config,
+    state: &Mutex<State>,
+) -> Response {
     match req {
-        Request::GetStatus => Response::Status(stub_status(username, uid, cfg)),
+        Request::GetStatus => Response::Status(compute_status(username, uid, cfg, state)),
         Request::Subscribe => Response::Error {
             message: "subscribe not implemented yet (v1 scaffold)".into(),
         },
@@ -127,24 +141,37 @@ fn handle_request(req: Request, username: &str, uid: u32, cfg: &Config) -> Respo
     }
 }
 
-/// v1 stub: pretend the user has used 0 seconds today.
-fn stub_status(username: &str, uid: u32, cfg: &Config) -> UserStatus {
-    let user_cfg = cfg.user_by_name(username);
-    let (state, daily_limit_seconds) = match user_cfg {
-        Some(u) => (SessionState::Active, u.daily_limit_minutes * 60),
-        None => (SessionState::NotConfigured, 0),
+/// Build a `UserStatus` for the calling peer from current counters + the
+/// last tick's enumeration of console sessions.
+fn compute_status(username: &str, uid: u32, cfg: &Config, state: &Mutex<State>) -> UserStatus {
+    let (used, active) = {
+        let s = state.lock().expect("state mutex poisoned");
+        (s.used(username), s.is_active(username))
     };
-    let used = 0u32;
-    let resets_at = next_local_midnight();
+
+    let (session_state, daily_limit_seconds) = match cfg.user_by_name(username) {
+        None => (SessionState::NotConfigured, 0u32),
+        Some(u) => {
+            let limit = u.daily_limit_minutes.saturating_mul(60);
+            let st = if used >= limit {
+                SessionState::LimitReached
+            } else if active {
+                SessionState::Active
+            } else {
+                SessionState::Offline
+            };
+            (st, limit)
+        }
+    };
 
     UserStatus {
         uid,
         username: username.to_string(),
-        state,
+        state: session_state,
         daily_limit_seconds,
         used_seconds: used,
         remaining_seconds: daily_limit_seconds as i64 - used as i64,
-        resets_at,
+        resets_at: next_local_midnight(),
     }
 }
 
