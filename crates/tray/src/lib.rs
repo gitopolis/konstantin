@@ -3,7 +3,7 @@
 
 use anyhow::{Context, Result};
 use screentime_proto::{
-    read_frame, write_frame, Request, Response, UserStatus, DEFAULT_SOCKET_PATH,
+    read_frame, write_frame, FrameError, Request, Response, UserStatus, DEFAULT_SOCKET_PATH,
 };
 use std::path::{Path, PathBuf};
 use tokio::net::UnixStream;
@@ -29,6 +29,46 @@ pub async fn fetch_status(socket: &Path) -> Result<UserStatus> {
         Response::Status(s) => Ok(s),
         Response::Error { message } => anyhow::bail!("daemon error: {message}"),
         other => anyhow::bail!("unexpected response: {other:?}"),
+    }
+}
+
+/// A live subscription to the daemon's `StatusUpdate` push stream.
+///
+/// Built by [`Subscription::open`], drained by repeatedly calling
+/// [`Subscription::next_update`]. The daemon pushes one frame on subscribe,
+/// then one per tick (default every 5 s) and on midnight rollover. The
+/// stream ends when the daemon closes the connection (returns
+/// `Ok(None)`) or on a transport error.
+pub struct Subscription {
+    stream: UnixStream,
+}
+
+impl Subscription {
+    /// Open a connection to `socket` and send `Request::Subscribe`. Does
+    /// not wait for the first push — call `next_update` for that.
+    pub async fn open(socket: &Path) -> Result<Self> {
+        let mut stream = UnixStream::connect(socket)
+            .await
+            .with_context(|| format!("connecting to {}", socket.display()))?;
+        write_frame(&mut stream, &Request::Subscribe)
+            .await
+            .context("sending Subscribe")?;
+        Ok(Self { stream })
+    }
+
+    /// Read the next pushed `UserStatus`. `Ok(None)` means the daemon
+    /// closed the connection cleanly.
+    pub async fn next_update(&mut self) -> Result<Option<UserStatus>> {
+        let resp: Response = match read_frame(&mut self.stream).await {
+            Ok(r) => r,
+            Err(FrameError::Closed) => return Ok(None),
+            Err(e) => return Err(e).context("reading subscribe frame"),
+        };
+        match resp {
+            Response::StatusUpdate(s) => Ok(Some(s)),
+            Response::Error { message } => anyhow::bail!("daemon error: {message}"),
+            other => anyhow::bail!("unexpected response on subscribe stream: {other:?}"),
+        }
     }
 }
 

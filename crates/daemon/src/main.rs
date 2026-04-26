@@ -25,8 +25,15 @@ use anyhow::{Context, Result};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use tokio::sync::broadcast;
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
+
+/// Buffer depth for the tick → subscribers broadcast. One entry per tick is
+/// generous: a subscriber that lags more than this gets a `Lagged` event
+/// (handled by sending a fresh snapshot). 64 covers > 5 min at the default
+/// 5 s tick.
+const TICK_BROADCAST_CAPACITY: usize = 64;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -65,20 +72,28 @@ async fn main() -> Result<()> {
         s.active_now = initial;
     }
 
-    let server = ipc::Server::bind(cfg.clone(), state.clone())
+    // Wakeup channel: ticker + midnight resetter publish, every Subscribe
+    // connection holds a Receiver. The initial Receiver here is dropped
+    // immediately — `Sender::subscribe` on the server side mints fresh
+    // ones per connection.
+    let (tick_tx, _) = broadcast::channel::<()>(TICK_BROADCAST_CAPACITY);
+
+    let server = ipc::Server::bind(cfg.clone(), state.clone(), tick_tx.clone())
         .await
         .context("binding IPC socket")?;
 
     let ticker_state = state.clone();
     let ticker_cfg = cfg.clone();
+    let ticker_tx = tick_tx.clone();
     tokio::spawn(async move {
-        run_ticker(ticker_cfg, ticker_state).await;
+        run_ticker(ticker_cfg, ticker_state, ticker_tx).await;
     });
 
     let resetter_state = state.clone();
     let resetter_cfg = cfg.clone();
+    let resetter_tx = tick_tx.clone();
     tokio::spawn(async move {
-        run_midnight_resetter(resetter_cfg, resetter_state).await;
+        run_midnight_resetter(resetter_cfg, resetter_state, resetter_tx).await;
     });
 
     let shutdown = async {
@@ -105,12 +120,16 @@ async fn main() -> Result<()> {
 /// Sleep until the next local midnight, fire the day rollover, persist,
 /// recompute. Recomputing each iteration (rather than adding 86400 s) is
 /// what keeps us correct across DST.
-async fn run_midnight_resetter(cfg: config::Config, state: Arc<Mutex<state::State>>) {
+async fn run_midnight_resetter(
+    cfg: config::Config,
+    state: Arc<Mutex<state::State>>,
+    tick_tx: broadcast::Sender<()>,
+) {
     loop {
         let now = chrono::Local::now();
         let target = time::next_local_midnight();
         let wait = (target - now).to_std().unwrap_or(Duration::from_secs(60));
-        tracing::info!(
+        info!(
             target = %target.format("%Y-%m-%d %H:%M:%S %z"),
             wait_s = wait.as_secs(),
             "midnight resetter sleeping"
@@ -118,25 +137,34 @@ async fn run_midnight_resetter(cfg: config::Config, state: Arc<Mutex<state::Stat
         tokio::time::sleep(wait).await;
 
         let today = chrono::Local::now().date_naive();
-        let snapshot = {
+        let (rolled, snapshot) = {
             let mut s = state.lock().expect("state mutex");
-            if s.reset_if_new_day(today) {
+            let rolled = s.reset_if_new_day(today);
+            if rolled {
                 info!(%today, "counters reset (midnight task)");
             } else {
-                // Shouldn't happen in practice; the ticker may have already
-                // rolled the day over. Either way, no-op is correct.
                 tracing::debug!(%today, "midnight task: state was already on today");
             }
-            s.clone()
+            (rolled, s.clone())
         };
         if let Err(e) = snapshot.save_atomic(&cfg.state_path) {
             warn!(error = %e, "state save failed (midnight task)");
         }
+        // Push fresh snapshots to live subscribers so the tray sees the
+        // jump from "23h59m used" to "0s used" without waiting a full tick.
+        if rolled {
+            let _ = tick_tx.send(());
+        }
     }
 }
 
-/// Periodically: enumerate console sessions, advance counters, persist.
-async fn run_ticker(cfg: config::Config, state: Arc<Mutex<state::State>>) {
+/// Periodically: enumerate console sessions, advance counters, persist,
+/// then wake any active subscribers.
+async fn run_ticker(
+    cfg: config::Config,
+    state: Arc<Mutex<state::State>>,
+    tick_tx: broadcast::Sender<()>,
+) {
     let period = Duration::from_secs(cfg.tick_seconds as u64);
     let mut iv = tokio::time::interval(period);
     iv.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -161,6 +189,9 @@ async fn run_ticker(cfg: config::Config, state: Arc<Mutex<state::State>>) {
         if let Err(e) = snapshot.save_atomic(&cfg.state_path) {
             warn!(error = %e, "state save failed");
         }
+        // `send` returns Err only when there are no receivers; that's the
+        // common case and not an error.
+        let _ = tick_tx.send(());
     }
 }
 
