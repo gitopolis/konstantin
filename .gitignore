@@ -1,0 +1,14 @@
+/target
+**/*.rs.bk
+Cargo.lock.bak
+
+# Local dev artifacts
+/run/
+/var/
+*.sock
+
+# Editor
+.vscode/
+.idea/
+*.swp
+.DS_Store

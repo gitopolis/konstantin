@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.qnicks.screentime-tray</string>
+
+    <!-- Headless status checker for now. Will be replaced by the menu-bar app
+         binary once the UI is implemented. -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/bin/screentime-status</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <false/>
+
+    <!-- Only load in GUI sessions. Prevents the agent from running in
+         loginwindow/screen-sharing background contexts. -->
+    <key>LimitLoadToSessionType</key>
+    <string>Aqua</string>
+
+    <key>StandardOutPath</key>
+    <string>/tmp/screentime-tray.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/screentime-tray.err.log</string>
+</dict>
+</plist>

@@ -1,0 +1,30 @@
+# Example screentimed config.
+#
+# Install location: /etc/screentimed/config.toml (root-owned, mode 0644).
+# Reload: edit and `sudo launchctl kickstart -k system/com.qnicks.screentimed`.
+
+socket_path  = "/var/run/screentimed.sock"
+state_path   = "/var/db/screentimed/state.json"
+tick_seconds = 5
+
+# Notify the user at these many minutes remaining (handled by the tray).
+warn_thresholds_minutes = [15, 5, 1]
+
+# What to do with users not listed in [users.*].
+#   "unrestricted" — ignore them (logged but never kicked).
+#   "block"        — kick them on first tick. DO NOT use until you've added
+#                    every account that should be allowed in.
+default_policy = "unrestricted"
+
+# Master safety switch.
+#   "log"    — log "would have kicked" but never actually log anyone out.
+#              KEEP THIS while bringing the daemon up for the first time.
+#   "logout" — actually invoke `launchctl bootout` when limits hit.
+enforcement = "log"
+
+# Test users (create them first — see packaging/install.sh).
+[users.alice]
+daily_limit_minutes = 30
+
+[users.bob]
+daily_limit_minutes = 60

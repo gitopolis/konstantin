@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.qnicks.screentimed</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/libexec/screentimed</string>
+    </array>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>SCREENTIMED_CONFIG</key>
+        <string>/etc/screentimed/config.toml</string>
+        <key>SCREENTIMED_LOG</key>
+        <string>info,screentimed=debug</string>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+
+    <key>StandardOutPath</key>
+    <string>/var/log/screentimed.log</string>
+    <key>StandardErrorPath</key>
+    <string>/var/log/screentimed.log</string>
+
+    <!-- Daemon runs as root so it can call `launchctl bootout user/<uid>`. -->
+    <key>UserName</key>
+    <string>root</string>
+    <key>GroupName</key>
+    <string>wheel</string>
+</dict>
+</plist>
