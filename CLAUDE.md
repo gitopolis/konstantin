@@ -154,7 +154,7 @@ These were Nikita's choices; revisit explicitly before changing them.
     time when it's up. Detection is the worker's `disconnected` flag,
     driven by socket-connect success.
 
-## What's already built (phases 1–7)
+## What's already built (phases 1–7 + A1–A7)
 
 * **Phase 1** — proto + framing + peer-creds auth, `GetStatus` returns
   real status from current state.
@@ -181,28 +181,59 @@ These were Nikita's choices; revisit explicitly before changing them.
   `NotifTracker` decision logic; tracker resets on `resets_at` change,
   fires the smallest applicable threshold only, suppresses
   `LimitReached` (user is being kicked, not warned).
+* **A1** — `packaging/build-app.sh` produces `target/Screentime.app/`
+  from release binaries. `LSUIElement=true`, ad-hoc codesigned.
+* **A2** — first-launch install: socket-probe → optional NSAlert →
+  privileged install via `osascript` on a background thread, with
+  the main thread pumping the run loop and showing a progress panel
+  so the cursor stays normal.
+* **A3** — `admin::run_with_progress` primitive lifted out;
+  reusable shape `Result<(), admin::Error::{Cancelled, Failed}>`.
+  `alerts::confirm` / `alerts::message` siblings.
+* **A4** — `actions::Controller` (NSObject subclass via
+  `define_class!`) routes `startDaemon: / stopDaemon: / restartDaemon:
+  / configure: / openLog: / uninstall:` selectors. Lifecycle commands
+  use `|| true`-tolerant launchctl chains so already-loaded /
+  already-stopped states are idempotent.
+* **A5** — state-driven UI: 🔴 when `disconnected`, formatted time
+  otherwise. Menu items enable/disable from the same flag.
+  `Latest::default()` starts in `disconnected: true` so initial UI is
+  honest.
+* **A6** — `bundle::Paths::resolve()` handles both real `.app` bundles
+  and dev-tree (`target/<profile>/` + `packaging/`). Source labelled
+  in startup log. User LaunchAgent rewrite is bundle-only — running
+  `target/release/screentime-tray` directly no longer poisons
+  `~/Library/LaunchAgents/` with a dev path.
+* **A7** — `Uninstall…` menu item: confirm → privileged teardown
+  (`launchctl bootout` + `rm` of system files) → user LaunchAgent
+  cleanup → `NSApplication::terminate`. `/etc/screentimed/` and
+  `/var/db/screentimed/` preserved by default.
+  `packaging/screentime.rb` cask formula has matching `uninstall` +
+  `zap` stanzas for non-interactive `brew uninstall --zap`.
 
 Tests: 21 passing at last commit (proto×2, daemon×13, tray×6). Unsafe
 block count: 4 (one selector cast, one `NSTimer` block ABI, two
 `utmpx` FFI walks). Both numbers will drift — they're a "currently
 healthy" marker, not a target.
 
-## What's NOT built yet — the next push
+## What's NOT built yet
 
-One effort: bundle the workspace into a single `Screentime.app` with
-an admin-gated menu. Phase 8 (lock/idle) was dropped — see decision #3.
+The roadmap is **complete**. Phase 8 (lock/idle) was dropped — see
+decision #3.
 
-### A. App bundle + admin-gated menu (the active work)
-
-| Phase | Scope |
-|-------|-------|
-| A1    | Build `Screentime.app/` from `target/release/`. New `packaging/build-app.sh`. `Info.plist` with `LSUIElement=true`, AppIcon.icns. |
-| A2    | First-launch install. Tray detects "no daemon" via socket connect; if it fails AND no system-side plist, prompts for admin and runs install via `osascript`. Drops the per-user LaunchAgent into `~/Library/LaunchAgents/` (no auth). |
-| A3    | `run_as_root` primitive in the tray crate (`osascript`-backed). Returns `Cancelled` / `Failed` / `Ok`; surfaces alerts on failure. |
-| A4    | Menu items: Start / Stop / Restart wrap `launchctl bootstrap` / `bootout` / `kickstart -k system/com.qnicks.screentimed`. Configure: copy `/etc/screentimed/config.toml` to `$TMPDIR`, `open -t`, FSEvents-watch for save, then `run_as_root` cp + kickstart. Open Log: `open /var/log/screentimed.log`. |
-| A5    | State-driven UI: 🔴 when `disconnected`, time string otherwise. Menu items enable/disable based on the same flag. |
-| A6    | Bundle-aware paths. Daemon, plist, config-example resolved relative to `Contents/Resources/`. |
-| A7    | Uninstall flow. `Uninstall…` menu item runs `run_as_root` against the equivalent of `uninstall.sh`. Cask `zap` block for non-interactive `brew uninstall --zap`. |
+Open items that aren't on the roadmap but are worth doing before any
+wider distribution:
+* **Live-fire verification of `enforcement = "logout"`** against
+  `alice` / `bob`. The decision logic is unit-tested but the actual
+  `launchctl bootout user/<uid>` invocation has never run against a
+  real test account.
+* **Developer ID + notarization** so the `.app` bundle can ship signed,
+  and so we can move to `SMAppService` and `UNUserNotificationCenter`.
+* **Real `AppIcon.iconset/`** in `packaging/`. Currently the bundle
+  ships with macOS's generic application icon.
+* **Homebrew tap repo** (`github.com/qnicks/homebrew-screentime`) hosting
+  the cask formula at `packaging/screentime.rb`. Plus a release pipeline
+  that builds, zips, and pushes `Screentime-<version>.zip` artifacts.
 
 ## Hard safety rules
 

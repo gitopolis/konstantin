@@ -201,6 +201,12 @@ mod imp {
 
         menu.addItem(&NSMenuItem::separatorItem(mtm));
 
+        let uninstall = make_action_item(mtm, "Uninstall…", sel!(uninstall:), controller);
+        uninstall.setEnabled(true);
+        menu.addItem(&uninstall);
+
+        menu.addItem(&NSMenuItem::separatorItem(mtm));
+
         let quit = NSMenuItem::new(mtm);
         quit.setTitle(&NSString::from_str("Quit"));
         quit.setKeyEquivalent(&NSString::from_str("q"));
@@ -553,6 +559,12 @@ mod imp {
                 fn open_log_action(&self, _sender: Option<&AnyObject>) {
                     open_log();
                 }
+
+                #[unsafe(method(uninstall:))]
+                fn uninstall_action(&self, _sender: Option<&AnyObject>) {
+                    let mtm = MainThreadMarker::from(self);
+                    uninstall_flow(mtm);
+                }
             }
         );
 
@@ -673,6 +685,83 @@ mod imp {
             let _ = std::process::Command::new("/usr/bin/open")
                 .arg("/var/log/screentimed.log")
                 .status();
+        }
+
+        /// Uninstall flow:
+        ///   1. Confirm with the user (destructive).
+        ///   2. Run the privileged teardown via `admin::run_with_progress`
+        ///      — bootout the daemon, remove its plist + binaries +
+        ///      socket. Mirrors `packaging/uninstall.sh`.
+        ///   3. Remove the per-user LaunchAgent plist (no auth — it's
+        ///      in our home directory).
+        ///   4. Tell the user, then terminate.
+        ///
+        /// `/etc/screentimed/` (config) and `/var/db/screentimed/`
+        /// (counter state) are intentionally preserved so a reinstall
+        /// resumes where the user left off. The Homebrew cask's `zap`
+        /// block at `packaging/screentime.rb` removes those for users
+        /// who want a clean wipe.
+        fn uninstall_flow(mtm: MainThreadMarker) {
+            if !alerts::confirm(
+                mtm,
+                "Uninstall Screentime?",
+                "Stops the background service and removes its files.\n\n\
+                 Your configuration (/etc/screentimed/) and counter state \
+                 (/var/db/screentimed/) will be preserved so a reinstall \
+                 picks up where you left off. To remove those too, run \
+                 `brew uninstall --zap screentime` after this finishes, \
+                 or delete them by hand.",
+                "Uninstall",
+                "Cancel",
+            ) {
+                return;
+            }
+
+            // Single-line bash; `;` separators so a missing file in
+            // one `rm -f` doesn't short-circuit the rest. The `bootout`
+            // is `|| true` because it errors if the daemon isn't
+            // loaded — also fine.
+            let script = "\
+                launchctl bootout system/com.qnicks.screentimed 2>/dev/null || true; \
+                rm -f /Library/LaunchDaemons/com.qnicks.screentimed.plist; \
+                rm -f /Library/LaunchAgents/com.qnicks.screentime-tray.plist; \
+                rm -f /usr/local/libexec/screentimed; \
+                rm -f /usr/local/bin/screentime-status; \
+                rm -f /usr/local/bin/screentime-tray; \
+                rm -f /var/run/screentimed.sock";
+
+            match admin::run_with_progress(
+                mtm,
+                "Uninstalling Screentime",
+                "Stopping the background service and removing files…",
+                script,
+            ) {
+                Ok(()) => {}
+                Err(admin::Error::Cancelled) => return,
+                Err(admin::Error::Failed(msg)) => {
+                    alerts::message(mtm, "Couldn't uninstall Screentime.", &msg);
+                    return;
+                }
+            }
+
+            // User-side cleanup. We don't bootout the LaunchAgent —
+            // we *are* it (or, for first-launch flows, we soon will be).
+            // Removing the plist prevents next-login auto-start; this
+            // process exits via `terminate` below.
+            if let Ok(home) = std::env::var("HOME") {
+                let plist = std::path::PathBuf::from(home)
+                    .join("Library/LaunchAgents/com.qnicks.screentime-tray.plist");
+                let _ = std::fs::remove_file(&plist);
+            }
+
+            alerts::message(
+                mtm,
+                "Screentime has been uninstalled.",
+                "The app will now quit. Move Screentime.app to the Trash \
+                 to finish removing the application bundle.",
+            );
+
+            NSApplication::sharedApplication(mtm).terminate(None);
         }
     }
 
