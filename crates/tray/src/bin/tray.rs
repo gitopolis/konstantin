@@ -80,7 +80,11 @@ mod imp {
         // Accessory: menu-bar item only — no Dock icon, no main menu.
         app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
 
-        let status_item = build_status_item(mtm);
+        // Controller owns the target/action handlers for menu items.
+        // Bound here so it lives until `app.run()` returns (process
+        // exit). Menu items hold a weak reference per Cocoa convention.
+        let controller = actions::Controller::new(mtm);
+        let status_item = build_status_item(mtm, &controller);
         let latest = Arc::new(Mutex::new(Latest::default()));
 
         // Initial title before any update arrives.
@@ -112,11 +116,33 @@ mod imp {
         Ok(())
     }
 
-    fn build_status_item(mtm: MainThreadMarker) -> Retained<NSStatusItem> {
+    fn build_status_item(
+        mtm: MainThreadMarker,
+        controller: &actions::Controller,
+    ) -> Retained<NSStatusItem> {
         let bar = NSStatusBar::systemStatusBar();
         let item = bar.statusItemWithLength(NSVariableStatusItemLength);
 
         let menu = NSMenu::new(mtm);
+
+        // Daemon lifecycle. A5 will toggle enabled state based on
+        // whether the daemon is reachable; for now they're always on.
+        add_action_item(mtm, &menu, "Start Daemon", sel!(startDaemon:), controller);
+        add_action_item(mtm, &menu, "Stop Daemon", sel!(stopDaemon:), controller);
+        add_action_item(
+            mtm,
+            &menu,
+            "Restart Daemon",
+            sel!(restartDaemon:),
+            controller,
+        );
+
+        menu.addItem(&NSMenuItem::separatorItem(mtm));
+
+        add_action_item(mtm, &menu, "Configure…", sel!(configure:), controller);
+        add_action_item(mtm, &menu, "Open Log", sel!(openLog:), controller);
+
+        menu.addItem(&NSMenuItem::separatorItem(mtm));
 
         let quit = NSMenuItem::new(mtm);
         quit.setTitle(&NSString::from_str("Quit"));
@@ -127,9 +153,30 @@ mod imp {
         // which is on the responder chain for menu actions.
         unsafe { quit.setAction(Some(sel!(terminate:))) };
         menu.addItem(&quit);
-        item.setMenu(Some(&menu));
 
+        item.setMenu(Some(&menu));
         item
+    }
+
+    /// Build a menu item wired to a selector on `controller`.
+    fn add_action_item(
+        mtm: MainThreadMarker,
+        menu: &NSMenu,
+        title: &str,
+        action: objc2::runtime::Sel,
+        controller: &actions::Controller,
+    ) {
+        let item = NSMenuItem::new(mtm);
+        item.setTitle(&NSString::from_str(title));
+        // SAFETY: same as `setAction` above. Both selectors here are
+        // declared on `Controller` via `define_class!`, and we set the
+        // target to a controller of that class — the dispatch is
+        // type-correct at runtime.
+        unsafe {
+            item.setAction(Some(action));
+            item.setTarget(Some(controller));
+        }
+        menu.addItem(&item);
     }
 
     fn spawn_subscriber(latest: Arc<Mutex<Latest>>) {
@@ -250,6 +297,212 @@ mod imp {
             .with_env_filter(filter)
             .with_target(true)
             .init();
+    }
+
+    /// Custom `NSObject` subclass that owns the menu-item action
+    /// handlers. Cocoa target/action menu callbacks need a real Obj-C
+    /// class to receive them, so we declare one with `define_class!`
+    /// and route each selector to a Rust function.
+    ///
+    /// All action methods run on the main thread (Cocoa guarantees
+    /// this for menu actions), so we can derive a `MainThreadMarker`
+    /// inside each handler.
+    mod actions {
+        use super::*;
+        use objc2::define_class;
+        use objc2::rc::Retained;
+        use objc2::runtime::{AnyObject, NSObject};
+        use objc2::MainThreadOnly;
+
+        define_class!(
+            #[unsafe(super(NSObject))]
+            #[thread_kind = MainThreadOnly]
+            #[name = "ScreentimeTrayController"]
+            pub struct Controller;
+
+            impl Controller {
+                #[unsafe(method(startDaemon:))]
+                fn start_daemon_action(&self, _sender: Option<&AnyObject>) {
+                    let mtm = MainThreadMarker::from(self);
+                    // Idempotent. `bootstrap` fails ("I/O error: 5") if
+                    // already loaded; that's fine, we just need it
+                    // loaded somehow. `enable` fails if already
+                    // enabled, also fine. `kickstart` (no `-k`) is the
+                    // authoritative step — it brings the service up if
+                    // it isn't already, no-ops if it is.
+                    run_admin(
+                        mtm,
+                        "Starting Daemon",
+                        "Starting Screentime…",
+                        "(launchctl bootstrap system /Library/LaunchDaemons/com.qnicks.screentimed.plist || true) && \
+                         (launchctl enable system/com.qnicks.screentimed || true) && \
+                         launchctl kickstart system/com.qnicks.screentimed",
+                        "Couldn't start Screentime.",
+                    );
+                }
+
+                #[unsafe(method(stopDaemon:))]
+                fn stop_daemon_action(&self, _sender: Option<&AnyObject>) {
+                    let mtm = MainThreadMarker::from(self);
+                    // `|| true` so "Stop" is silent when the service
+                    // wasn't loaded to begin with. The user's intent
+                    // ("not running") is already satisfied.
+                    run_admin(
+                        mtm,
+                        "Stopping Daemon",
+                        "Stopping Screentime…",
+                        "launchctl bootout system/com.qnicks.screentimed || true",
+                        "Couldn't stop Screentime.",
+                    );
+                }
+
+                #[unsafe(method(restartDaemon:))]
+                fn restart_daemon_action(&self, _sender: Option<&AnyObject>) {
+                    let mtm = MainThreadMarker::from(self);
+                    // Cover both "loaded" and "not loaded" entry states.
+                    // `bootstrap || true` makes the loaded-already case
+                    // silent. `kickstart -k` then restarts unconditionally.
+                    run_admin(
+                        mtm,
+                        "Restarting Daemon",
+                        "Restarting Screentime…",
+                        "(launchctl bootstrap system /Library/LaunchDaemons/com.qnicks.screentimed.plist || true) && \
+                         launchctl kickstart -k system/com.qnicks.screentimed",
+                        "Couldn't restart Screentime.",
+                    );
+                }
+
+                #[unsafe(method(configure:))]
+                fn configure_action(&self, _sender: Option<&AnyObject>) {
+                    let mtm = MainThreadMarker::from(self);
+                    configure_flow(mtm);
+                }
+
+                #[unsafe(method(openLog:))]
+                fn open_log_action(&self, _sender: Option<&AnyObject>) {
+                    open_log();
+                }
+            }
+        );
+
+        impl Controller {
+            pub fn new(mtm: MainThreadMarker) -> Retained<Self> {
+                let alloc = Self::alloc(mtm);
+                unsafe { objc2::msg_send![alloc, init] }
+            }
+        }
+
+        /// Common shape for "run privileged command, alert on failure".
+        fn run_admin(
+            mtm: MainThreadMarker,
+            panel_title: &str,
+            panel_message: &str,
+            bash_command: &str,
+            failure_title: &str,
+        ) {
+            match admin::run_with_progress(mtm, panel_title, panel_message, bash_command) {
+                Ok(()) => {}
+                Err(admin::Error::Cancelled) => {}
+                Err(admin::Error::Failed(msg)) => {
+                    alerts::message(mtm, failure_title, &msg);
+                }
+            }
+        }
+
+        /// Configure flow: copy config to a temp file, open in default
+        /// text editor, then alert "Apply / Discard". Apply commits via
+        /// admin and kickstarts the daemon. Temp file is always cleaned
+        /// up.
+        fn configure_flow(mtm: MainThreadMarker) {
+            const SYSTEM_CONFIG: &str = "/etc/screentimed/config.toml";
+
+            if !std::path::Path::new(SYSTEM_CONFIG).exists() {
+                alerts::message(
+                    mtm,
+                    "No configuration found.",
+                    "Set up Screentime first to create the configuration file.",
+                );
+                return;
+            }
+
+            let tmpdir = std::env::var("TMPDIR")
+                .unwrap_or_else(|_| "/tmp/".to_string());
+            let temp = format!(
+                "{tmpdir}screentime-config-{}.toml",
+                std::process::id()
+            );
+
+            if let Err(e) = std::fs::copy(SYSTEM_CONFIG, &temp) {
+                alerts::message(mtm, "Couldn't read configuration.", &e.to_string());
+                return;
+            }
+
+            // Open the temp file in the user's default text editor.
+            // `open -t` picks the editor associated with .txt by
+            // default (TextEdit unless overridden), independent of
+            // .toml's UTI.
+            if let Err(e) = std::process::Command::new("/usr/bin/open")
+                .arg("-t")
+                .arg(&temp)
+                .status()
+            {
+                let _ = std::fs::remove_file(&temp);
+                alerts::message(mtm, "Couldn't open editor.", &e.to_string());
+                return;
+            }
+
+            // Bring our app to the front so the Apply/Discard alert is
+            // visible above the editor window.
+            NSApplication::sharedApplication(mtm).activate();
+
+            let apply = alerts::confirm(
+                mtm,
+                "Edit Configuration",
+                &format!(
+                    "Edit the configuration in the text editor that just opened, \
+                     save it (⌘S), then click Apply.\n\nTemp file: {temp}"
+                ),
+                "Apply",
+                "Discard",
+            );
+
+            if !apply {
+                let _ = std::fs::remove_file(&temp);
+                return;
+            }
+
+            let script = format!(
+                "install -m 0644 '{temp}' /etc/screentimed/config.toml && \
+                 launchctl kickstart -k system/com.qnicks.screentimed"
+            );
+
+            let outcome = admin::run_with_progress(
+                mtm,
+                "Applying Configuration",
+                "Saving configuration and reloading Screentime…",
+                &script,
+            );
+
+            let _ = std::fs::remove_file(&temp);
+
+            match outcome {
+                Ok(()) => {}
+                Err(admin::Error::Cancelled) => {}
+                Err(admin::Error::Failed(msg)) => {
+                    alerts::message(mtm, "Couldn't apply configuration.", &msg);
+                }
+            }
+        }
+
+        /// `Open Log` — hand the file off to Console.app (the macOS
+        /// default for .log files). No admin needed; the file is
+        /// world-readable by default since the daemon's launchd plist
+        /// uses standard `StandardOutPath` redirection.
+        fn open_log() {
+            let _ = std::process::Command::new("/usr/bin/open")
+                .arg("/var/log/screentimed.log")
+                .status();
+        }
     }
 
     /// Two-button (`primary` / `secondary`) and one-button (`OK`) NSAlert
