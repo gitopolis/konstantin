@@ -8,7 +8,7 @@ state_path   = "/var/db/screentimed/state.json"
 tick_seconds = 5
 
 # Notify the user at these many minutes remaining (handled by the tray).
-warn_thresholds_minutes = [15, 5, 1]
+warn_thresholds_minutes = [10, 2, 1]
 
 # What to do with users not listed in [users.*].
 #   "unrestricted" — ignore them (logged but never kicked).
