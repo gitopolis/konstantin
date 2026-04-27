@@ -42,6 +42,7 @@ mod imp {
     use objc2_app_kit::NSApplicationActivationPolicy;
     use objc2_foundation::{MainThreadMarker, NSString, NSTimer};
     use screentime_proto::{SessionState, UserStatus};
+    use screentime_tray::notifications::{self, NotifTracker};
     use screentime_tray::{default_socket_path, format_remaining, Subscription};
     use std::ptr::NonNull;
     use std::sync::{Arc, Mutex};
@@ -127,6 +128,10 @@ mod imp {
 
     async fn run_subscriber(latest: Arc<Mutex<Latest>>) {
         let socket = default_socket_path();
+        // The tracker is reset on every UserStatus that has a different
+        // `resets_at`, so a daemon restart with the same day's resets_at
+        // doesn't re-fire notifications. Lives across reconnects.
+        let mut notif = NotifTracker::new();
         loop {
             let mut sub = match Subscription::open(&socket).await {
                 Ok(s) => {
@@ -144,6 +149,16 @@ mod imp {
             loop {
                 match sub.next_update().await {
                     Ok(Some(s)) => {
+                        if let Some(minutes) = notif.evaluate(&s) {
+                            tracing::info!(minutes, "firing threshold notification");
+                            // Fire-and-forget; an osascript hiccup must
+                            // not stall the subscribe loop.
+                            tokio::spawn(async move {
+                                if let Err(e) = notifications::show(minutes).await {
+                                    tracing::warn!(error = %e, "notification dispatch failed");
+                                }
+                            });
+                        }
                         latest.lock().expect("latest").pending = Some(s);
                     }
                     Ok(None) => {

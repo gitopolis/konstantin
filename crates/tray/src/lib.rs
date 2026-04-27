@@ -1,5 +1,7 @@
 //! Shared client logic for talking to `screentimed`. The headless `status`
-//! binary and the (forthcoming) `tray` binary both use this.
+//! binary and the menu-bar `tray` binary both use this.
+
+pub mod notifications;
 
 use anyhow::{Context, Result};
 use screentime_proto::{

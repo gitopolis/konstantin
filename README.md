@@ -131,5 +131,5 @@ before changing the enforcement path. In short:
 | 4     | ✅ done     | `Subscribe` push channel for live tray updates |
 | 5     | ✅ done     | forced logout via `launchctl bootout` (gated by `enforcement = "logout"` + kill-switch + backoff) |
 | 6     | ✅ done     | menu-bar UI binary (`screentime-tray`) using `objc2` + `NSStatusItem`, with auto-reconnect |
-| 7     | next        | threshold notifications (15 / 5 / 1 minutes remaining) |
-| 8     |             | (v2) per-user lock/idle reporting via the tray, with a 30 s sanity-check fallback |
+| 7     | ✅ done     | threshold notifications (e.g. 15 / 5 / 1 minutes remaining) — config-driven, fires via `osascript` |
+| 8     | next        | (v2) per-user lock/idle reporting via the tray, with a 30 s sanity-check fallback |

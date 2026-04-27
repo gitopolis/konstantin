@@ -242,6 +242,7 @@ fn compute_status(username: &str, uid: u32, cfg: &Config, state: &Mutex<State>) 
         used_seconds: used,
         remaining_seconds: daily_limit_seconds as i64 - used as i64,
         resets_at: next_local_midnight(),
+        warn_thresholds_minutes: cfg.warn_thresholds_minutes.clone(),
     }
 }
 

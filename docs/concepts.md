@@ -22,7 +22,9 @@ enforcement path or adding new wire types.
   `NSApplication` and a 5 Hz `NSTimer` block that drains the latest
   `UserStatus` and writes the title
 * auto-reconnects with a 2 s backoff if the daemon stops
-* phase 7 will add threshold notifications
+* fires threshold notifications via `osascript` when `remaining_seconds`
+  crosses one of `warn_thresholds_minutes` (config-driven, shipped
+  with each `UserStatus`)
 
 All three communicate over a Unix socket at `/var/run/screentimed.sock`
 (mode 0666). Wire types and framing live in the shared
@@ -200,6 +202,28 @@ Each subscriber's `compute_status` reads from the shared
 
 All five paths under `/etc` and `/var` are configurable; see
 [config.md](config.md).
+
+## Threshold notifications
+
+The daemon ships its `warn_thresholds_minutes` (e.g. `[15, 5, 1]`) inside
+every `UserStatus`. The tray runs a small `NotifTracker` that watches
+the stream:
+
+* On day rollover (`resets_at` changes) — re-arm.
+* Only fires while `state == Active`. `LimitReached` is silent (the
+  user is being kicked, not warned).
+* Picks the **smallest** threshold ≥ `remaining_seconds`. So a tray
+  that subscribes late at 100 s remaining with thresholds `[15, 5, 1]`
+  fires only the 5-minute warning, not also 15.
+* Once fired, won't fire again until a strictly smaller threshold is
+  crossed. So 15 → 5 → 1 each fire exactly once per day.
+
+Dispatch shells out to `osascript -e 'display notification "..." with
+title "..."'`. Per CLAUDE.md, this is the pragmatic choice for an
+unsigned bundle: `osascript` itself is signed by Apple, so notifications
+work without TCC consent dialogs and without notarization.
+`UNUserNotificationCenter` via `objc2` is the future path for a polished
+distribution build.
 
 ## What's *not* tampered with
 

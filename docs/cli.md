@@ -154,6 +154,11 @@ No arguments. Show or hide via the menu-bar item; quit via the menu's
 * When the daemon stops the title becomes `screentime: ?` and the worker
   retries `Subscription::open` every 2 s. Reconnect is automatic; no
   user action needed.
+* When `remaining_seconds` crosses one of `warn_thresholds_minutes`
+  (configured daemon-side, shipped with each `UserStatus`), the tray
+  fires a notification via `osascript`. Each threshold fires at most
+  once per day; the smallest applicable threshold wins on first
+  crossing.
 
 ### Logs
 

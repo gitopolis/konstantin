@@ -62,6 +62,13 @@ pub struct UserStatus {
     /// Signed so a value < 0 means "in grace period / over the limit".
     pub remaining_seconds: i64,
     pub resets_at: DateTime<Local>,
+    /// Tray-side notification thresholds in minutes (e.g. `[15, 5, 1]`).
+    /// Populated from the daemon's `warn_thresholds_minutes` config.
+    /// `#[serde(default)]` so older daemons (without the field) still
+    /// deserialize correctly — newer trays just see no thresholds and
+    /// fire no notifications.
+    #[serde(default)]
+    pub warn_thresholds_minutes: Vec<u32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -154,6 +161,7 @@ mod tests {
             used_seconds: 60,
             remaining_seconds: 7140,
             resets_at: Local::now(),
+            warn_thresholds_minutes: vec![15, 5, 1],
         });
         write_frame(&mut a, &resp).await.unwrap();
         let got: Response = read_frame(&mut b).await.unwrap();
