@@ -48,6 +48,19 @@ cargo build --release
 cargo test  --workspace
 ```
 
+To produce a `Screentime.app` bundle (the user-facing distribution
+artifact, ad-hoc codesigned for Apple Silicon):
+
+```sh
+cargo build --release
+./packaging/build-app.sh                     # writes target/Screentime.app/
+open target/Screentime.app                   # launch via Launch Services
+```
+
+The bundle is currently unsigned for distribution (no Developer ID).
+For Homebrew cask distribution that's expected — cask handles the
+quarantine attribute on install.
+
 ## Smoke-test (no install required)
 
 The example config writes to root-owned paths. For a local test, copy it
