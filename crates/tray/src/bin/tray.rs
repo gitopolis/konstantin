@@ -95,6 +95,19 @@ mod imp {
     pub fn main() -> Result<()> {
         install_tracing();
 
+        // Log path-resolution mode early. Useful when a bug report
+        // mentions install paths — at a glance you know whether the
+        // user is running the production .app bundle or somebody's
+        // dev tree.
+        match bundle::Paths::resolve() {
+            Ok(p) => tracing::info!(
+                source = p.source.label(),
+                daemon = %p.daemon_binary.display(),
+                "screentime-tray starting"
+            ),
+            Err(e) => tracing::warn!(error = %e, "could not resolve bundle paths"),
+        }
+
         let mtm = MainThreadMarker::new()
             .expect("screentime-tray must be launched on the main thread");
 
@@ -116,8 +129,21 @@ mod imp {
         // Idempotent: write our per-user LaunchAgent plist so launchd
         // auto-starts the tray on next login. Doesn't bootstrap — we
         // ARE the running tray; bootstrap would race-spawn a sibling.
-        if let Err(e) = install::ensure_user_launchagent() {
-            tracing::warn!(error = %e, "user LaunchAgent setup failed (non-fatal)");
+        //
+        // Skipped when running from a dev tree, since the LaunchAgent
+        // would point at `target/release/screentime-tray`; if that
+        // binary is later cleaned (`cargo clean`) or moved, login
+        // auto-start would silently fail.
+        match bundle::Paths::resolve().map(|p| p.source) {
+            Ok(bundle::Source::Bundle) => {
+                if let Err(e) = install::ensure_user_launchagent() {
+                    tracing::warn!(error = %e, "user LaunchAgent setup failed (non-fatal)");
+                }
+            }
+            Ok(bundle::Source::DevTree) => {
+                tracing::info!("dev-tree run — skipping user LaunchAgent rewrite");
+            }
+            Err(_) => {} // already logged above
         }
 
         // First-launch flow: if we can't reach the daemon AND no system
@@ -347,6 +373,101 @@ mod imp {
             .with_env_filter(filter)
             .with_target(true)
             .init();
+    }
+
+    /// Resolves paths to the daemon binary, daemon plist template, and
+    /// example config — either from this `.app` bundle's
+    /// `Contents/Resources/` (production) or from `target/<profile>/`
+    /// + `packaging/` (developer running `cargo run` or
+    /// `target/release/screentime-tray` directly).
+    ///
+    /// One source of truth so anyone needing a bundled artifact —
+    /// install, future "update daemon" flow, diagnostics — calls
+    /// `bundle::Paths::resolve()`.
+    mod bundle {
+        use std::path::PathBuf;
+
+        /// Where we found the bundled artifacts. Useful for logs and
+        /// for telling devs apart from end users.
+        #[derive(Debug, Clone, Copy)]
+        pub enum Source {
+            /// Resolved from a real `.app` bundle's `Contents/`.
+            Bundle,
+            /// Resolved from a workspace `target/<profile>/` plus
+            /// `packaging/`. The `cargo run` / `target/release/...`
+            /// path.
+            DevTree,
+        }
+
+        impl Source {
+            pub fn label(self) -> &'static str {
+                match self {
+                    Self::Bundle => "bundle",
+                    Self::DevTree => "dev-tree",
+                }
+            }
+        }
+
+        pub struct Paths {
+            pub daemon_binary: PathBuf,
+            pub daemon_plist: PathBuf,
+            pub config_example: PathBuf,
+            pub source: Source,
+        }
+
+        impl Paths {
+            /// Try the bundle layout first; fall back to dev-tree
+            /// layout. Errors only on a missing/unparented exe path —
+            /// either path resolution succeeds or something is very
+            /// wrong with the environment.
+            pub fn resolve() -> anyhow::Result<Self> {
+                let exe = std::env::current_exe()
+                    .map_err(|e| anyhow::anyhow!("reading current_exe: {e}"))?;
+                let exe_dir = exe
+                    .parent()
+                    .ok_or_else(|| anyhow::anyhow!("exe has no parent dir"))?;
+
+                // Bundle layout: `exe_dir` is `Contents/MacOS/`. If
+                // `Contents/Resources/screentimed` exists alongside, we're
+                // in a bundle.
+                if let Some(contents) = exe_dir.parent() {
+                    let resources = contents.join("Resources");
+                    let bundled_daemon = resources.join("screentimed");
+                    if bundled_daemon.is_file() {
+                        return Ok(Self {
+                            daemon_binary: bundled_daemon,
+                            daemon_plist: contents
+                                .join("Library/LaunchDaemons/com.qnicks.screentimed.plist"),
+                            config_example: resources.join("config.example.toml"),
+                            source: Source::Bundle,
+                        });
+                    }
+                }
+
+                // Dev-tree fallback. `exe_dir` is `target/<profile>/`
+                // (`release` or `debug`); the daemon binary lives next
+                // to the tray, and `packaging/` lives at the workspace
+                // root.
+                let profile_dir = exe_dir;
+                let workspace = profile_dir
+                    .parent()
+                    .and_then(|p| p.parent())
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "can't infer workspace root from {}",
+                            exe.display()
+                        )
+                    })?;
+
+                Ok(Self {
+                    daemon_binary: profile_dir.join("screentimed"),
+                    daemon_plist: workspace
+                        .join("packaging/com.qnicks.screentimed.plist"),
+                    config_example: workspace.join("packaging/config.example.toml"),
+                    source: Source::DevTree,
+                })
+            }
+        }
     }
 
     /// Custom `NSObject` subclass that owns the menu-item action
@@ -804,7 +925,7 @@ mod imp {
             ) {
                 return false;
             }
-            let paths = match BundlePaths::resolve() {
+            let paths = match bundle::Paths::resolve() {
                 Ok(p) => p,
                 Err(e) => {
                     tracing::error!(error = %e, "could not resolve bundle paths");
@@ -865,54 +986,7 @@ mod imp {
             Ok(())
         }
 
-        /// Bundle-relative paths to the daemon binary, daemon plist
-        /// template, and example config. Falls back to dev-tree paths
-        /// (under `target/release/` and `packaging/`) when the binary
-        /// isn't running from a `.app` bundle so `cargo run` workflows
-        /// still work.
-        struct BundlePaths {
-            daemon_binary: PathBuf,
-            daemon_plist: PathBuf,
-            config_example: PathBuf,
-        }
-
-        impl BundlePaths {
-            fn resolve() -> anyhow::Result<Self> {
-                let exe = std::env::current_exe()?;
-                let macos_dir = exe
-                    .parent()
-                    .ok_or_else(|| anyhow::anyhow!("exe has no parent"))?;
-                let contents = macos_dir
-                    .parent()
-                    .ok_or_else(|| anyhow::anyhow!("MacOS/ has no parent"))?;
-
-                // Bundle layout: Contents/Resources/screentimed exists.
-                let resources = contents.join("Resources");
-                let bundled_daemon = resources.join("screentimed");
-                if bundled_daemon.is_file() {
-                    return Ok(Self {
-                        daemon_binary: bundled_daemon,
-                        daemon_plist: contents
-                            .join("Library/LaunchDaemons/com.qnicks.screentimed.plist"),
-                        config_example: resources.join("config.example.toml"),
-                    });
-                }
-
-                // Dev fallback: target/release/screentime-tray + packaging/.
-                let release = macos_dir;
-                let workspace = release
-                    .parent()
-                    .and_then(|p| p.parent())
-                    .ok_or_else(|| anyhow::anyhow!("can't find workspace root from {}", exe.display()))?;
-                Ok(Self {
-                    daemon_binary: release.join("screentimed"),
-                    daemon_plist: workspace.join("packaging/com.qnicks.screentimed.plist"),
-                    config_example: workspace.join("packaging/config.example.toml"),
-                })
-            }
-        }
-
-        fn build_install_script(p: &BundlePaths) -> String {
+        fn build_install_script(p: &bundle::Paths) -> String {
             // Single bash command via `&&` chains. `install -d` creates
             // missing dirs idempotently. Re-running is safe — `cp`
             // overwrites the daemon binary (handles upgrades), and the
