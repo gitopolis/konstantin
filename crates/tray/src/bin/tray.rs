@@ -60,14 +60,36 @@ mod imp {
     const RECONNECT_BACKOFF: Duration = Duration::from_secs(2);
 
     /// Shared state between the worker and the main-thread timer.
-    #[derive(Default)]
     struct Latest {
         /// Most recent `UserStatus` from the daemon. `None` until the
         /// first frame arrives. Drained by the timer (it `take`s).
         pending: Option<UserStatus>,
-        /// True if the worker has lost connectivity. Lets the timer show
-        /// a "?" placeholder instead of stale data.
+        /// True iff we don't currently have an open subscription. We
+        /// start in this state and the worker flips it to `false` once
+        /// it actually reaches the daemon.
         disconnected: bool,
+    }
+
+    impl Default for Latest {
+        fn default() -> Self {
+            // Start "disconnected" so the UI shows 🔴 honestly until the
+            // worker confirms it can reach the daemon.
+            Self {
+                pending: None,
+                disconnected: true,
+            }
+        }
+    }
+
+    /// All the long-lived AppKit handles the drain timer needs to
+    /// touch each tick. Built once by `build_status_item`, moved into
+    /// the timer block which the run loop retains for the app's
+    /// lifetime.
+    struct Tray {
+        status_item: Retained<NSStatusItem>,
+        start_item: Retained<NSMenuItem>,
+        stop_item: Retained<NSMenuItem>,
+        restart_item: Retained<NSMenuItem>,
     }
 
     pub fn main() -> Result<()> {
@@ -84,11 +106,12 @@ mod imp {
         // Bound here so it lives until `app.run()` returns (process
         // exit). Menu items hold a weak reference per Cocoa convention.
         let controller = actions::Controller::new(mtm);
-        let status_item = build_status_item(mtm, &controller);
+        let tray = build_status_item(mtm, &controller);
         let latest = Arc::new(Mutex::new(Latest::default()));
 
-        // Initial title before any update arrives.
-        set_title(&status_item, "screentime: …", mtm);
+        // Initial title before any update arrives — match the default
+        // `disconnected: true` state.
+        set_title(&tray.status_item, "🔴", mtm);
 
         // Idempotent: write our per-user LaunchAgent plist so launchd
         // auto-starts the tray on next login. Doesn't bootstrap — we
@@ -109,38 +132,46 @@ mod imp {
         }
 
         spawn_subscriber(latest.clone());
-        install_drain_timer(status_item, latest);
+        install_drain_timer(tray, latest);
 
         // Blocks until `terminate:` is called from the menu.
         app.run();
         Ok(())
     }
 
-    fn build_status_item(
-        mtm: MainThreadMarker,
-        controller: &actions::Controller,
-    ) -> Retained<NSStatusItem> {
+    fn build_status_item(mtm: MainThreadMarker, controller: &actions::Controller) -> Tray {
         let bar = NSStatusBar::systemStatusBar();
         let item = bar.statusItemWithLength(NSVariableStatusItemLength);
 
         let menu = NSMenu::new(mtm);
+        // Disable AppKit's auto-validation so our explicit `setEnabled`
+        // calls in the drain timer are authoritative.
+        menu.setAutoenablesItems(false);
 
-        // Daemon lifecycle. A5 will toggle enabled state based on
-        // whether the daemon is reachable; for now they're always on.
-        add_action_item(mtm, &menu, "Start Daemon", sel!(startDaemon:), controller);
-        add_action_item(mtm, &menu, "Stop Daemon", sel!(stopDaemon:), controller);
-        add_action_item(
-            mtm,
-            &menu,
-            "Restart Daemon",
-            sel!(restartDaemon:),
-            controller,
-        );
+        let start_item = make_action_item(mtm, "Start Daemon", sel!(startDaemon:), controller);
+        let stop_item = make_action_item(mtm, "Stop Daemon", sel!(stopDaemon:), controller);
+        let restart_item =
+            make_action_item(mtm, "Restart Daemon", sel!(restartDaemon:), controller);
+
+        // Initial enable-state matches the default `disconnected: true`
+        // — only Start is actionable until the worker reports back.
+        start_item.setEnabled(true);
+        stop_item.setEnabled(false);
+        restart_item.setEnabled(false);
+
+        menu.addItem(&start_item);
+        menu.addItem(&stop_item);
+        menu.addItem(&restart_item);
 
         menu.addItem(&NSMenuItem::separatorItem(mtm));
 
-        add_action_item(mtm, &menu, "Configure…", sel!(configure:), controller);
-        add_action_item(mtm, &menu, "Open Log", sel!(openLog:), controller);
+        let configure = make_action_item(mtm, "Configure…", sel!(configure:), controller);
+        let log = make_action_item(mtm, "Open Log", sel!(openLog:), controller);
+        // These two are always actionable — no daemon-state dependency.
+        configure.setEnabled(true);
+        log.setEnabled(true);
+        menu.addItem(&configure);
+        menu.addItem(&log);
 
         menu.addItem(&NSMenuItem::separatorItem(mtm));
 
@@ -152,23 +183,31 @@ mod imp {
         // would crash. `terminate:` is implemented by `NSApplication`,
         // which is on the responder chain for menu actions.
         unsafe { quit.setAction(Some(sel!(terminate:))) };
+        quit.setEnabled(true);
         menu.addItem(&quit);
 
         item.setMenu(Some(&menu));
-        item
+
+        Tray {
+            status_item: item,
+            start_item,
+            stop_item,
+            restart_item,
+        }
     }
 
-    /// Build a menu item wired to a selector on `controller`.
-    fn add_action_item(
+    /// Build a menu item wired to a selector on `controller`. Returns
+    /// the retained item so the caller can hold it for later
+    /// state updates.
+    fn make_action_item(
         mtm: MainThreadMarker,
-        menu: &NSMenu,
         title: &str,
         action: objc2::runtime::Sel,
         controller: &actions::Controller,
-    ) {
+    ) -> Retained<NSMenuItem> {
         let item = NSMenuItem::new(mtm);
         item.setTitle(&NSString::from_str(title));
-        // SAFETY: same as `setAction` above. Both selectors here are
+        // SAFETY: same as `setAction` above. Selectors here are
         // declared on `Controller` via `define_class!`, and we set the
         // target to a controller of that class — the dispatch is
         // type-correct at runtime.
@@ -176,7 +215,7 @@ mod imp {
             item.setAction(Some(action));
             item.setTarget(Some(controller));
         }
-        menu.addItem(&item);
+        item
     }
 
     fn spawn_subscriber(latest: Arc<Mutex<Latest>>) {
@@ -243,22 +282,33 @@ mod imp {
         }
     }
 
-    fn install_drain_timer(status_item: Retained<NSStatusItem>, latest: Arc<Mutex<Latest>>) {
+    fn install_drain_timer(tray: Tray, latest: Arc<Mutex<Latest>>) {
         let block = RcBlock::new(move |_timer: NonNull<NSTimer>| {
             // Block fires on the main thread (run loop where the timer was
             // scheduled), so we can re-derive the marker safely.
             let mtm = MainThreadMarker::new()
                 .expect("drain timer must fire on the main thread");
-            let drained = {
+            let (pending, disconnected) = {
                 let mut g = latest.lock().expect("latest mutex");
                 (g.pending.take(), g.disconnected)
             };
-            match drained {
-                (Some(status), _) => apply_status(&status_item, &status, mtm),
-                (None, true) => set_title(&status_item, "screentime: ?", mtm),
-                // Nothing new and connection is fine — leave title alone.
-                (None, false) => {}
+
+            // Menu enable-state. Idempotent — `setEnabled` with the
+            // current value is a no-op in AppKit, so calling every
+            // tick is fine.
+            tray.start_item.setEnabled(disconnected);
+            tray.stop_item.setEnabled(!disconnected);
+            tray.restart_item.setEnabled(!disconnected);
+
+            // Title. 🔴 trumps any pending status if we're currently
+            // disconnected — even if a stale `pending` is sitting
+            // around, the daemon is unreachable *now*.
+            if disconnected {
+                set_title(&tray.status_item, "🔴", mtm);
+            } else if let Some(status) = pending {
+                apply_status(&tray.status_item, &status, mtm);
             }
+            // else: connected, no fresh status — leave title alone.
         });
 
         let interval = 1.0 / DRAIN_HZ;
