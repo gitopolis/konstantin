@@ -19,11 +19,10 @@ use crate::config::Config;
 use crate::state::State;
 use crate::time::next_local_midnight;
 use anyhow::{Context, Result};
-use nix::unistd::User;
+use nix::unistd::{getpeereid, User};
 use screentime_proto::{
     read_frame, write_frame, FrameError, Request, Response, SessionState, UserStatus,
 };
-use std::os::fd::AsRawFd;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
@@ -247,18 +246,7 @@ fn compute_status(username: &str, uid: u32, cfg: &Config, state: &Mutex<State>) 
 }
 
 /// macOS / BSD: peer credentials via `getpeereid(2)`. Returns `(uid, gid)`.
-///
-/// `nix` 0.29 doesn't re-export `getpeereid`, so we call libc directly.
 fn peer_creds(stream: &UnixStream) -> Result<(u32, u32)> {
-    let fd = stream.as_raw_fd();
-    let mut uid: libc::uid_t = 0;
-    let mut gid: libc::gid_t = 0;
-    // SAFETY: `fd` is a valid, open Unix-socket file descriptor borrowed from
-    // `stream` for the duration of this call; the out-pointers point at local
-    // stack slots we own.
-    let rc = unsafe { libc::getpeereid(fd, &mut uid, &mut gid) };
-    if rc != 0 {
-        return Err(std::io::Error::last_os_error()).context("getpeereid");
-    }
-    Ok((uid, gid))
+    let (uid, gid) = getpeereid(stream).context("getpeereid")?;
+    Ok((uid.as_raw(), gid.as_raw()))
 }

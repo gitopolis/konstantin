@@ -19,7 +19,7 @@ rust-version = "1.78"
 # IPC + serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-toml = "0.8"
+toml = "1"
 
 # Async runtime
 tokio = { version = "1", features = [
@@ -39,12 +39,12 @@ chrono = { version = "0.4", features = ["clock", "serde"] }
 
 # Errors / logging
 anyhow = "1"
-thiserror = "1"
+thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
 # UNIX-y bits (peer creds, utmpx)
-nix = { version = "0.29", features = ["socket", "user"] }
+nix = { version = "0.31", features = ["socket", "user"] }
 libc = "0.2"
 
 # Cocoa interop for the menu-bar tray (macOS only — consumed by the tray
