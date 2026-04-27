@@ -22,6 +22,12 @@ default_policy = "unrestricted"
 #   "logout" — actually invoke `launchctl bootout` when limits hit.
 enforcement = "log"
 
+# Live kill-switch. If this file exists, the daemon will refuse to invoke
+# `launchctl bootout` regardless of `enforcement`. Touch it to disable
+# enforcement in an emergency without restarting the daemon; remove it to
+# re-enable. Default: /etc/screentimed/disable.
+# kill_switch_path = "/etc/screentimed/disable"
+
 # Test users (create them first — see packaging/install.sh).
 [users.alice]
 daily_limit_minutes = 30

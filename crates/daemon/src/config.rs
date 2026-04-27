@@ -42,6 +42,12 @@ pub struct Config {
     #[serde(default)]
     pub enforcement: Enforcement,
 
+    /// If this file exists, the daemon will NOT invoke `launchctl bootout`
+    /// even when `enforcement = "logout"`. Lets the operator disable
+    /// enforcement live without restarting (or reconfiguring) the daemon.
+    #[serde(default = "default_kill_switch_path")]
+    pub kill_switch_path: PathBuf,
+
     #[serde(default)]
     pub users: HashMap<String, UserConfig>,
 }
@@ -85,6 +91,10 @@ fn default_tick_seconds() -> u32 {
 
 fn default_warn_thresholds() -> Vec<u32> {
     vec![15, 5, 1]
+}
+
+fn default_kill_switch_path() -> PathBuf {
+    PathBuf::from("/etc/screentimed/disable")
 }
 
 impl Config {

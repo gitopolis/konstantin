@@ -1,6 +1,6 @@
 //! `screentimed` — privileged daemon for enforcing daily screen-time limits.
 //!
-//! v1 scope (phases 1–3):
+//! v1 scope (phases 1–5):
 //!   * load TOML config
 //!   * bind a Unix socket and accept connections
 //!   * authenticate clients via `getpeereid(2)`
@@ -8,14 +8,16 @@
 //!     counters every `tick_seconds`, persisting to `state.json`
 //!   * scheduled local-midnight reset task (recomputes the boundary
 //!     after every reset to stay correct across DST transitions)
+//!   * `Subscribe` push channel — server pushes `StatusUpdate` on every
+//!     tick and on midnight rollover
+//!   * enforcement: `launchctl bootout user/<uid>` when a configured user
+//!     hits their daily limit, gated by `enforcement = "logout"` and the
+//!     kill-switch file
 //!   * answer `GetStatus` with real used / remaining seconds and a
 //!     resolved `SessionState`
-//!
-//! Out of scope until later phases:
-//!   * forced logout via `launchctl bootout` (phase 5)
-//!   * `Subscribe` push channel (phase 4 — returns Error for now)
 
 mod config;
+mod enforcement;
 mod ipc;
 mod sessions;
 mod state;
@@ -159,7 +161,7 @@ async fn run_midnight_resetter(
 }
 
 /// Periodically: enumerate console sessions, advance counters, persist,
-/// then wake any active subscribers.
+/// wake any active subscribers, and run an enforcement pass.
 async fn run_ticker(
     cfg: config::Config,
     state: Arc<Mutex<state::State>>,
@@ -171,6 +173,8 @@ async fn run_ticker(
     // The first tick of `interval` completes immediately; consume it so the
     // first counter increment happens after a real `period` has elapsed.
     iv.tick().await;
+
+    let mut enforcer = enforcement::Enforcer::new();
 
     loop {
         iv.tick().await;
@@ -192,6 +196,11 @@ async fn run_ticker(
         // `send` returns Err only when there are no receivers; that's the
         // common case and not an error.
         let _ = tick_tx.send(());
+
+        // Enforcement runs *after* persist + broadcast so a kicked user's
+        // last counter value is durable, and any live subscriber sees the
+        // pre-kick state before the connection drops.
+        enforcer.step(&cfg, &active, &snapshot.counters).await;
     }
 }
 
