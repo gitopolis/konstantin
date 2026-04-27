@@ -56,6 +56,8 @@ objc2-foundation = { version = "0.3", features = [
     "NSDate",
     "NSObject",
     "NSThread",
+    "NSRunLoop",
+    "NSGeometry",
     "block2",
 ] }
 objc2-app-kit = { version = "0.3", features = [
@@ -72,6 +74,10 @@ objc2-app-kit = { version = "0.3", features = [
     "NSCell",
     "NSView",
     "NSWindow",
+    "NSAlert",
+    "NSPanel",
+    "NSProgressIndicator",
+    "NSTextField",
 ] }
 block2 = "0.6"
 
