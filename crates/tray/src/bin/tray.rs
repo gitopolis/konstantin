@@ -88,25 +88,26 @@ mod imp {
         install_drain_timer(status_item, latest);
 
         // Blocks until `terminate:` is called from the menu.
-        unsafe { app.run() };
+        app.run();
         Ok(())
     }
 
     fn build_status_item(mtm: MainThreadMarker) -> Retained<NSStatusItem> {
-        let bar = unsafe { NSStatusBar::systemStatusBar() };
-        let item = unsafe { bar.statusItemWithLength(NSVariableStatusItemLength) };
+        let bar = NSStatusBar::systemStatusBar();
+        let item = bar.statusItemWithLength(NSVariableStatusItemLength);
 
         let menu = NSMenu::new(mtm);
 
         let quit = NSMenuItem::new(mtm);
-        unsafe {
-            quit.setTitle(&NSString::from_str("Quit"));
-            quit.setKeyEquivalent(&NSString::from_str("q"));
-            // Standard Cocoa selector; NSApplication is the responder.
-            quit.setAction(Some(sel!(terminate:)));
-            menu.addItem(&quit);
-            item.setMenu(Some(&menu));
-        }
+        quit.setTitle(&NSString::from_str("Quit"));
+        quit.setKeyEquivalent(&NSString::from_str("q"));
+        // SAFETY: `setAction` is `unsafe` because raw Objective-C selectors
+        // are untyped — sending an unrecognized selector to its target
+        // would crash. `terminate:` is implemented by `NSApplication`,
+        // which is on the responder chain for menu actions.
+        unsafe { quit.setAction(Some(sel!(terminate:))) };
+        menu.addItem(&quit);
+        item.setMenu(Some(&menu));
 
         item
     }
@@ -180,7 +181,10 @@ mod imp {
         });
 
         let interval = 1.0 / DRAIN_HZ;
-        // The run loop retains the scheduled timer; we don't need to.
+        // SAFETY: this scheduling API is `unsafe` because the block can in
+        // principle be called with a different signature than declared.
+        // Our block matches `NonNull<NSTimer>`, the block is heap-allocated
+        // by `RcBlock`, and the run loop retains the returned timer for us.
         unsafe {
             NSTimer::scheduledTimerWithTimeInterval_repeats_block(interval, true, &block);
         }
@@ -200,10 +204,8 @@ mod imp {
     }
 
     fn set_title(item: &NSStatusItem, title: &str, mtm: MainThreadMarker) {
-        unsafe {
-            if let Some(button) = item.button(mtm) {
-                button.setTitle(&NSString::from_str(title));
-            }
+        if let Some(button) = item.button(mtm) {
+            button.setTitle(&NSString::from_str(title));
         }
     }
 
