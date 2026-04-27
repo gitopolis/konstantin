@@ -6,11 +6,11 @@
     <key>Label</key>
     <string>com.qnicks.screentime-tray</string>
 
-    <!-- Headless status checker for now. Will be replaced by the menu-bar app
-         binary once the UI is implemented. -->
+    <!-- Menu-bar app. Subscribes to the daemon's push channel and shows
+         remaining time live in NSStatusItem. -->
     <key>ProgramArguments</key>
     <array>
-        <string>/usr/local/bin/screentime-status</string>
+        <string>/usr/local/bin/screentime-tray</string>
     </array>
 
     <key>RunAtLoad</key>

@@ -9,13 +9,16 @@ description = "Per-user menu-bar client for the screentime daemon."
 
 # Two binaries:
 #   * `screentime-status` — headless CLI, prints status as JSON or human text.
-#                           Lives here so the workspace compiles cross-platform
-#                           and we have something testable before the UI exists.
-#   * `screentime-tray`   — (TODO) the actual NSStatusItem menu-bar app.
+#                           Cross-platform.
+#   * `screentime-tray`   — the menu-bar app. macOS only (NSStatusItem).
 
 [[bin]]
 name = "screentime-status"
 path = "src/bin/status.rs"
+
+[[bin]]
+name = "screentime-tray"
+path = "src/bin/tray.rs"
 
 [dependencies]
 screentime-proto = { workspace = true }
@@ -26,3 +29,12 @@ chrono = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+
+# Cocoa bindings for `screentime-tray`. macOS only — on other targets the
+# tray binary stubs out to a `compile_error!` shim and these crates aren't
+# resolved.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = { workspace = true }
+objc2-foundation = { workspace = true }
+objc2-app-kit = { workspace = true }
+block2 = { workspace = true }

@@ -122,6 +122,44 @@ resets_at : 2026-04-27 00:00:00 -0700
 | `2`  | Transport / decode error (cannot connect, frame malformed, daemon vanished). |
 | `3`  | Daemon-side error response (currently unused — the daemon does not return `Response::Error` for either `GetStatus` or `Subscribe` after phase 4). |
 
+## `screentime-tray`
+
+The per-user menu-bar app. macOS only. Normally run as a LaunchAgent
+in Aqua sessions; for development you can launch it directly from a
+GUI terminal session.
+
+### Usage
+
+No arguments. Show or hide via the menu-bar item; quit via the menu's
+"Quit" option (`⌘Q`).
+
+### Environment variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `SCREENTIMED_SOCKET`    | `/var/run/screentimed.sock` | Path to the daemon's IPC socket. |
+| `SCREENTIME_TRAY_LOG`   | `info,screentime_tray=info` | `tracing` `EnvFilter` directive. |
+
+### Behavior
+
+* On startup the title is `screentime: …` until the first `StatusUpdate`
+  arrives.
+* While connected the title reflects `remaining_seconds`:
+  * `Active` → `format_remaining(remaining_seconds)` (e.g. `1h23m`,
+    `12m05s`)
+  * `LimitReached` → `0s`
+  * `Offline` → `offline`
+  * `NotConfigured` → `—`
+  * `Paused` (phase 8 only) → `⏸ <remaining>`
+* When the daemon stops the title becomes `screentime: ?` and the worker
+  retries `Subscription::open` every 2 s. Reconnect is automatic; no
+  user action needed.
+
+### Logs
+
+When run as a LaunchAgent, stdout/stderr go to `/tmp/screentime-tray.out.log`
+and `/tmp/screentime-tray.err.log` (configurable in the plist).
+
 ## Building
 
 ```sh

@@ -16,9 +16,13 @@ enforcement path or adding new wire types.
 * one-shot status via `GetStatus`
 * `--watch` mode subscribes and streams live updates
 
-`screentime-tray` (per-user menu-bar app, Aqua only — phase 6)
-* will use `Subscribe` for live countdown
-* phase 7 adds threshold notifications
+`screentime-tray` (per-user menu-bar app, Aqua only)
+* `NSStatusItem` showing remaining time, updated live from `Subscribe`
+* current-thread tokio runtime on a worker thread; main thread runs
+  `NSApplication` and a 5 Hz `NSTimer` block that drains the latest
+  `UserStatus` and writes the title
+* auto-reconnects with a 2 s backoff if the daemon stops
+* phase 7 will add threshold notifications
 
 All three communicate over a Unix socket at `/var/run/screentimed.sock`
 (mode 0666). Wire types and framing live in the shared

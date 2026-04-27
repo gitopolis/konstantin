@@ -8,8 +8,8 @@ A macOS screen-time enforcer written in Rust.
   over their daily limit via `launchctl bootout`.
 * `screentime-status` — headless CLI client. Asks the daemon "what's my
   status?" over a Unix socket. Supports `--watch` for a live stream.
-* `screentime-tray` — per-user menu-bar app. Library exists; UI binary
-  lands in phase 6.
+* `screentime-tray` — per-user menu-bar app. Subscribes to the daemon's
+  push channel and shows remaining time live in `NSStatusItem`.
 
 ## Documentation
 
@@ -130,6 +130,6 @@ before changing the enforcement path. In short:
 | 3     | ✅ done     | midnight reset task (DST-correct) |
 | 4     | ✅ done     | `Subscribe` push channel for live tray updates |
 | 5     | ✅ done     | forced logout via `launchctl bootout` (gated by `enforcement = "logout"` + kill-switch + backoff) |
-| 6     | next        | menu-bar UI binary (`screentime-tray`) using `objc2` + `NSStatusItem` |
-| 7     |             | threshold notifications (15 / 5 / 1 minutes remaining) |
+| 6     | ✅ done     | menu-bar UI binary (`screentime-tray`) using `objc2` + `NSStatusItem`, with auto-reconnect |
+| 7     | next        | threshold notifications (15 / 5 / 1 minutes remaining) |
 | 8     |             | (v2) per-user lock/idle reporting via the tray, with a 30 s sanity-check fallback |

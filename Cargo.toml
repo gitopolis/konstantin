@@ -47,6 +47,34 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 nix = { version = "0.29", features = ["socket", "user"] }
 libc = "0.2"
 
+# Cocoa interop for the menu-bar tray (macOS only — consumed by the tray
+# crate behind `[target.'cfg(target_os = "macos")'.dependencies]`).
+objc2 = "0.5"
+objc2-foundation = { version = "0.2", features = [
+    "NSString",
+    "NSTimer",
+    "NSDate",
+    "NSObject",
+    "NSThread",
+    "block2",
+] }
+objc2-app-kit = { version = "0.2", features = [
+    "NSApplication",
+    "NSRunningApplication",
+    "NSResponder",
+    "NSStatusBar",
+    "NSStatusItem",
+    "NSStatusBarButton",
+    "NSMenu",
+    "NSMenuItem",
+    "NSControl",
+    "NSButton",
+    "NSCell",
+    "NSView",
+    "NSWindow",
+] }
+block2 = "0.5"
+
 # Internal
 screentime-proto = { path = "crates/proto" }
 

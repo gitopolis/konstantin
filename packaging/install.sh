@@ -19,19 +19,19 @@ fi
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TARGET="${ROOT}/target/release"
 
-if [[ ! -x "${TARGET}/screentimed" ]]; then
-    echo "missing ${TARGET}/screentimed — run 'cargo build --release' first" >&2
-    exit 1
-fi
-if [[ ! -x "${TARGET}/screentime-status" ]]; then
-    echo "missing ${TARGET}/screentime-status — run 'cargo build --release' first" >&2
-    exit 1
-fi
+for bin in screentimed screentime-status screentime-tray; do
+    if [[ ! -x "${TARGET}/${bin}" ]]; then
+        echo "missing ${TARGET}/${bin} — run 'cargo build --release' first" >&2
+        exit 1
+    fi
+done
 
 echo "→ installing daemon binary"
 install -m 0755 "${TARGET}/screentimed"        /usr/local/libexec/screentimed
-echo "→ installing client binary"
+echo "→ installing CLI client"
 install -m 0755 "${TARGET}/screentime-status"  /usr/local/bin/screentime-status
+echo "→ installing menu-bar app"
+install -m 0755 "${TARGET}/screentime-tray"    /usr/local/bin/screentime-tray
 
 echo "→ creating /etc/screentimed/"
 install -d -m 0755 /etc/screentimed
