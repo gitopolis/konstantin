@@ -2,6 +2,7 @@
 //! binary and the menu-bar `tray` binary both use this.
 
 pub mod notifications;
+pub mod users;
 
 use anyhow::{Context, Result};
 use screentime_proto::{

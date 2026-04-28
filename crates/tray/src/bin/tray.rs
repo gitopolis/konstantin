@@ -552,7 +552,7 @@ mod imp {
                 #[unsafe(method(configure:))]
                 fn configure_action(&self, _sender: Option<&AnyObject>) {
                     let mtm = MainThreadMarker::from(self);
-                    configure_flow(mtm);
+                    super::config_ui::open(mtm);
                 }
 
                 #[unsafe(method(openLog:))]
@@ -588,91 +588,6 @@ mod imp {
                 Err(admin::Error::Cancelled) => {}
                 Err(admin::Error::Failed(msg)) => {
                     alerts::message(mtm, failure_title, &msg);
-                }
-            }
-        }
-
-        /// Configure flow: copy config to a temp file, open in default
-        /// text editor, then alert "Apply / Discard". Apply commits via
-        /// admin and kickstarts the daemon. Temp file is always cleaned
-        /// up.
-        fn configure_flow(mtm: MainThreadMarker) {
-            const SYSTEM_CONFIG: &str = "/etc/screentimed/config.toml";
-
-            if !std::path::Path::new(SYSTEM_CONFIG).exists() {
-                alerts::message(
-                    mtm,
-                    "No configuration found.",
-                    "Set up Screentime first to create the configuration file.",
-                );
-                return;
-            }
-
-            let tmpdir = std::env::var("TMPDIR")
-                .unwrap_or_else(|_| "/tmp/".to_string());
-            let temp = format!(
-                "{tmpdir}screentime-config-{}.toml",
-                std::process::id()
-            );
-
-            if let Err(e) = std::fs::copy(SYSTEM_CONFIG, &temp) {
-                alerts::message(mtm, "Couldn't read configuration.", &e.to_string());
-                return;
-            }
-
-            // Open the temp file in the user's default text editor.
-            // `open -t` picks the editor associated with .txt by
-            // default (TextEdit unless overridden), independent of
-            // .toml's UTI.
-            if let Err(e) = std::process::Command::new("/usr/bin/open")
-                .arg("-t")
-                .arg(&temp)
-                .status()
-            {
-                let _ = std::fs::remove_file(&temp);
-                alerts::message(mtm, "Couldn't open editor.", &e.to_string());
-                return;
-            }
-
-            // Bring our app to the front so the Apply/Discard alert is
-            // visible above the editor window.
-            NSApplication::sharedApplication(mtm).activate();
-
-            let apply = alerts::confirm(
-                mtm,
-                "Edit Configuration",
-                &format!(
-                    "Edit the configuration in the text editor that just opened, \
-                     save it (⌘S), then click Apply.\n\nTemp file: {temp}"
-                ),
-                "Apply",
-                "Discard",
-            );
-
-            if !apply {
-                let _ = std::fs::remove_file(&temp);
-                return;
-            }
-
-            let script = format!(
-                "install -m 0644 '{temp}' /etc/screentimed/config.toml && \
-                 launchctl kickstart -k system/com.qnicks.screentimed"
-            );
-
-            let outcome = admin::run_with_progress(
-                mtm,
-                "Applying Configuration",
-                "Saving configuration and reloading Screentime…",
-                &script,
-            );
-
-            let _ = std::fs::remove_file(&temp);
-
-            match outcome {
-                Ok(()) => {}
-                Err(admin::Error::Cancelled) => {}
-                Err(admin::Error::Failed(msg)) => {
-                    alerts::message(mtm, "Couldn't apply configuration.", &msg);
                 }
             }
         }
@@ -1101,7 +1016,7 @@ mod imp {
             )
         }
 
-        fn build_user_launchagent_plist(tray_exe: &Path) -> String {
+        pub(super) fn build_user_launchagent_plist(tray_exe: &Path) -> String {
             let exe = xml_escape(&tray_exe.display().to_string());
             format!(
                 r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -1130,12 +1045,1142 @@ mod imp {
             )
         }
 
-        fn xml_escape(s: &str) -> String {
+        pub(super) fn xml_escape(s: &str) -> String {
             s.replace('&', "&amp;")
                 .replace('<', "&lt;")
                 .replace('>', "&gt;")
                 .replace('"', "&quot;")
                 .replace('\'', "&apos;")
+        }
+    }
+
+    /// Native settings window. Replaces the previous "open the TOML in
+    /// a text editor" flow with an AppKit window listing every real
+    /// local user, with per-user daily-limit and tray-autostart
+    /// controls plus an editable warn-thresholds field at the top.
+    ///
+    /// One privileged step on Save covers everything: writing the
+    /// updated `/etc/screentimed/config.toml`, installing/removing
+    /// LaunchAgents for *other* users, and `launchctl kickstart -k`-ing
+    /// the daemon. The operator's *own* tray-autostart flips happen
+    /// unprivileged before the admin call.
+    ///
+    /// Other config keys (`enforcement`, `default_policy`,
+    /// `kill_switch_path`, paths, `tick_seconds`) are round-tripped
+    /// untouched via `toml::Value` — the daemon picks them up on
+    /// kickstart.
+    mod config_ui {
+        use super::*;
+        use objc2::define_class;
+        use objc2::rc::Retained;
+        use objc2::runtime::{AnyObject, NSObject};
+        use objc2::{msg_send, sel, AnyThread, MainThreadOnly};
+        use objc2_app_kit::{
+            NSBackingStoreType, NSButton, NSColor, NSControlStateValueOff, NSControlStateValueOn,
+            NSFont, NSImage, NSImageScaling, NSImageView, NSTextField, NSView, NSWindow,
+            NSWindowStyleMask,
+        };
+        use objc2_foundation::{NSData, NSPoint, NSRect, NSSize};
+        use screentime_tray::users::{self, LocalUser, UserPicture};
+        use std::cell::RefCell;
+        use std::path::{Path, PathBuf};
+
+        const SYSTEM_CONFIG: &str = "/etc/screentimed/config.toml";
+        const TRAY_AGENT_LABEL: &str = "com.qnicks.screentime-tray";
+        const TRAY_AGENT_FILENAME: &str = "com.qnicks.screentime-tray.plist";
+
+        thread_local! {
+            /// At most one configure window at a time. Re-opening just
+            /// fronts the existing window. Replaced wholesale on each
+            /// open so stale widget retains drop.
+            static UI_HANDLE: RefCell<Option<UiHandle>> = const { RefCell::new(None) };
+        }
+
+        struct UiHandle {
+            window: Retained<NSWindow>,
+            // Keep the controller alive while the window is up.
+            _controller: Retained<ConfigController>,
+            /// Original parsed TOML. Cloned & mutated on save so all
+            /// untouched fields (`enforcement`, `default_policy`, …)
+            /// are preserved.
+            config_value: toml::Value,
+            rows: Vec<Row>,
+            thresholds_field: Retained<NSTextField>,
+            /// Username running this tray instance — drives the
+            /// "no admin needed for own user" branch in the autostart
+            /// step.
+            operator_username: String,
+        }
+
+        struct Row {
+            user: LocalUser,
+            limit_check: Retained<NSButton>,
+            minutes_field: Retained<NSTextField>,
+            autostart_check: Retained<NSButton>,
+            /// Snapshot of `<home>/Library/LaunchAgents/...plist`
+            /// existence at window-open time. Used to compute the diff
+            /// on save.
+            autostart_initial: bool,
+        }
+
+        define_class!(
+            #[unsafe(super(NSObject))]
+            #[thread_kind = MainThreadOnly]
+            #[name = "ScreentimeConfigController"]
+            pub struct ConfigController;
+
+            impl ConfigController {
+                #[unsafe(method(toggleLimit:))]
+                fn toggle_limit_action(&self, sender: Option<&AnyObject>) {
+                    let Some(sender) = sender else { return };
+                    let tag: isize = unsafe { msg_send![sender, tag] };
+                    let state: isize = unsafe { msg_send![sender, state] };
+                    let on = state == NSControlStateValueOn;
+                    UI_HANDLE.with(|cell| {
+                        if let Some(h) = cell.borrow().as_ref() {
+                            if let Some(row) = h.rows.get(tag as usize) {
+                                row.minutes_field.setEnabled(on);
+                            }
+                        }
+                    });
+                }
+
+                #[unsafe(method(toggleAutostart:))]
+                fn toggle_autostart_action(&self, _sender: Option<&AnyObject>) {
+                    // Stored state is read straight from the checkbox at
+                    // save time; nothing else to update on click.
+                }
+
+                #[unsafe(method(saveTapped:))]
+                fn save_tapped_action(&self, _sender: Option<&AnyObject>) {
+                    let mtm = MainThreadMarker::from(self);
+                    save_flow(mtm);
+                }
+
+                #[unsafe(method(cancelTapped:))]
+                fn cancel_tapped_action(&self, _sender: Option<&AnyObject>) {
+                    close_and_clear();
+                }
+            }
+        );
+
+        impl ConfigController {
+            fn new(mtm: MainThreadMarker) -> Retained<Self> {
+                let alloc = Self::alloc(mtm);
+                unsafe { msg_send![alloc, init] }
+            }
+        }
+
+        /// Public entry point. Idempotent: re-clicking while the window
+        /// is showing just fronts it.
+        pub fn open(mtm: MainThreadMarker) {
+            let already_visible = UI_HANDLE.with(|cell| {
+                cell.borrow()
+                    .as_ref()
+                    .map(|h| h.window.isVisible())
+                    .unwrap_or(false)
+            });
+            if already_visible {
+                UI_HANDLE.with(|cell| {
+                    if let Some(h) = cell.borrow().as_ref() {
+                        h.window.makeKeyAndOrderFront(None);
+                    }
+                });
+                NSApplication::sharedApplication(mtm).activate();
+                return;
+            }
+
+            let config_path = Path::new(SYSTEM_CONFIG);
+            if !config_path.exists() {
+                super::alerts::message(
+                    mtm,
+                    "No configuration found.",
+                    "Set up Screentime first to create the configuration file.",
+                );
+                return;
+            }
+            let config_text = match std::fs::read_to_string(config_path) {
+                Ok(t) => t,
+                Err(e) => {
+                    super::alerts::message(mtm, "Couldn't read configuration.", &e.to_string());
+                    return;
+                }
+            };
+            let config_value: toml::Value = match toml::from_str(&config_text) {
+                Ok(v) => v,
+                Err(e) => {
+                    super::alerts::message(mtm, "Couldn't parse configuration.", &e.to_string());
+                    return;
+                }
+            };
+
+            let users_list = match users::enumerate() {
+                Ok(u) => u,
+                Err(e) => {
+                    super::alerts::message(mtm, "Couldn't list users.", &e.to_string());
+                    return;
+                }
+            };
+            if users_list.is_empty() {
+                super::alerts::message(mtm, "No local users found.", "Nothing to configure.");
+                return;
+            }
+
+            let initial_thresholds = current_thresholds(&config_value);
+            let operator = current_username();
+            let cache = load_ui_cache();
+            let user_initials = collect_user_settings(&users_list, &config_value, &operator, &cache);
+
+            let controller = ConfigController::new(mtm);
+            let built = build_window(
+                mtm,
+                &controller,
+                &users_list,
+                &user_initials,
+                &initial_thresholds,
+            );
+
+            let window_clone = built.window.clone();
+            UI_HANDLE.with(|cell| {
+                *cell.borrow_mut() = Some(UiHandle {
+                    window: built.window,
+                    _controller: controller,
+                    config_value,
+                    rows: built.rows,
+                    thresholds_field: built.thresholds_field,
+                    operator_username: operator,
+                });
+            });
+
+            window_clone.makeKeyAndOrderFront(None);
+            NSApplication::sharedApplication(mtm).activate();
+        }
+
+        fn close_and_clear() {
+            UI_HANDLE.with(|cell| {
+                if let Some(h) = cell.borrow_mut().take() {
+                    h.window.close();
+                }
+            });
+        }
+
+        // ─── Initial-state helpers ─────────────────────────────────────
+
+        fn current_thresholds(cfg: &toml::Value) -> String {
+            let arr = cfg
+                .as_table()
+                .and_then(|t| t.get("warn_thresholds_minutes"))
+                .and_then(|v| v.as_array());
+            match arr {
+                Some(a) => a
+                    .iter()
+                    .filter_map(|v| v.as_integer())
+                    .map(|n| n.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                // Match the daemon default at config.rs:92.
+                None => "15, 5, 1".to_string(),
+            }
+        }
+
+        struct InitialUserSetting {
+            limited: bool,
+            minutes: u32,
+            autostart: bool,
+        }
+
+        fn collect_user_settings(
+            users: &[LocalUser],
+            cfg: &toml::Value,
+            operator: &str,
+            cache: &UiCache,
+        ) -> Vec<InitialUserSetting> {
+            let users_table = cfg
+                .as_table()
+                .and_then(|t| t.get("users"))
+                .and_then(|v| v.as_table());
+            users
+                .iter()
+                .map(|u| {
+                    let entry = users_table.and_then(|t| t.get(&u.username));
+                    let minutes = entry
+                        .and_then(|e| e.as_table())
+                        .and_then(|t| t.get("daily_limit_minutes"))
+                        .and_then(|v| v.as_integer())
+                        .map(|n| n.max(1) as u32)
+                        .unwrap_or(60);
+                    InitialUserSetting {
+                        limited: entry.is_some(),
+                        minutes,
+                        autostart: autostart_state(u, operator, cache),
+                    }
+                })
+                .collect()
+        }
+
+        /// Initial autostart state for a row.
+        ///
+        /// For the operator's own user, `stat` is authoritative — they
+        /// can always read their own home and the file location is
+        /// stable. For *other* users, hardened macOS denies `stat` on
+        /// `/Users/<other>/Library/LaunchAgents/`, so we keep a small
+        /// operator-owned JSON cache (`ui_cache_path`) that records the
+        /// last saved state. Cache hits win; cache misses fall back to
+        /// `stat` (which usually returns false for inaccessible homes —
+        /// fine, then the operator just re-asserts the toggle).
+        fn autostart_state(user: &LocalUser, operator: &str, cache: &UiCache) -> bool {
+            if user.username == operator {
+                return autostart_present(user);
+            }
+            cache
+                .autostart
+                .get(&user.username)
+                .copied()
+                .unwrap_or_else(|| autostart_present(user))
+        }
+
+        fn autostart_present(user: &LocalUser) -> bool {
+            agent_path(user).is_file()
+        }
+
+        fn agent_path(user: &LocalUser) -> PathBuf {
+            user.home.join("Library/LaunchAgents").join(TRAY_AGENT_FILENAME)
+        }
+
+        fn current_username() -> String {
+            // `USER` env var works for tray launches via Dock / Finder /
+            // launchd, but `getpwuid(getuid())` is the authoritative
+            // source. Try the cheap path first.
+            if let Ok(name) = std::env::var("USER") {
+                if !name.is_empty() {
+                    return name;
+                }
+            }
+            std::process::Command::new("/usr/bin/id")
+                .arg("-un")
+                .output()
+                .ok()
+                .and_then(|o| String::from_utf8(o.stdout).ok())
+                .map(|s| s.trim().to_string())
+                .unwrap_or_default()
+        }
+
+        // ─── Operator-owned UI state cache ─────────────────────────────
+        //
+        // `~/Library/Application Support/com.qnicks.screentime/ui-state.json`.
+        // Tracks per-user "Start at login" intent across tray restarts.
+        // The on-disk plist for *other* users isn't stat-able from the
+        // operator's process on hardened macOS, so this cache is the
+        // source of truth for those rows.
+
+        #[derive(Default, serde::Serialize, serde::Deserialize)]
+        struct UiCache {
+            #[serde(default)]
+            autostart: std::collections::HashMap<String, bool>,
+        }
+
+        fn ui_cache_path() -> Option<PathBuf> {
+            let home = std::env::var_os("HOME")?;
+            Some(
+                PathBuf::from(home)
+                    .join("Library/Application Support/com.qnicks.screentime/ui-state.json"),
+            )
+        }
+
+        fn load_ui_cache() -> UiCache {
+            let path = match ui_cache_path() {
+                Some(p) => p,
+                None => return UiCache::default(),
+            };
+            match std::fs::read_to_string(&path) {
+                Ok(text) => serde_json::from_str(&text).unwrap_or_default(),
+                Err(_) => UiCache::default(),
+            }
+        }
+
+        fn save_ui_cache(cache: &UiCache) {
+            let path = match ui_cache_path() {
+                Some(p) => p,
+                None => return,
+            };
+            if let Some(parent) = path.parent() {
+                if let Err(e) = std::fs::create_dir_all(parent) {
+                    tracing::warn!(error = %e, "creating UI cache dir");
+                    return;
+                }
+            }
+            match serde_json::to_string_pretty(cache) {
+                Ok(text) => {
+                    if let Err(e) = std::fs::write(&path, text) {
+                        tracing::warn!(error = %e, "writing UI cache");
+                    }
+                }
+                Err(e) => tracing::warn!(error = %e, "serializing UI cache"),
+            }
+        }
+
+        // ─── Window construction ──────────────────────────────────────
+
+        struct Built {
+            window: Retained<NSWindow>,
+            rows: Vec<Row>,
+            thresholds_field: Retained<NSTextField>,
+        }
+
+        const WINDOW_WIDTH: f64 = 580.0;
+        const SIDE_MARGIN: f64 = 20.0;
+        const ROW_HEIGHT: f64 = 44.0;
+        const ROW_GAP: f64 = 4.0;
+        const AVATAR_SIZE: f64 = 32.0;
+        const FIELD_HEIGHT: f64 = 22.0;
+        const BUTTON_HEIGHT: f64 = 32.0;
+
+        fn build_window(
+            mtm: MainThreadMarker,
+            controller: &ConfigController,
+            users: &[LocalUser],
+            initials: &[InitialUserSetting],
+            initial_thresholds: &str,
+        ) -> Built {
+            // Compute total height so we can place items top-down in
+            // bottom-up Cocoa coordinates.
+            let title_block = 30.0;
+            let thresholds_block = 28.0;
+            let users_header_block = 24.0;
+            let rows_block = ((ROW_HEIGHT + ROW_GAP) * users.len() as f64 - ROW_GAP).max(0.0);
+            let buttons_block = BUTTON_HEIGHT;
+            let inner = title_block
+                + 12.0
+                + thresholds_block
+                + 16.0
+                + users_header_block
+                + rows_block
+                + 24.0
+                + buttons_block;
+            let height = (inner + 2.0 * SIDE_MARGIN).max(280.0);
+
+            let content_rect =
+                NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(WINDOW_WIDTH, height));
+            let style = NSWindowStyleMask::Titled | NSWindowStyleMask::Closable;
+            let backing = NSBackingStoreType::Buffered;
+            let window: Retained<NSWindow> = unsafe {
+                let alloc = NSWindow::alloc(mtm);
+                msg_send![
+                    alloc,
+                    initWithContentRect: content_rect,
+                    styleMask: style.0,
+                    backing: backing.0,
+                    defer: false,
+                ]
+            };
+            window.setTitle(&NSString::from_str("Screentime Settings"));
+            unsafe { window.setReleasedWhenClosed(false) };
+            window.center();
+
+            let content = window.contentView().expect("window content view");
+
+            // y starts at the top edge and grows downward as we add
+            // items; per-item frame y = height - y_top - item_h.
+            let mut y_top = SIDE_MARGIN;
+
+            // Title.
+            let title_y = height - y_top - title_block;
+            let title = make_title_label(mtm, "Screentime Settings");
+            title.setFrame(NSRect::new(
+                NSPoint::new(SIDE_MARGIN, title_y),
+                NSSize::new(WINDOW_WIDTH - 2.0 * SIDE_MARGIN, title_block),
+            ));
+            content.addSubview(&title);
+            y_top += title_block + 12.0;
+
+            // Thresholds row: label on the left, text field on the right.
+            let thresholds_y = height - y_top - thresholds_block;
+            let label = make_label(mtm, "Warn before limit (minutes, comma-separated):");
+            label.setFrame(NSRect::new(
+                NSPoint::new(SIDE_MARGIN, thresholds_y + 3.0),
+                NSSize::new(340.0, 20.0),
+            ));
+            content.addSubview(&label);
+            let thresholds_field = NSTextField::new(mtm);
+            thresholds_field.setStringValue(&NSString::from_str(initial_thresholds));
+            thresholds_field.setFrame(NSRect::new(
+                NSPoint::new(WINDOW_WIDTH - SIDE_MARGIN - 160.0, thresholds_y + 2.0),
+                NSSize::new(160.0, FIELD_HEIGHT),
+            ));
+            content.addSubview(&thresholds_field);
+            y_top += thresholds_block + 16.0;
+
+            // Users header.
+            let header_y = height - y_top - users_header_block;
+            let users_header = make_section_header(mtm, "Users");
+            users_header.setFrame(NSRect::new(
+                NSPoint::new(SIDE_MARGIN, header_y + 4.0),
+                NSSize::new(WINDOW_WIDTH - 2.0 * SIDE_MARGIN, 20.0),
+            ));
+            content.addSubview(&users_header);
+            y_top += users_header_block;
+
+            // Rows.
+            let mut rows = Vec::with_capacity(users.len());
+            for (i, (user, init)) in users.iter().zip(initials.iter()).enumerate() {
+                let row_y = height - y_top - ROW_HEIGHT;
+                let built_row = build_row(mtm, controller, i, user, init, row_y);
+                content.addSubview(&built_row.container);
+                rows.push(Row {
+                    user: user.clone(),
+                    limit_check: built_row.limit_check,
+                    minutes_field: built_row.minutes_field,
+                    autostart_check: built_row.autostart_check,
+                    autostart_initial: init.autostart,
+                });
+                y_top += ROW_HEIGHT + ROW_GAP;
+            }
+
+            // Buttons row, right-aligned.
+            let buttons_y = SIDE_MARGIN;
+            let cancel = make_button(mtm, controller, "Cancel", sel!(cancelTapped:));
+            cancel.setFrame(NSRect::new(
+                NSPoint::new(WINDOW_WIDTH - SIDE_MARGIN - 200.0, buttons_y),
+                NSSize::new(90.0, BUTTON_HEIGHT),
+            ));
+            content.addSubview(&cancel);
+            let save = make_button(mtm, controller, "Save", sel!(saveTapped:));
+            save.setFrame(NSRect::new(
+                NSPoint::new(WINDOW_WIDTH - SIDE_MARGIN - 100.0, buttons_y),
+                NSSize::new(100.0, BUTTON_HEIGHT),
+            ));
+            save.setKeyEquivalent(&NSString::from_str("\r"));
+            content.addSubview(&save);
+
+            Built {
+                window,
+                rows,
+                thresholds_field,
+            }
+        }
+
+        struct BuiltRow {
+            container: Retained<NSView>,
+            limit_check: Retained<NSButton>,
+            minutes_field: Retained<NSTextField>,
+            autostart_check: Retained<NSButton>,
+        }
+
+        fn build_row(
+            mtm: MainThreadMarker,
+            controller: &ConfigController,
+            index: usize,
+            user: &LocalUser,
+            init: &InitialUserSetting,
+            row_y: f64,
+        ) -> BuiltRow {
+            let row_rect = NSRect::new(
+                NSPoint::new(SIDE_MARGIN, row_y),
+                NSSize::new(WINDOW_WIDTH - 2.0 * SIDE_MARGIN, ROW_HEIGHT),
+            );
+            let container: Retained<NSView> = unsafe {
+                let alloc = NSView::alloc(mtm);
+                msg_send![alloc, initWithFrame: row_rect]
+            };
+
+            // Avatar.
+            let avatar_view = NSImageView::new(mtm);
+            avatar_view.setFrame(NSRect::new(
+                NSPoint::new(0.0, (ROW_HEIGHT - AVATAR_SIZE) / 2.0),
+                NSSize::new(AVATAR_SIZE, AVATAR_SIZE),
+            ));
+            // ScaleAxesIndependently avoids letterboxing inside the
+            // square frame — combined with the circular layer mask
+            // below, this gives the System Settings look (the photo
+            // fills the disc edge-to-edge instead of leaving slivers
+            // of transparent backing).
+            avatar_view.setImageScaling(NSImageScaling::ScaleAxesIndependently);
+            if let Some(image) = load_avatar(mtm, user) {
+                avatar_view.setImage(Some(&image));
+            }
+            // Clip to a circle via the backing CALayer. NSImageView
+            // doesn't ship layer-backed by default, so opt in.
+            avatar_view.setWantsLayer(true);
+            if let Some(layer) = avatar_view.layer() {
+                unsafe {
+                    let _: () = msg_send![&*layer, setCornerRadius: AVATAR_SIZE / 2.0];
+                    let _: () = msg_send![&*layer, setMasksToBounds: true];
+                }
+            }
+            container.addSubview(&avatar_view);
+
+            // Username + role.
+            let name_x = AVATAR_SIZE + 12.0;
+            let name_label = make_username_label(mtm, &user.username);
+            name_label.setFrame(NSRect::new(
+                NSPoint::new(name_x, ROW_HEIGHT / 2.0 + 1.0),
+                NSSize::new(150.0, 18.0),
+            ));
+            container.addSubview(&name_label);
+            let role_label = make_role_label(mtm, if user.is_admin { "Admin" } else { "Standard" });
+            role_label.setFrame(NSRect::new(
+                NSPoint::new(name_x, ROW_HEIGHT / 2.0 - 16.0),
+                NSSize::new(150.0, 14.0),
+            ));
+            container.addSubview(&role_label);
+
+            // Limit checkbox.
+            let limit_x = name_x + 160.0;
+            let limit_check = make_checkbox(
+                mtm,
+                controller,
+                "Limit daily",
+                sel!(toggleLimit:),
+                index,
+                init.limited,
+            );
+            limit_check.setFrame(NSRect::new(
+                NSPoint::new(limit_x, (ROW_HEIGHT - 22.0) / 2.0),
+                NSSize::new(105.0, 22.0),
+            ));
+            container.addSubview(&limit_check);
+
+            // Minutes field.
+            let minutes_field = NSTextField::new(mtm);
+            minutes_field.setStringValue(&NSString::from_str(&init.minutes.to_string()));
+            minutes_field.setEnabled(init.limited);
+            minutes_field.setFrame(NSRect::new(
+                NSPoint::new(limit_x + 105.0, (ROW_HEIGHT - FIELD_HEIGHT) / 2.0),
+                NSSize::new(54.0, FIELD_HEIGHT),
+            ));
+            minutes_field.setPlaceholderString(Some(&NSString::from_str("min")));
+            container.addSubview(&minutes_field);
+
+            // Autostart checkbox.
+            let autostart_check = make_checkbox(
+                mtm,
+                controller,
+                "Start at login",
+                sel!(toggleAutostart:),
+                index,
+                init.autostart,
+            );
+            autostart_check.setFrame(NSRect::new(
+                NSPoint::new(limit_x + 170.0, (ROW_HEIGHT - 22.0) / 2.0),
+                NSSize::new(140.0, 22.0),
+            ));
+            container.addSubview(&autostart_check);
+
+            BuiltRow {
+                container,
+                limit_check,
+                minutes_field,
+                autostart_check,
+            }
+        }
+
+        fn load_avatar(mtm: MainThreadMarker, user: &LocalUser) -> Option<Retained<NSImage>> {
+            let from_user = match &user.picture {
+                Some(UserPicture::File(path)) => {
+                    let s = NSString::from_str(&path.display().to_string());
+                    let alloc = NSImage::alloc();
+                    let img: Option<Retained<NSImage>> =
+                        unsafe { msg_send![alloc, initWithContentsOfFile: &*s] };
+                    img
+                }
+                Some(UserPicture::Jpeg(bytes)) => {
+                    let data = NSData::with_bytes(bytes);
+                    let alloc = NSImage::alloc();
+                    let img: Option<Retained<NSImage>> =
+                        unsafe { msg_send![alloc, initWithData: &*data] };
+                    img
+                }
+                None => None,
+            };
+            let _ = mtm; // marker no longer needed; symbol lookup is class-level
+            from_user.or_else(|| {
+                let name = NSString::from_str("person.crop.circle.fill");
+                NSImage::imageWithSystemSymbolName_accessibilityDescription(&name, None)
+            })
+        }
+
+        // ─── Widget factories ──────────────────────────────────────────
+
+        fn make_title_label(mtm: MainThreadMarker, text: &str) -> Retained<NSTextField> {
+            let label = NSTextField::labelWithString(&NSString::from_str(text), mtm);
+            label.setFont(Some(&NSFont::boldSystemFontOfSize(18.0)));
+            label
+        }
+
+        fn make_section_header(mtm: MainThreadMarker, text: &str) -> Retained<NSTextField> {
+            let label = NSTextField::labelWithString(&NSString::from_str(text), mtm);
+            label.setFont(Some(&NSFont::boldSystemFontOfSize(13.0)));
+            label
+        }
+
+        fn make_label(mtm: MainThreadMarker, text: &str) -> Retained<NSTextField> {
+            NSTextField::labelWithString(&NSString::from_str(text), mtm)
+        }
+
+        fn make_username_label(mtm: MainThreadMarker, name: &str) -> Retained<NSTextField> {
+            let label = NSTextField::labelWithString(&NSString::from_str(name), mtm);
+            label.setFont(Some(&NSFont::boldSystemFontOfSize(13.0)));
+            label
+        }
+
+        fn make_role_label(mtm: MainThreadMarker, text: &str) -> Retained<NSTextField> {
+            let label = NSTextField::labelWithString(&NSString::from_str(text), mtm);
+            label.setFont(Some(&NSFont::systemFontOfSize(11.0)));
+            label.setTextColor(Some(&NSColor::secondaryLabelColor()));
+            label
+        }
+
+        fn make_checkbox(
+            mtm: MainThreadMarker,
+            controller: &ConfigController,
+            title: &str,
+            action: objc2::runtime::Sel,
+            tag: usize,
+            on: bool,
+        ) -> Retained<NSButton> {
+            let title_ns = NSString::from_str(title);
+            let cb = unsafe {
+                NSButton::checkboxWithTitle_target_action(
+                    &title_ns,
+                    Some(controller),
+                    Some(action),
+                    mtm,
+                )
+            };
+            cb.setState(if on {
+                NSControlStateValueOn
+            } else {
+                NSControlStateValueOff
+            });
+            unsafe {
+                let _: () = msg_send![&*cb, setTag: tag as isize];
+            }
+            cb
+        }
+
+        fn make_button(
+            mtm: MainThreadMarker,
+            controller: &ConfigController,
+            title: &str,
+            action: objc2::runtime::Sel,
+        ) -> Retained<NSButton> {
+            let title_ns = NSString::from_str(title);
+            unsafe {
+                NSButton::buttonWithTitle_target_action(
+                    &title_ns,
+                    Some(controller),
+                    Some(action),
+                    mtm,
+                )
+            }
+        }
+
+        // ─── Save flow ─────────────────────────────────────────────────
+
+        #[derive(Clone)]
+        struct RowSnapshot {
+            username: String,
+            uid: u32,
+            home: PathBuf,
+            limited: bool,
+            minutes: u32,
+            autostart_target: bool,
+            autostart_initial: bool,
+        }
+
+        struct Snapshot {
+            thresholds: Vec<u32>,
+            rows: Vec<RowSnapshot>,
+            config_value: toml::Value,
+            operator_username: String,
+        }
+
+        fn save_flow(mtm: MainThreadMarker) {
+            let snapshot = match capture_snapshot() {
+                Some(s) => s,
+                None => return,
+            };
+
+            let new_config_text = match build_new_config_toml(&snapshot) {
+                Ok(s) => s,
+                Err(msg) => {
+                    super::alerts::message(mtm, "Invalid configuration", &msg);
+                    return;
+                }
+            };
+
+            let config_temp = tmp_path("screentime-config", "toml");
+            if let Err(e) = std::fs::write(&config_temp, &new_config_text) {
+                super::alerts::message(mtm, "Couldn't write temp config.", &e.to_string());
+                return;
+            }
+
+            // Apply self-changes unprivileged so the password prompt
+            // covers only things that genuinely need root.
+            let mut other_user_changes: Vec<(PathBuf, RowSnapshot, bool)> = Vec::new();
+            for row in &snapshot.rows {
+                if row.autostart_target == row.autostart_initial {
+                    continue;
+                }
+                if row.username == snapshot.operator_username {
+                    if row.autostart_target {
+                        if let Err(e) = enable_autostart_self(&row.home) {
+                            tracing::warn!(error = %e, "self autostart enable failed");
+                        }
+                    } else if let Err(e) = disable_autostart_self(&row.home) {
+                        tracing::warn!(error = %e, "self autostart disable failed");
+                    }
+                    continue;
+                }
+                if row.autostart_target {
+                    let plist_temp =
+                        tmp_path(&format!("screentime-agent-{}", row.username), "plist");
+                    let plist_body =
+                        super::install::build_user_launchagent_plist(&tray_exe());
+                    if let Err(e) = std::fs::write(&plist_temp, plist_body) {
+                        super::alerts::message(
+                            mtm,
+                            "Couldn't write temp plist.",
+                            &e.to_string(),
+                        );
+                        let _ = std::fs::remove_file(&config_temp);
+                        return;
+                    }
+                    other_user_changes.push((plist_temp, row.clone(), true));
+                } else {
+                    other_user_changes.push((PathBuf::new(), row.clone(), false));
+                }
+            }
+
+            let script = build_admin_script(&config_temp, &other_user_changes);
+
+            let outcome = super::admin::run_with_progress(
+                mtm,
+                "Saving Settings",
+                "Saving and reloading Screentime…",
+                &script,
+            );
+
+            // Cleanup all temp files regardless of outcome.
+            let _ = std::fs::remove_file(&config_temp);
+            for (path, _, _) in &other_user_changes {
+                if !path.as_os_str().is_empty() {
+                    let _ = std::fs::remove_file(path);
+                }
+            }
+
+            match outcome {
+                Ok(()) => {
+                    persist_autostart_targets(&snapshot);
+                    close_and_clear();
+                }
+                Err(super::admin::Error::Cancelled) => {}
+                Err(super::admin::Error::Failed(msg)) => {
+                    super::alerts::message(mtm, "Couldn't save settings.", &msg);
+                }
+            }
+        }
+
+        /// Update the operator-owned cache so the next Configure open
+        /// renders the same `Start at login` state we just committed —
+        /// even for users whose home directory we can't `stat`.
+        fn persist_autostart_targets(snap: &Snapshot) {
+            let mut cache = load_ui_cache();
+            for row in &snap.rows {
+                cache
+                    .autostart
+                    .insert(row.username.clone(), row.autostart_target);
+            }
+            save_ui_cache(&cache);
+        }
+
+        fn capture_snapshot() -> Option<Snapshot> {
+            UI_HANDLE.with(|cell| {
+                let h_ref = cell.borrow();
+                let h = h_ref.as_ref()?;
+                let thresholds_text = h.thresholds_field.stringValue().to_string();
+                let rows = h
+                    .rows
+                    .iter()
+                    .map(|r| {
+                        let limited = r.limit_check.state() == NSControlStateValueOn;
+                        let autostart_target =
+                            r.autostart_check.state() == NSControlStateValueOn;
+                        let minutes = r
+                            .minutes_field
+                            .stringValue()
+                            .to_string()
+                            .trim()
+                            .parse::<u32>()
+                            .unwrap_or(0);
+                        RowSnapshot {
+                            username: r.user.username.clone(),
+                            uid: r.user.uid,
+                            home: r.user.home.clone(),
+                            limited,
+                            minutes,
+                            autostart_target,
+                            autostart_initial: r.autostart_initial,
+                        }
+                    })
+                    .collect();
+                let thresholds = parse_thresholds(&thresholds_text).unwrap_or_default();
+                Some(Snapshot {
+                    thresholds,
+                    rows,
+                    config_value: h.config_value.clone(),
+                    operator_username: h.operator_username.clone(),
+                })
+            })
+        }
+
+        fn parse_thresholds(text: &str) -> Result<Vec<u32>, String> {
+            let mut out = Vec::new();
+            for tok in text.split(|c: char| c == ',' || c.is_whitespace()) {
+                let tok = tok.trim();
+                if tok.is_empty() {
+                    continue;
+                }
+                let n: u32 = tok
+                    .parse()
+                    .map_err(|_| format!("'{tok}' is not a non-negative whole number"))?;
+                out.push(n);
+            }
+            Ok(out)
+        }
+
+        fn build_new_config_toml(snap: &Snapshot) -> Result<String, String> {
+            for row in &snap.rows {
+                if row.limited {
+                    if row.minutes == 0 {
+                        return Err(format!(
+                            "{}: minutes must be greater than 0 when 'Limit daily' is on",
+                            row.username
+                        ));
+                    }
+                    if row.minutes > 1440 {
+                        return Err(format!(
+                            "{}: minutes must be at most 1440 (24 hours)",
+                            row.username
+                        ));
+                    }
+                }
+            }
+
+            // Round-trip through toml::Value: keeps every other key
+            // (enforcement, default_policy, kill_switch_path, paths,
+            // tick_seconds) untouched.
+            let mut value = snap.config_value.clone();
+            let table = value
+                .as_table_mut()
+                .ok_or_else(|| "config root is not a table".to_string())?;
+
+            let arr: Vec<toml::Value> = snap
+                .thresholds
+                .iter()
+                .map(|n| toml::Value::Integer(*n as i64))
+                .collect();
+            table.insert("warn_thresholds_minutes".to_string(), toml::Value::Array(arr));
+
+            let mut users_table = toml::value::Table::new();
+            for row in &snap.rows {
+                if !row.limited {
+                    continue;
+                }
+                let mut entry = toml::value::Table::new();
+                entry.insert(
+                    "daily_limit_minutes".to_string(),
+                    toml::Value::Integer(row.minutes as i64),
+                );
+                users_table.insert(row.username.clone(), toml::Value::Table(entry));
+            }
+            table.insert("users".to_string(), toml::Value::Table(users_table));
+
+            toml::to_string_pretty(&value).map_err(|e| format!("serializing TOML: {e}"))
+        }
+
+        fn build_admin_script(
+            config_temp: &Path,
+            other_user_changes: &[(PathBuf, RowSnapshot, bool)],
+        ) -> String {
+            let mut parts: Vec<String> = Vec::new();
+            parts.push(format!(
+                "install -m 0644 {src} /etc/screentimed/config.toml",
+                src = shell_quote(config_temp),
+            ));
+            for (plist_temp, row, enable) in other_user_changes {
+                let dest_dir = row.home.join("Library/LaunchAgents");
+                let dest_plist = dest_dir.join(TRAY_AGENT_FILENAME);
+                if *enable {
+                    parts.push(format!(
+                        "install -d -o {user} -g staff -m 0755 {dir}",
+                        user = shell_quote_arg(&row.username),
+                        dir = shell_quote(&dest_dir),
+                    ));
+                    parts.push(format!(
+                        "install -m 0644 -o {user} -g staff {src} {dst}",
+                        user = shell_quote_arg(&row.username),
+                        src = shell_quote(plist_temp),
+                        dst = shell_quote(&dest_plist),
+                    ));
+                    parts.push(format!(
+                        "(launchctl print gui/{uid} >/dev/null 2>&1 && \
+                          launchctl bootstrap gui/{uid} {dst} || true)",
+                        uid = row.uid,
+                        dst = shell_quote(&dest_plist),
+                    ));
+                } else {
+                    parts.push(format!(
+                        "(rm -f {dst}; launchctl bootout gui/{uid}/{label} 2>/dev/null || true)",
+                        dst = shell_quote(&dest_plist),
+                        uid = row.uid,
+                        label = TRAY_AGENT_LABEL,
+                    ));
+                }
+            }
+            parts.push("launchctl kickstart -k system/com.qnicks.screentimed".to_string());
+            parts.join(" && ")
+        }
+
+        fn enable_autostart_self(home: &Path) -> std::io::Result<()> {
+            let agents = home.join("Library/LaunchAgents");
+            std::fs::create_dir_all(&agents)?;
+            let dst = agents.join(TRAY_AGENT_FILENAME);
+            let body = super::install::build_user_launchagent_plist(&tray_exe());
+            std::fs::write(&dst, body)?;
+            // Best-effort bootstrap into our own GUI domain.
+            let uid = current_uid();
+            let _ = std::process::Command::new("/bin/launchctl")
+                .args(["bootstrap", &format!("gui/{uid}")])
+                .arg(&dst)
+                .status();
+            Ok(())
+        }
+
+        fn disable_autostart_self(home: &Path) -> std::io::Result<()> {
+            let dst = home.join("Library/LaunchAgents").join(TRAY_AGENT_FILENAME);
+            let _ = std::fs::remove_file(&dst);
+            let uid = current_uid();
+            let _ = std::process::Command::new("/bin/launchctl")
+                .args(["bootout", &format!("gui/{uid}/{TRAY_AGENT_LABEL}")])
+                .status();
+            Ok(())
+        }
+
+        fn tray_exe() -> PathBuf {
+            std::env::current_exe()
+                .unwrap_or_else(|_| PathBuf::from("/usr/local/bin/screentime-tray"))
+        }
+
+        fn tmp_path(stem: &str, ext: &str) -> PathBuf {
+            let dir = std::env::var("TMPDIR").unwrap_or_else(|_| "/tmp/".to_string());
+            PathBuf::from(format!("{dir}{stem}-{}.{ext}", std::process::id()))
+        }
+
+        fn shell_quote(p: &Path) -> String {
+            shell_quote_arg(&p.display().to_string())
+        }
+
+        fn shell_quote_arg(s: &str) -> String {
+            // Wrap in single quotes, escape any embedded single quote as
+            // `'\''` (close, escape, reopen).
+            format!("'{}'", s.replace('\'', "'\\''"))
+        }
+
+        fn current_uid() -> u32 {
+            extern "C" {
+                fn getuid() -> u32;
+            }
+            unsafe { getuid() }
+        }
+
+        #[cfg(test)]
+        mod tests {
+            use super::*;
+
+            #[test]
+            fn thresholds_parses_comma_separated() {
+                assert_eq!(parse_thresholds("15, 5, 1").unwrap(), vec![15, 5, 1]);
+                assert_eq!(parse_thresholds("").unwrap(), Vec::<u32>::new());
+                assert_eq!(parse_thresholds("  10 ,  2  ").unwrap(), vec![10, 2]);
+            }
+
+            #[test]
+            fn thresholds_rejects_garbage() {
+                assert!(parse_thresholds("15, abc, 1").is_err());
+                assert!(parse_thresholds("-3").is_err());
+            }
+
+            #[test]
+            fn shell_quote_escapes_apostrophe() {
+                assert_eq!(shell_quote_arg("alice"), "'alice'");
+                assert_eq!(shell_quote_arg("o'brien"), "'o'\\''brien'");
+            }
+
+            #[test]
+            fn build_config_keeps_unrelated_keys() {
+                let original = r#"
+enforcement = "logout"
+default_policy = "block"
+kill_switch_path = "/etc/screentimed/disable"
+warn_thresholds_minutes = [30, 10]
+
+[users.alice]
+daily_limit_minutes = 30
+"#;
+                let cfg: toml::Value = toml::from_str(original).unwrap();
+                let snap = Snapshot {
+                    thresholds: vec![15, 5, 1],
+                    rows: vec![RowSnapshot {
+                        username: "bob".to_string(),
+                        uid: 502,
+                        home: PathBuf::from("/Users/bob"),
+                        limited: true,
+                        minutes: 90,
+                        autostart_target: false,
+                        autostart_initial: false,
+                    }],
+                    config_value: cfg,
+                    operator_username: "nikita".to_string(),
+                };
+                let out = build_new_config_toml(&snap).unwrap();
+                let parsed: toml::Value = toml::from_str(&out).unwrap();
+                let table = parsed.as_table().unwrap();
+                assert_eq!(table["enforcement"].as_str(), Some("logout"));
+                assert_eq!(table["default_policy"].as_str(), Some("block"));
+                let thresholds: Vec<i64> = table["warn_thresholds_minutes"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|v| v.as_integer().unwrap())
+                    .collect();
+                assert_eq!(thresholds, vec![15, 5, 1]);
+                let users = table["users"].as_table().unwrap();
+                assert!(users.contains_key("bob"));
+                // alice was dropped because she wasn't in the snapshot.
+                assert!(!users.contains_key("alice"));
+                assert_eq!(users["bob"]["daily_limit_minutes"].as_integer(), Some(90));
+            }
+
+            #[test]
+            fn build_config_validates_minutes() {
+                let cfg = toml::Value::Table(toml::value::Table::new());
+                let snap = Snapshot {
+                    thresholds: vec![],
+                    rows: vec![RowSnapshot {
+                        username: "alice".into(),
+                        uid: 501,
+                        home: PathBuf::from("/Users/alice"),
+                        limited: true,
+                        minutes: 0,
+                        autostart_target: false,
+                        autostart_initial: false,
+                    }],
+                    config_value: cfg,
+                    operator_username: "nikita".into(),
+                };
+                assert!(build_new_config_toml(&snap).is_err());
+            }
         }
     }
 }
