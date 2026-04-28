@@ -206,7 +206,7 @@ async fn run_ticker(
 
 fn install_tracing() {
     let filter = EnvFilter::try_from_env("SCREENTIMED_LOG")
-        .unwrap_or_else(|_| EnvFilter::new("info,screentimed=debug,screentime_proto=info"));
+        .unwrap_or_else(|_| EnvFilter::new("info,screentimed=debug,konstantin_proto=info"));
     tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_target(true)

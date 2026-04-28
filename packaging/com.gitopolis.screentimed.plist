@@ -4,7 +4,7 @@
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>com.qnicks.screentimed</string>
+    <string>com.gitopolis.screentimed</string>
 
     <key>ProgramArguments</key>
     <array>

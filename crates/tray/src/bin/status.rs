@@ -1,17 +1,17 @@
 //! Headless smoke-test client. Useful before the menu-bar UI exists.
 //!
 //! Usage:
-//!     screentime-status                  # one-shot, human output
-//!     screentime-status --json           # one-shot, raw JSON
-//!     screentime-status --watch          # subscribe, stream updates
-//!     screentime-status --watch --json   # subscribe, one JSON object per line
-//!     SCREENTIMED_SOCKET=/tmp/x.sock screentime-status
+//!     konstantin-status                  # one-shot, human output
+//!     konstantin-status --json           # one-shot, raw JSON
+//!     konstantin-status --watch          # subscribe, stream updates
+//!     konstantin-status --watch --json   # subscribe, one JSON object per line
+//!     SCREENTIMED_SOCKET=/tmp/x.sock konstantin-status
 //!
 //! Exit codes: 0 ok, 2 transport / decode error, 3 daemon-side error.
 
 use anyhow::Result;
-use screentime_proto::UserStatus;
-use screentime_tray::{default_socket_path, fetch_status, format_remaining, Subscription};
+use konstantin_proto::UserStatus;
+use konstantin_tray::{default_socket_path, fetch_status, format_remaining, Subscription};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -24,7 +24,7 @@ async fn main() -> Result<()> {
         let mut sub = match Subscription::open(&socket).await {
             Ok(s) => s,
             Err(e) => {
-                eprintln!("screentime-status: {e:#}");
+                eprintln!("konstantin-status: {e:#}");
                 std::process::exit(2);
             }
         };
@@ -40,11 +40,11 @@ async fn main() -> Result<()> {
                     }
                 }
                 Ok(None) => {
-                    eprintln!("screentime-status: daemon closed connection");
+                    eprintln!("konstantin-status: daemon closed connection");
                     return Ok(());
                 }
                 Err(e) => {
-                    eprintln!("screentime-status: {e:#}");
+                    eprintln!("konstantin-status: {e:#}");
                     std::process::exit(2);
                 }
             }
@@ -54,7 +54,7 @@ async fn main() -> Result<()> {
     let status = match fetch_status(&socket).await {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("screentime-status: {e:#}");
+            eprintln!("konstantin-status: {e:#}");
             std::process::exit(2);
         }
     };

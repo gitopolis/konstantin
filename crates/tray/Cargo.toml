@@ -1,27 +1,27 @@
 [package]
-name = "screentime-tray"
+name = "konstantin-tray"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
 rust-version.workspace = true
-description = "Per-user menu-bar client for the screentime daemon."
+description = "Per-user menu-bar client for the Konstantin daemon."
 
 # Two binaries:
-#   * `screentime-status` — headless CLI, prints status as JSON or human text.
+#   * `konstantin-status` — headless CLI, prints status as JSON or human text.
 #                           Cross-platform.
-#   * `screentime-tray`   — the menu-bar app. macOS only (NSStatusItem).
+#   * `konstantin-tray`   — the menu-bar app. macOS only (NSStatusItem).
 
 [[bin]]
-name = "screentime-status"
+name = "konstantin-status"
 path = "src/bin/status.rs"
 
 [[bin]]
-name = "screentime-tray"
+name = "konstantin-tray"
 path = "src/bin/tray.rs"
 
 [dependencies]
-screentime-proto = { workspace = true }
+konstantin-proto = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 toml = { workspace = true }
@@ -34,7 +34,7 @@ tracing-subscriber = { workspace = true }
 # (NFSHomeDirectory, Picture, JPEGPhoto). Light dep, well-maintained.
 plist = "1"
 
-# Cocoa bindings for `screentime-tray`. macOS only — on other targets the
+# Cocoa bindings for `konstantin-tray`. macOS only — on other targets the
 # tray binary stubs out to a `compile_error!` shim and these crates aren't
 # resolved.
 [target.'cfg(target_os = "macos")'.dependencies]

@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# Build Screentime.app from the workspace's release binaries.
+# Build Konstantin.app from the workspace's release binaries.
 #
 # Usage:
 #     cargo build --release
 #     ./packaging/build-app.sh
 #
-# Output: target/Screentime.app/
+# Output: target/Konstantin.app/
 #
 # The bundle is ad-hoc codesigned (`codesign -s -`) so it loads on Apple
 # Silicon — the kernel rejects unsigned binaries since macOS 11. Ad-hoc
@@ -16,7 +16,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TARGET="${ROOT}/target/release"
-APP="${ROOT}/target/Screentime.app"
+APP="${ROOT}/target/Konstantin.app"
 
 # Read version from the workspace Cargo.toml (single source of truth).
 VERSION=$(awk -F'"' '/^version[[:space:]]*=/ { print $2; exit }' \
@@ -27,14 +27,14 @@ if [[ -z "${VERSION}" ]]; then
 fi
 
 # Verify all three release binaries exist.
-for bin in screentimed screentime-status screentime-tray; do
+for bin in screentimed konstantin-status konstantin-tray; do
     if [[ ! -x "${TARGET}/${bin}" ]]; then
         echo "missing ${TARGET}/${bin} — run 'cargo build --release' first" >&2
         exit 1
     fi
 done
 
-echo "→ building Screentime.app v${VERSION}"
+echo "→ building Konstantin.app v${VERSION}"
 
 # Start clean.
 rm -rf "${APP}"
@@ -46,21 +46,21 @@ install -d "${APP}/Contents/Library/LaunchDaemons"
 
 # Main executable — the tray. CFBundleExecutable in Info.plist points
 # at this name.
-install -m 0755 "${TARGET}/screentime-tray"   "${APP}/Contents/MacOS/screentime-tray"
+install -m 0755 "${TARGET}/konstantin-tray"   "${APP}/Contents/MacOS/konstantin-tray"
 
 # Resources: the daemon binary + diagnostic CLI + the example config.
 # At first-launch install (phase A2) the tray copies the daemon binary
 # from here into /usr/local/libexec/.
 install -m 0755 "${TARGET}/screentimed"        "${APP}/Contents/Resources/screentimed"
-install -m 0755 "${TARGET}/screentime-status"  "${APP}/Contents/Resources/screentime-status"
+install -m 0755 "${TARGET}/konstantin-status"  "${APP}/Contents/Resources/konstantin-status"
 install -m 0644 "${ROOT}/packaging/config.example.toml" \
     "${APP}/Contents/Resources/config.example.toml"
 
 # LaunchDaemon plist. We hand-install (cp + bootstrap) at runtime, but
 # placing it in Contents/Library/LaunchDaemons/ matches SMAppService's
 # expected layout — easy migration if/when we have Developer ID.
-install -m 0644 "${ROOT}/packaging/com.qnicks.screentimed.plist" \
-    "${APP}/Contents/Library/LaunchDaemons/com.qnicks.screentimed.plist"
+install -m 0644 "${ROOT}/packaging/com.gitopolis.screentimed.plist" \
+    "${APP}/Contents/Library/LaunchDaemons/com.gitopolis.screentimed.plist"
 
 # Optional icon. If neither form is present we just don't ship an icon
 # — macOS falls back to the generic app icon. Provide artwork later by
@@ -88,15 +88,15 @@ cat > "${APP}/Contents/Info.plist" <<EOF
     <key>CFBundleDevelopmentRegion</key>
     <string>en</string>
     <key>CFBundleExecutable</key>
-    <string>screentime-tray</string>
+    <string>konstantin-tray</string>
     <key>CFBundleIconFile</key>
     <string>AppIcon</string>
     <key>CFBundleIdentifier</key>
-    <string>com.qnicks.screentime</string>
+    <string>com.gitopolis.konstantin</string>
     <key>CFBundleInfoDictionaryVersion</key>
     <string>6.0</string>
     <key>CFBundleName</key>
-    <string>Screentime</string>
+    <string>Konstantin</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>

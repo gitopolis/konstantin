@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# Install the screentime menu-bar app as a per-user LaunchAgent.
+# Install the Konstantin menu-bar app as a per-user LaunchAgent.
 #
 # This script does NOT need sudo. It assumes:
 #   * `sudo ./packaging/install.sh` has already placed the system-wide
-#     binaries (including /usr/local/bin/screentime-tray) and the
+#     binaries (including /usr/local/bin/konstantin-tray) and the
 #     daemon plist.
 #   * You are running it as the user that should see the menu-bar item.
 #
@@ -20,13 +20,13 @@ if [[ $EUID -eq 0 ]]; then
 fi
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-PLIST_SRC="${ROOT}/packaging/com.qnicks.screentime-tray.plist"
-PLIST_DST="${HOME}/Library/LaunchAgents/com.qnicks.screentime-tray.plist"
-LABEL="com.qnicks.screentime-tray"
+PLIST_SRC="${ROOT}/packaging/com.gitopolis.konstantin-tray.plist"
+PLIST_DST="${HOME}/Library/LaunchAgents/com.gitopolis.konstantin-tray.plist"
+LABEL="com.gitopolis.konstantin-tray"
 DOMAIN="gui/$(id -u)"
 
-if [[ ! -x /usr/local/bin/screentime-tray ]]; then
-    echo "missing /usr/local/bin/screentime-tray — run 'sudo ./packaging/install.sh' first" >&2
+if [[ ! -x /usr/local/bin/konstantin-tray ]]; then
+    echo "missing /usr/local/bin/konstantin-tray — run 'sudo ./packaging/install.sh' first" >&2
     exit 1
 fi
 if [[ ! -f "${PLIST_SRC}" ]]; then
@@ -53,7 +53,7 @@ cat <<EOF
 installed. the menu-bar item should appear shortly.
 
 logs (per launchd plist):
-    tail -f /tmp/screentime-tray.err.log
+    tail -f /tmp/konstantin-tray.err.log
 
 reload after editing the plist:
     launchctl bootout    ${DOMAIN}/${LABEL}

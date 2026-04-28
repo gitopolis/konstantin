@@ -1,7 +1,7 @@
 # Example screentimed config.
 #
 # Install location: /etc/screentimed/config.toml (root-owned, mode 0644).
-# Reload: edit and `sudo launchctl kickstart -k system/com.qnicks.screentimed`.
+# Reload: edit and `sudo launchctl kickstart -k system/com.gitopolis.screentimed`.
 
 socket_path  = "/var/run/screentimed.sock"
 state_path   = "/var/db/screentimed/state.json"

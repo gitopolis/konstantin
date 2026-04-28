@@ -1,11 +1,11 @@
 [package]
-name = "screentime-proto"
+name = "konstantin-proto"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
 rust-version.workspace = true
-description = "Wire types and framing for the screentime daemon/tray IPC."
+description = "Wire types and framing for the Konstantin daemon/tray IPC."
 
 [dependencies]
 serde = { workspace = true }

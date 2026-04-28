@@ -10,9 +10,9 @@ if [[ $EUID -eq 0 ]]; then
     exit 1
 fi
 
-LABEL="com.qnicks.screentime-tray"
+LABEL="com.gitopolis.konstantin-tray"
 DOMAIN="gui/$(id -u)"
-PLIST="${HOME}/Library/LaunchAgents/com.qnicks.screentime-tray.plist"
+PLIST="${HOME}/Library/LaunchAgents/com.gitopolis.konstantin-tray.plist"
 
 echo "→ unloading ${DOMAIN}/${LABEL}"
 launchctl bootout "${DOMAIN}/${LABEL}" 2>/dev/null || true

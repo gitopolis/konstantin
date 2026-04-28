@@ -3,7 +3,7 @@
 The daemon reads its config from the path in `$SCREENTIMED_CONFIG` if
 set, otherwise from `/etc/screentimed/config.toml`. Format is TOML.
 Reload by editing the file and restarting the daemon
-(`sudo launchctl kickstart -k system/com.qnicks.screentimed`).
+(`sudo launchctl kickstart -k system/com.gitopolis.screentimed`).
 
 A complete annotated example lives in
 [`packaging/config.example.toml`](../packaging/config.example.toml).

@@ -1,4 +1,4 @@
-//! Threshold-notification machinery for `screentime-tray`.
+//! Threshold-notification machinery for `konstantin-tray`.
 //!
 //! Two pieces:
 //!
@@ -13,7 +13,7 @@
 //!   keeps phase 7 simple.
 
 use chrono::{DateTime, Local};
-use screentime_proto::{SessionState, UserStatus};
+use konstantin_proto::{SessionState, UserStatus};
 
 /// Tracks which threshold has fired this reset cycle so each crossing
 /// announces exactly once.

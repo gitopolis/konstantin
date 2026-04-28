@@ -13,7 +13,7 @@ development you run it directly (or under `cargo run`).
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `SCREENTIMED_CONFIG` | `/etc/screentimed/config.toml` | Path to the TOML config. See [config.md](config.md) for the schema. |
-| `SCREENTIMED_LOG`    | `info,screentimed=debug,screentime_proto=info` | `tracing` `EnvFilter` directive. Standard syntax: `info`, `debug`, `screentimed::ipc=trace`, etc. |
+| `SCREENTIMED_LOG`    | `info,screentimed=debug,konstantin_proto=info` | `tracing` `EnvFilter` directive. Standard syntax: `info`, `debug`, `screentimed::ipc=trace`, etc. |
 
 ### Flags
 
@@ -60,7 +60,7 @@ To get just enforcement decisions:
 SCREENTIMED_LOG=screentimed::enforcement=info ./screentimed
 ```
 
-## `screentime-status`
+## `konstantin-status`
 
 The headless CLI client. Useful before the menu-bar UI exists, and as a
 diagnostic afterwards.
@@ -68,11 +68,11 @@ diagnostic afterwards.
 ### Usage
 
 ```
-screentime-status                  # one-shot, human-readable
-screentime-status --json           # one-shot, pretty JSON
-screentime-status --watch          # subscribe, stream compact lines
-screentime-status -w               # short form of --watch
-screentime-status --watch --json   # subscribe, one JSON object per line
+konstantin-status                  # one-shot, human-readable
+konstantin-status --json           # one-shot, pretty JSON
+konstantin-status --watch          # subscribe, stream compact lines
+konstantin-status -w               # short form of --watch
+konstantin-status --watch --json   # subscribe, one JSON object per line
 ```
 
 ### Flags
@@ -122,7 +122,7 @@ resets_at : 2026-04-27 00:00:00 -0700
 | `2`  | Transport / decode error (cannot connect, frame malformed, daemon vanished). |
 | `3`  | Daemon-side error response (currently unused — the daemon does not return `Response::Error` for either `GetStatus` or `Subscribe` after phase 4). |
 
-## `screentime-tray`
+## `konstantin-tray`
 
 The per-user menu-bar app. macOS only. Normally run as a LaunchAgent
 in Aqua sessions; for development you can launch it directly from a
@@ -138,12 +138,11 @@ No arguments. Show or hide via the menu-bar item; quit via the menu's
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `SCREENTIMED_SOCKET`    | `/var/run/screentimed.sock` | Path to the daemon's IPC socket. |
-| `SCREENTIME_TRAY_LOG`   | `info,screentime_tray=info` | `tracing` `EnvFilter` directive. |
+| `KONSTANTIN_TRAY_LOG`   | `info,konstantin_tray=info` | `tracing` `EnvFilter` directive. |
 
 ### Behavior
 
-* On startup the title is `screentime: …` until the first `StatusUpdate`
-  arrives.
+* On startup the title is `🔴` until the first `StatusUpdate` arrives.
 * While connected the title reflects `remaining_seconds`:
   * `Active` → `format_remaining(remaining_seconds)` (e.g. `1h23m`,
     `12m05s`)
@@ -151,9 +150,9 @@ No arguments. Show or hide via the menu-bar item; quit via the menu's
   * `Offline` → `offline`
   * `NotConfigured` → `—`
   * `Paused` (phase 8 only) → `⏸ <remaining>`
-* When the daemon stops the title becomes `screentime: ?` and the worker
-  retries `Subscription::open` every 2 s. Reconnect is automatic; no
-  user action needed.
+* When the daemon stops the title becomes `🔴` and the worker retries
+  `Subscription::open` every 2 s. Reconnect is automatic; no user
+  action needed.
 * When `remaining_seconds` crosses one of `warn_thresholds_minutes`
   (configured daemon-side, shipped with each `UserStatus`), the tray
   fires a notification via `osascript`. Each threshold fires at most
@@ -162,8 +161,8 @@ No arguments. Show or hide via the menu-bar item; quit via the menu's
 
 ### Logs
 
-When run as a LaunchAgent, stdout/stderr go to `/tmp/screentime-tray.out.log`
-and `/tmp/screentime-tray.err.log` (configurable in the plist).
+When run as a LaunchAgent, stdout/stderr go to `/tmp/konstantin-tray.out.log`
+and `/tmp/konstantin-tray.err.log` (configurable in the plist).
 
 ## Building
 

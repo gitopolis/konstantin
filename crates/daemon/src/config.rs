@@ -78,7 +78,7 @@ pub enum Enforcement {
 }
 
 fn default_socket_path() -> PathBuf {
-    PathBuf::from(screentime_proto::DEFAULT_SOCKET_PATH)
+    PathBuf::from(konstantin_proto::DEFAULT_SOCKET_PATH)
 }
 
 fn default_state_path() -> PathBuf {

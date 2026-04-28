@@ -5,29 +5,36 @@ read it before making changes so decisions stay consistent.
 
 Owner: Nikita (qnicks@gmail.com). Target machine: macOS Tahoe on Apple
 Silicon. Rust edition 2021, MSRV 1.78. Distribution intent: Homebrew
-cask shipping an unsigned `Screentime.app` bundle. Developer ID
+cask shipping an unsigned `Konstantin.app` bundle. Developer ID
 notarization is out of scope for v1.
+
+The user-facing application is **Konstantin**; the privileged daemon
+binary keeps its historical `screentimed` name (so do all the
+`/etc/screentimed/`, `/var/db/screentimed/`, `/var/run/screentimed.sock`,
+`/var/log/screentimed.log` paths and the `SCREENTIMED_*` env vars).
+Bundle / cask / binary identifiers use the `com.gitopolis.*` prefix and
+the `konstantin` name root.
 
 ## Architecture
 
 Three Rust artifacts in one Cargo workspace, all eventually packaged
-into a single `Screentime.app` bundle (see "App bundle architecture"
+into a single `Konstantin.app` bundle (see "App bundle architecture"
 below).
 
 * **`screentimed`** — privileged LaunchDaemon, runs as root. Owns
   config loading, per-user counters, console-session enumeration via
   `utmpx`, midnight resets, the `Subscribe` push channel, and forced
   logouts via `launchctl bootout user/<uid>`.
-* **`screentime-tray`** — per-user LaunchAgent (Aqua only). `NSStatusBar`
+* **`konstantin-tray`** — per-user LaunchAgent (Aqua only). `NSStatusBar`
   / `NSStatusItem` menu-bar app subscribed to the daemon's push channel.
   Shows remaining time live, fires threshold notifications, and (in
   progress) lets the operator start / stop / restart / configure the
   daemon via menu items gated by a system admin-password prompt.
-* **`screentime-proto`** — shared library: wire types (`Request`,
+* **`konstantin-proto`** — shared library: wire types (`Request`,
   `Response`, `UserStatus`, `SessionState`) and length-prefixed JSON
   framing helpers.
 
-A headless `screentime-status` CLI also lives in the tray crate. Useful
+A headless `konstantin-status` CLI also lives in the tray crate. Useful
 for diagnostics; not user-facing once the `.app` ships.
 
 IPC is over a Unix socket at `/var/run/screentimed.sock` (mode 0666).
@@ -49,14 +56,14 @@ The end-user product is one `.app` bundle, distributed via Homebrew
 cask. Bundle layout:
 
 ```
-Screentime.app/Contents/
+Konstantin.app/Contents/
   Info.plist                                — LSUIElement=true (no Dock icon)
-  MacOS/screentime-tray                     — main bundle executable
-  Library/LaunchDaemons/com.qnicks.screentimed.plist
+  MacOS/konstantin-tray                     — main bundle executable
+  Library/LaunchDaemons/com.gitopolis.screentimed.plist
   Resources/
     screentimed                             — daemon binary (copied to
                                               /usr/local/libexec/ at install)
-    screentime-status                       — diagnostic CLI
+    konstantin-status                       — diagnostic CLI
     config.example.toml
     AppIcon.icns
 ```
@@ -66,8 +73,8 @@ First-launch flow:
 1. Tray attempts `UnixStream::connect("/var/run/screentimed.sock")`.
    If it succeeds, the daemon is already running — proceed with normal
    subscribe.
-2. If the connect fails AND `/Library/LaunchDaemons/com.qnicks.screentimed.plist`
-   is missing, the tray puts up a "Set up Screentime" alert that runs
+2. If the connect fails AND `/Library/LaunchDaemons/com.gitopolis.screentimed.plist`
+   is missing, the tray puts up a "Set up Konstantin" alert that runs
    the install steps (copy daemon binary into `/usr/local/libexec/`,
    plist into `/Library/LaunchDaemons/`, `launchctl bootstrap`).
 3. The per-user LaunchAgent is dropped into `~/Library/LaunchAgents/`
@@ -131,12 +138,12 @@ These were Nikita's choices; revisit explicitly before changing them.
 6. **Notifications via `osascript`** (not `UNUserNotificationCenter`).
    `osascript` is signed by Apple, so notifications work without TCC
    consent or bundle signing. Trade: notifications attribute to
-   "Script Editor" rather than "Screentime". `UNUserNotificationCenter`
+   "Script Editor" rather than "Konstantin". `UNUserNotificationCenter`
    is the future path once Developer ID signing is in place.
 
 7. **`.app` bundle is the canonical install path.** The bundle ships
    the daemon binary at `Contents/Resources/screentimed`. On
-   "Set up Screentime", the binary is **copied** (not symlinked) into
+   "Set up Konstantin", the binary is **copied** (not symlinked) into
    `/usr/local/libexec/`. Re-running setup re-copies, fixing version
    skew when the user upgrades the bundle.
 
@@ -172,7 +179,7 @@ These were Nikita's choices; revisit explicitly before changing them.
   user/<uid>` with a 5 s timeout and best-effort retry on failure.
   **Live verification of Logout mode against `alice`/`bob` is still
   pending.**
-* **Phase 6** — `screentime-tray` binary using `objc2 = "0.6"`,
+* **Phase 6** — `konstantin-tray` binary using `objc2 = "0.6"`,
   `objc2-app-kit = "0.3"`, `objc2-foundation = "0.3"`, `block2 = "0.6"`.
   Main thread runs `NSApplication` and a 5 Hz `NSTimer` block; worker
   thread hosts a current-thread tokio runtime running the
@@ -181,7 +188,7 @@ These were Nikita's choices; revisit explicitly before changing them.
   `NotifTracker` decision logic; tracker resets on `resets_at` change,
   fires the smallest applicable threshold only, suppresses
   `LimitReached` (user is being kicked, not warned).
-* **A1** — `packaging/build-app.sh` produces `target/Screentime.app/`
+* **A1** — `packaging/build-app.sh` produces `target/Konstantin.app/`
   from release binaries. `LSUIElement=true`, ad-hoc codesigned.
 * **A2** — first-launch install: socket-probe → optional NSAlert →
   privileged install via `osascript` on a background thread, with
@@ -202,13 +209,13 @@ These were Nikita's choices; revisit explicitly before changing them.
 * **A6** — `bundle::Paths::resolve()` handles both real `.app` bundles
   and dev-tree (`target/<profile>/` + `packaging/`). Source labelled
   in startup log. User LaunchAgent rewrite is bundle-only — running
-  `target/release/screentime-tray` directly no longer poisons
+  `target/release/konstantin-tray` directly no longer poisons
   `~/Library/LaunchAgents/` with a dev path.
 * **A7** — `Uninstall…` menu item: confirm → privileged teardown
   (`launchctl bootout` + `rm` of system files) → user LaunchAgent
   cleanup → `NSApplication::terminate`. `/etc/screentimed/` and
   `/var/db/screentimed/` preserved by default.
-  `packaging/screentime.rb` cask formula has matching `uninstall` +
+  `packaging/konstantin.rb` cask formula has matching `uninstall` +
   `zap` stanzas for non-interactive `brew uninstall --zap`.
 
 Tests: 21 passing at last commit (proto×2, daemon×13, tray×6). Unsafe
@@ -231,9 +238,9 @@ wider distribution:
   and so we can move to `SMAppService` and `UNUserNotificationCenter`.
 * **Real `AppIcon.iconset/`** in `packaging/`. Currently the bundle
   ships with macOS's generic application icon.
-* **Homebrew tap repo** (`github.com/qnicks/homebrew-screentime`) hosting
-  the cask formula at `packaging/screentime.rb`. Plus a release pipeline
-  that builds, zips, and pushes `Screentime-<version>.zip` artifacts.
+* **Homebrew tap repo** (`github.com/gitopolis/homebrew-konstantin`) hosting
+  the cask formula at `packaging/konstantin.rb`. Plus a release pipeline
+  that builds, zips, and pushes `Konstantin-<version>.zip` artifacts.
 
 ## Hard safety rules
 
@@ -300,7 +307,7 @@ survive reinstalls.
 ## Layout
 
 ```
-screentime/
+konstantin/
 ├── Cargo.toml                                          # workspace root
 ├── CLAUDE.md                                           # this file
 ├── README.md
@@ -313,13 +320,13 @@ screentime/
 │   ├── daemon/     src/{main,config,ipc,sessions,
 │   │                   state,time,enforcement}.rs      # screentimed
 │   └── tray/       src/{lib,notifications}.rs,
-│                   src/bin/{status,tray}.rs            # screentime-status + tray
+│                   src/bin/{status,tray}.rs            # konstantin-status + tray
 └── packaging/
-    ├── com.qnicks.screentimed.plist            # LaunchDaemon, runs as root
-    ├── com.qnicks.screentime-tray.plist        # LaunchAgent, Aqua-only
+    ├── com.gitopolis.screentimed.plist          # LaunchDaemon, runs as root
+    ├── com.gitopolis.konstantin-tray.plist      # LaunchAgent, Aqua-only
     ├── config.example.toml
-    ├── install.sh, uninstall.sh                # system-side, requires sudo
-    ├── install-tray.sh, uninstall-tray.sh      # per-user, no sudo
+    ├── install.sh, uninstall.sh                 # system-side, requires sudo
+    ├── install-tray.sh, uninstall-tray.sh       # per-user, no sudo
     └── create-test-users.sh, delete-test-users.sh
 ```
 

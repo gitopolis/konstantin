@@ -205,6 +205,37 @@ dependencies = [
 ]
 
 [[package]]
+name = "konstantin-proto"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
+name = "konstantin-tray"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "block2",
+ "chrono",
+ "konstantin-proto",
+ "objc2",
+ "objc2-app-kit",
+ "objc2-foundation",
+ "plist",
+ "serde",
+ "serde_json",
+ "tokio",
+ "toml",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "lazy_static"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -528,45 +559,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b39cdef0fa800fc44525c84ccb54a029961a8215f9619753635a9c0d2538d46d"
 
 [[package]]
-name = "screentime-proto"
-version = "0.1.0"
-dependencies = [
- "chrono",
- "serde",
- "serde_json",
- "thiserror",
- "tokio",
-]
-
-[[package]]
-name = "screentime-tray"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "block2",
- "chrono",
- "objc2",
- "objc2-app-kit",
- "objc2-foundation",
- "plist",
- "screentime-proto",
- "serde",
- "serde_json",
- "tokio",
- "toml",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
 name = "screentimed"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "chrono",
+ "konstantin-proto",
  "libc",
  "nix",
- "screentime-proto",
  "serde",
  "serde_json",
  "thiserror",

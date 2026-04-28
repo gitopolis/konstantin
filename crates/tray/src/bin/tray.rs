@@ -1,4 +1,4 @@
-//! `screentime-tray` — per-user menu-bar app for macOS.
+//! `konstantin-tray` — per-user menu-bar app for macOS.
 //!
 //! Shows remaining daily time in `NSStatusItem`. Subscribes to the daemon's
 //! push channel so the title updates every tick (and on midnight rollover)
@@ -19,7 +19,7 @@
 
 #[cfg(not(target_os = "macos"))]
 fn main() {
-    eprintln!("screentime-tray: macOS only");
+    eprintln!("konstantin-tray: macOS only");
     std::process::exit(1);
 }
 
@@ -42,9 +42,9 @@ mod imp {
     // NSRunningApplication header, not NSApplication's.
     use objc2_app_kit::NSApplicationActivationPolicy;
     use objc2_foundation::{MainThreadMarker, NSString, NSTimer};
-    use screentime_proto::{SessionState, UserStatus};
-    use screentime_tray::notifications::{self, NotifTracker};
-    use screentime_tray::{default_socket_path, format_remaining, Subscription};
+    use konstantin_proto::{SessionState, UserStatus};
+    use konstantin_tray::notifications::{self, NotifTracker};
+    use konstantin_tray::{default_socket_path, format_remaining, Subscription};
     use std::ptr::NonNull;
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
@@ -103,13 +103,13 @@ mod imp {
             Ok(p) => tracing::info!(
                 source = p.source.label(),
                 daemon = %p.daemon_binary.display(),
-                "screentime-tray starting"
+                "konstantin-tray starting"
             ),
             Err(e) => tracing::warn!(error = %e, "could not resolve bundle paths"),
         }
 
         let mtm = MainThreadMarker::new()
-            .expect("screentime-tray must be launched on the main thread");
+            .expect("konstantin-tray must be launched on the main thread");
 
         let app = NSApplication::sharedApplication(mtm);
         // Accessory: menu-bar item only — no Dock icon, no main menu.
@@ -131,7 +131,7 @@ mod imp {
         // ARE the running tray; bootstrap would race-spawn a sibling.
         //
         // Skipped when running from a dev tree, since the LaunchAgent
-        // would point at `target/release/screentime-tray`; if that
+        // would point at `target/release/konstantin-tray`; if that
         // binary is later cleaned (`cargo clean`) or moved, login
         // auto-start would silently fail.
         match bundle::Paths::resolve().map(|p| p.source) {
@@ -252,7 +252,7 @@ mod imp {
 
     fn spawn_subscriber(latest: Arc<Mutex<Latest>>) {
         std::thread::Builder::new()
-            .name("screentime-tray-subscriber".into())
+            .name("konstantin-tray-subscriber".into())
             .spawn(move || {
                 let rt = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
@@ -373,8 +373,8 @@ mod imp {
     }
 
     fn install_tracing() {
-        let filter = EnvFilter::try_from_env("SCREENTIME_TRAY_LOG")
-            .unwrap_or_else(|_| EnvFilter::new("info,screentime_tray=info"));
+        let filter = EnvFilter::try_from_env("KONSTANTIN_TRAY_LOG")
+            .unwrap_or_else(|_| EnvFilter::new("info,konstantin_tray=info"));
         tracing_subscriber::fmt()
             .with_env_filter(filter)
             .with_target(true)
@@ -385,7 +385,7 @@ mod imp {
     /// example config — either from this `.app` bundle's
     /// `Contents/Resources/` (production) or from `target/<profile>/`
     /// + `packaging/` (developer running `cargo run` or
-    /// `target/release/screentime-tray` directly).
+    /// `target/release/konstantin-tray` directly).
     ///
     /// One source of truth so anyone needing a bundled artifact —
     /// install, future "update daemon" flow, diagnostics — calls
@@ -443,7 +443,7 @@ mod imp {
                         return Ok(Self {
                             daemon_binary: bundled_daemon,
                             daemon_plist: contents
-                                .join("Library/LaunchDaemons/com.qnicks.screentimed.plist"),
+                                .join("Library/LaunchDaemons/com.gitopolis.screentimed.plist"),
                             config_example: resources.join("config.example.toml"),
                             source: Source::Bundle,
                         });
@@ -468,7 +468,7 @@ mod imp {
                 Ok(Self {
                     daemon_binary: profile_dir.join("screentimed"),
                     daemon_plist: workspace
-                        .join("packaging/com.qnicks.screentimed.plist"),
+                        .join("packaging/com.gitopolis.screentimed.plist"),
                     config_example: workspace.join("packaging/config.example.toml"),
                     source: Source::DevTree,
                 })
@@ -494,7 +494,7 @@ mod imp {
         define_class!(
             #[unsafe(super(NSObject))]
             #[thread_kind = MainThreadOnly]
-            #[name = "ScreentimeTrayController"]
+            #[name = "KonstantinTrayController"]
             pub struct Controller;
 
             impl Controller {
@@ -510,11 +510,11 @@ mod imp {
                     run_admin(
                         mtm,
                         "Starting Daemon",
-                        "Starting Screentime…",
-                        "(launchctl bootstrap system /Library/LaunchDaemons/com.qnicks.screentimed.plist || true) && \
-                         (launchctl enable system/com.qnicks.screentimed || true) && \
-                         launchctl kickstart system/com.qnicks.screentimed",
-                        "Couldn't start Screentime.",
+                        "Starting Konstantin…",
+                        "(launchctl bootstrap system /Library/LaunchDaemons/com.gitopolis.screentimed.plist || true) && \
+                         (launchctl enable system/com.gitopolis.screentimed || true) && \
+                         launchctl kickstart system/com.gitopolis.screentimed",
+                        "Couldn't start Konstantin.",
                     );
                 }
 
@@ -527,9 +527,9 @@ mod imp {
                     run_admin(
                         mtm,
                         "Stopping Daemon",
-                        "Stopping Screentime…",
-                        "launchctl bootout system/com.qnicks.screentimed || true",
-                        "Couldn't stop Screentime.",
+                        "Stopping Konstantin…",
+                        "launchctl bootout system/com.gitopolis.screentimed || true",
+                        "Couldn't stop Konstantin.",
                     );
                 }
 
@@ -542,10 +542,10 @@ mod imp {
                     run_admin(
                         mtm,
                         "Restarting Daemon",
-                        "Restarting Screentime…",
-                        "(launchctl bootstrap system /Library/LaunchDaemons/com.qnicks.screentimed.plist || true) && \
-                         launchctl kickstart -k system/com.qnicks.screentimed",
-                        "Couldn't restart Screentime.",
+                        "Restarting Konstantin…",
+                        "(launchctl bootstrap system /Library/LaunchDaemons/com.gitopolis.screentimed.plist || true) && \
+                         launchctl kickstart -k system/com.gitopolis.screentimed",
+                        "Couldn't restart Konstantin.",
                     );
                 }
 
@@ -614,17 +614,17 @@ mod imp {
         /// `/etc/screentimed/` (config) and `/var/db/screentimed/`
         /// (counter state) are intentionally preserved so a reinstall
         /// resumes where the user left off. The Homebrew cask's `zap`
-        /// block at `packaging/screentime.rb` removes those for users
+        /// block at `packaging/konstantin.rb` removes those for users
         /// who want a clean wipe.
         fn uninstall_flow(mtm: MainThreadMarker) {
             if !alerts::confirm(
                 mtm,
-                "Uninstall Screentime?",
+                "Uninstall Konstantin?",
                 "Stops the background service and removes its files.\n\n\
                  Your configuration (/etc/screentimed/) and counter state \
                  (/var/db/screentimed/) will be preserved so a reinstall \
                  picks up where you left off. To remove those too, run \
-                 `brew uninstall --zap screentime` after this finishes, \
+                 `brew uninstall --zap konstantin` after this finishes, \
                  or delete them by hand.",
                 "Uninstall",
                 "Cancel",
@@ -637,24 +637,24 @@ mod imp {
             // is `|| true` because it errors if the daemon isn't
             // loaded — also fine.
             let script = "\
-                launchctl bootout system/com.qnicks.screentimed 2>/dev/null || true; \
-                rm -f /Library/LaunchDaemons/com.qnicks.screentimed.plist; \
-                rm -f /Library/LaunchAgents/com.qnicks.screentime-tray.plist; \
+                launchctl bootout system/com.gitopolis.screentimed 2>/dev/null || true; \
+                rm -f /Library/LaunchDaemons/com.gitopolis.screentimed.plist; \
+                rm -f /Library/LaunchAgents/com.gitopolis.konstantin-tray.plist; \
                 rm -f /usr/local/libexec/screentimed; \
-                rm -f /usr/local/bin/screentime-status; \
-                rm -f /usr/local/bin/screentime-tray; \
+                rm -f /usr/local/bin/konstantin-status; \
+                rm -f /usr/local/bin/konstantin-tray; \
                 rm -f /var/run/screentimed.sock";
 
             match admin::run_with_progress(
                 mtm,
-                "Uninstalling Screentime",
+                "Uninstalling Konstantin",
                 "Stopping the background service and removing files…",
                 script,
             ) {
                 Ok(()) => {}
                 Err(admin::Error::Cancelled) => return,
                 Err(admin::Error::Failed(msg)) => {
-                    alerts::message(mtm, "Couldn't uninstall Screentime.", &msg);
+                    alerts::message(mtm, "Couldn't uninstall Konstantin.", &msg);
                     return;
                 }
             }
@@ -665,14 +665,14 @@ mod imp {
             // process exits via `terminate` below.
             if let Ok(home) = std::env::var("HOME") {
                 let plist = std::path::PathBuf::from(home)
-                    .join("Library/LaunchAgents/com.qnicks.screentime-tray.plist");
+                    .join("Library/LaunchAgents/com.gitopolis.konstantin-tray.plist");
                 let _ = std::fs::remove_file(&plist);
             }
 
             alerts::message(
                 mtm,
-                "Screentime has been uninstalled.",
-                "The app will now quit. Move Screentime.app to the Trash \
+                "Konstantin has been uninstalled.",
+                "The app will now quit. Move Konstantin.app to the Trash \
                  to finish removing the application bundle.",
             );
 
@@ -774,7 +774,7 @@ mod imp {
             let cmd = bash_command.to_string();
             let (tx, rx) = mpsc::channel::<Result<(), Error>>();
             std::thread::Builder::new()
-                .name("screentime-tray-admin".into())
+                .name("konstantin-tray-admin".into())
                 .spawn(move || {
                     let _ = tx.send(run_osascript_blocking(&cmd));
                 })
@@ -895,7 +895,7 @@ mod imp {
         use std::path::{Path, PathBuf};
 
         /// macOS LaunchDaemon plist destination (system).
-        const SYSTEM_PLIST: &str = "/Library/LaunchDaemons/com.qnicks.screentimed.plist";
+        const SYSTEM_PLIST: &str = "/Library/LaunchDaemons/com.gitopolis.screentimed.plist";
         /// IPC socket — used purely as a liveness probe.
         const SOCKET_PATH: &str = "/var/run/screentimed.sock";
 
@@ -921,8 +921,8 @@ mod imp {
         pub fn run_first_launch_install(mtm: MainThreadMarker) -> bool {
             if !alerts::confirm(
                 mtm,
-                "Set up Screentime",
-                "Screentime needs to install its background service. \
+                "Set up Konstantin",
+                "Konstantin needs to install its background service. \
                  You'll be prompted for your administrator password.",
                 "Set Up…",
                 "Quit",
@@ -945,8 +945,8 @@ mod imp {
 
             match admin::run_with_progress(
                 mtm,
-                "Setting Up Screentime",
-                "Installing Screentime's background service.\n\
+                "Setting Up Konstantin",
+                "Installing Konstantin's background service.\n\
                  You may be prompted for your administrator password.",
                 &script,
             ) {
@@ -960,13 +960,13 @@ mod imp {
                 }
                 Err(admin::Error::Failed(msg)) => {
                     tracing::error!(error = %msg, "install command failed");
-                    alerts::message(mtm, "Screentime install failed.", &msg);
+                    alerts::message(mtm, "Konstantin install failed.", &msg);
                     false
                 }
             }
         }
 
-        /// Idempotent. Writes `~/Library/LaunchAgents/com.qnicks.screentime-tray.plist`
+        /// Idempotent. Writes `~/Library/LaunchAgents/com.gitopolis.konstantin-tray.plist`
         /// pointing at `current_exe()`. Skips the write if the existing
         /// content is already correct. Does NOT bootstrap — the tray is
         /// already running, and a bootstrap would race-spawn a sibling
@@ -977,7 +977,7 @@ mod imp {
                 .map_err(|_| anyhow::anyhow!("HOME not set"))?;
             let agents_dir = PathBuf::from(home).join("Library/LaunchAgents");
             std::fs::create_dir_all(&agents_dir)?;
-            let dst = agents_dir.join("com.qnicks.screentime-tray.plist");
+            let dst = agents_dir.join("com.gitopolis.konstantin-tray.plist");
             let want = build_user_launchagent_plist(&exe);
 
             if let Ok(have) = std::fs::read_to_string(&dst) {
@@ -1005,11 +1005,11 @@ mod imp {
                  install -d -m 0755 /etc/screentimed && \
                  install -d -m 0700 /var/db/screentimed && \
                  install -m 0755 '{daemon}' /usr/local/libexec/screentimed && \
-                 install -m 0644 '{plist}' /Library/LaunchDaemons/com.qnicks.screentimed.plist && \
+                 install -m 0644 '{plist}' /Library/LaunchDaemons/com.gitopolis.screentimed.plist && \
                  ([ -f /etc/screentimed/config.toml ] || install -m 0644 '{config}' /etc/screentimed/config.toml) && \
-                 (launchctl bootstrap system /Library/LaunchDaemons/com.qnicks.screentimed.plist || true) && \
-                 launchctl enable system/com.qnicks.screentimed && \
-                 launchctl kickstart -k system/com.qnicks.screentimed",
+                 (launchctl bootstrap system /Library/LaunchDaemons/com.gitopolis.screentimed.plist || true) && \
+                 launchctl enable system/com.gitopolis.screentimed && \
+                 launchctl kickstart -k system/com.gitopolis.screentimed",
                 daemon = p.daemon_binary.display(),
                 plist = p.daemon_plist.display(),
                 config = p.config_example.display(),
@@ -1024,7 +1024,7 @@ mod imp {
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>com.qnicks.screentime-tray</string>
+    <string>com.gitopolis.konstantin-tray</string>
     <key>ProgramArguments</key>
     <array>
         <string>{exe}</string>
@@ -1036,9 +1036,9 @@ mod imp {
     <key>LimitLoadToSessionType</key>
     <string>Aqua</string>
     <key>StandardOutPath</key>
-    <string>/tmp/screentime-tray.out.log</string>
+    <string>/tmp/konstantin-tray.out.log</string>
     <key>StandardErrorPath</key>
-    <string>/tmp/screentime-tray.err.log</string>
+    <string>/tmp/konstantin-tray.err.log</string>
 </dict>
 </plist>
 "#
@@ -1081,13 +1081,13 @@ mod imp {
             NSWindowStyleMask,
         };
         use objc2_foundation::{NSData, NSPoint, NSRect, NSSize};
-        use screentime_tray::users::{self, LocalUser, UserPicture};
+        use konstantin_tray::users::{self, LocalUser, UserPicture};
         use std::cell::RefCell;
         use std::path::{Path, PathBuf};
 
         const SYSTEM_CONFIG: &str = "/etc/screentimed/config.toml";
-        const TRAY_AGENT_LABEL: &str = "com.qnicks.screentime-tray";
-        const TRAY_AGENT_FILENAME: &str = "com.qnicks.screentime-tray.plist";
+        const TRAY_AGENT_LABEL: &str = "com.gitopolis.konstantin-tray";
+        const TRAY_AGENT_FILENAME: &str = "com.gitopolis.konstantin-tray.plist";
 
         thread_local! {
             /// At most one configure window at a time. Re-opening just
@@ -1126,7 +1126,7 @@ mod imp {
         define_class!(
             #[unsafe(super(NSObject))]
             #[thread_kind = MainThreadOnly]
-            #[name = "ScreentimeConfigController"]
+            #[name = "KonstantinConfigController"]
             pub struct ConfigController;
 
             impl ConfigController {
@@ -1195,7 +1195,7 @@ mod imp {
                 super::alerts::message(
                     mtm,
                     "No configuration found.",
-                    "Set up Screentime first to create the configuration file.",
+                    "Set up Konstantin first to create the configuration file.",
                 );
                 return;
             }
@@ -1367,7 +1367,7 @@ mod imp {
 
         // ─── Operator-owned UI state cache ─────────────────────────────
         //
-        // `~/Library/Application Support/com.qnicks.screentime/ui-state.json`.
+        // `~/Library/Application Support/com.gitopolis.konstantin/ui-state.json`.
         // Tracks per-user "Start at login" intent across tray restarts.
         // The on-disk plist for *other* users isn't stat-able from the
         // operator's process on hardened macOS, so this cache is the
@@ -1383,7 +1383,7 @@ mod imp {
             let home = std::env::var_os("HOME")?;
             Some(
                 PathBuf::from(home)
-                    .join("Library/Application Support/com.qnicks.screentime/ui-state.json"),
+                    .join("Library/Application Support/com.gitopolis.konstantin/ui-state.json"),
             )
         }
 
@@ -1473,7 +1473,7 @@ mod imp {
                     defer: false,
                 ]
             };
-            window.setTitle(&NSString::from_str("Screentime Settings"));
+            window.setTitle(&NSString::from_str("Konstantin Settings"));
             unsafe { window.setReleasedWhenClosed(false) };
             window.center();
 
@@ -1485,7 +1485,7 @@ mod imp {
 
             // Title.
             let title_y = height - y_top - title_block;
-            let title = make_title_label(mtm, "Screentime Settings");
+            let title = make_title_label(mtm, "Konstantin Settings");
             title.setFrame(NSRect::new(
                 NSPoint::new(SIDE_MARGIN, title_y),
                 NSSize::new(WINDOW_WIDTH - 2.0 * SIDE_MARGIN, title_block),
@@ -1809,7 +1809,7 @@ mod imp {
                 }
             };
 
-            let config_temp = tmp_path("screentime-config", "toml");
+            let config_temp = tmp_path("konstantin-config", "toml");
             if let Err(e) = std::fs::write(&config_temp, &new_config_text) {
                 super::alerts::message(mtm, "Couldn't write temp config.", &e.to_string());
                 return;
@@ -1834,7 +1834,7 @@ mod imp {
                 }
                 if row.autostart_target {
                     let plist_temp =
-                        tmp_path(&format!("screentime-agent-{}", row.username), "plist");
+                        tmp_path(&format!("konstantin-agent-{}", row.username), "plist");
                     let plist_body =
                         super::install::build_user_launchagent_plist(&tray_exe());
                     if let Err(e) = std::fs::write(&plist_temp, plist_body) {
@@ -1857,7 +1857,7 @@ mod imp {
             let outcome = super::admin::run_with_progress(
                 mtm,
                 "Saving Settings",
-                "Saving and reloading Screentime…",
+                "Saving and reloading Konstantin…",
                 &script,
             );
 
@@ -2038,7 +2038,7 @@ mod imp {
                     ));
                 }
             }
-            parts.push("launchctl kickstart -k system/com.qnicks.screentimed".to_string());
+            parts.push("launchctl kickstart -k system/com.gitopolis.screentimed".to_string());
             parts.join(" && ")
         }
 
@@ -2069,7 +2069,7 @@ mod imp {
 
         fn tray_exe() -> PathBuf {
             std::env::current_exe()
-                .unwrap_or_else(|_| PathBuf::from("/usr/local/bin/screentime-tray"))
+                .unwrap_or_else(|_| PathBuf::from("/usr/local/bin/konstantin-tray"))
         }
 
         fn tmp_path(stem: &str, ext: &str) -> PathBuf {

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Install screentimed + tray client on the local machine.
+# Install screentimed + Konstantin tray client on the local machine.
 #
 # This script ASSUMES you have built the workspace already:
 #     cargo build --release
@@ -45,13 +45,13 @@ install_tray_for_user() {
     fi
 
     agents_dir="${home}/Library/LaunchAgents"
-    dst="${agents_dir}/com.qnicks.screentime-tray.plist"
+    dst="${agents_dir}/com.gitopolis.konstantin-tray.plist"
 
     # Create LaunchAgents/ owned by the user, then drop the plist with
     # matching ownership so the user can manage it without sudo.
     install -d -o "$user" -g staff -m 0755 "$agents_dir"
     install -m 0644 -o "$user" -g staff \
-        "${ROOT}/packaging/com.qnicks.screentime-tray.plist" "$dst"
+        "${ROOT}/packaging/com.gitopolis.konstantin-tray.plist" "$dst"
     echo "  installed for ${user} (uid ${uid}) → ${dst}"
 
     # `gui/<uid>` only exists while the user has an active Aqua session.
@@ -59,10 +59,10 @@ install_tray_for_user() {
     # sudo), boot the agent up immediately. Otherwise launchd picks it
     # up at next login via `RunAtLoad`.
     if launchctl print "gui/${uid}" >/dev/null 2>&1; then
-        launchctl bootout "gui/${uid}/com.qnicks.screentime-tray" 2>/dev/null || true
+        launchctl bootout "gui/${uid}/com.gitopolis.konstantin-tray" 2>/dev/null || true
         if launchctl bootstrap "gui/${uid}" "$dst" 2>/dev/null; then
-            launchctl enable "gui/${uid}/com.qnicks.screentime-tray" 2>/dev/null || true
-            launchctl kickstart "gui/${uid}/com.qnicks.screentime-tray" 2>/dev/null || true
+            launchctl enable "gui/${uid}/com.gitopolis.konstantin-tray" 2>/dev/null || true
+            launchctl kickstart "gui/${uid}/com.gitopolis.konstantin-tray" 2>/dev/null || true
             echo "    bootstrapped into gui/${uid}"
         else
             echo "    bootstrap failed; will retry at next login" >&2
@@ -72,7 +72,7 @@ install_tray_for_user() {
     fi
 }
 
-for bin in screentimed screentime-status screentime-tray; do
+for bin in screentimed konstantin-status konstantin-tray; do
     if [[ ! -x "${TARGET}/${bin}" ]]; then
         echo "missing ${TARGET}/${bin} — run 'cargo build --release' first" >&2
         exit 1
@@ -90,9 +90,9 @@ install -d -m 0755 /Library/LaunchDaemons
 echo "→ installing daemon binary"
 install -m 0755 "${TARGET}/screentimed"        /usr/local/libexec/screentimed
 echo "→ installing CLI client"
-install -m 0755 "${TARGET}/screentime-status"  /usr/local/bin/screentime-status
+install -m 0755 "${TARGET}/konstantin-status"  /usr/local/bin/konstantin-status
 echo "→ installing menu-bar app"
-install -m 0755 "${TARGET}/screentime-tray"    /usr/local/bin/screentime-tray
+install -m 0755 "${TARGET}/konstantin-tray"    /usr/local/bin/konstantin-tray
 
 echo "→ creating /etc/screentimed/"
 install -d -m 0755 /etc/screentimed
@@ -107,13 +107,13 @@ echo "→ creating /var/db/screentimed/"
 install -d -m 0700 /var/db/screentimed
 
 echo "→ installing LaunchDaemon plist"
-install -m 0644 "${ROOT}/packaging/com.qnicks.screentimed.plist" \
-    /Library/LaunchDaemons/com.qnicks.screentimed.plist
+install -m 0644 "${ROOT}/packaging/com.gitopolis.screentimed.plist" \
+    /Library/LaunchDaemons/com.gitopolis.screentimed.plist
 
 echo "→ loading LaunchDaemon"
-launchctl bootstrap system /Library/LaunchDaemons/com.qnicks.screentimed.plist || true
-launchctl enable system/com.qnicks.screentimed || true
-launchctl kickstart -k system/com.qnicks.screentimed || true
+launchctl bootstrap system /Library/LaunchDaemons/com.gitopolis.screentimed.plist || true
+launchctl enable system/com.gitopolis.screentimed || true
+launchctl kickstart -k system/com.gitopolis.screentimed || true
 
 # --- per-user tray LaunchAgent --------------------------------------
 echo "→ installing per-user tray LaunchAgent(s)"

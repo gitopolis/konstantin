@@ -1,4 +1,4 @@
-# screentime
+# konstantin
 
 A macOS screen-time enforcer written in Rust.
 
@@ -6,9 +6,9 @@ A macOS screen-time enforcer written in Rust.
   sessions via `utmpx`, tracks per-user used-seconds, persists state to
   disk, resets at local midnight, and (when configured to) kicks users
   over their daily limit via `launchctl bootout`.
-* `screentime-status` — headless CLI client. Asks the daemon "what's my
+* `konstantin-status` — headless CLI client. Asks the daemon "what's my
   status?" over a Unix socket. Supports `--watch` for a live stream.
-* `screentime-tray` — per-user menu-bar app. Subscribes to the daemon's
+* `konstantin-tray` — per-user menu-bar app. Subscribes to the daemon's
   push channel and shows remaining time live in `NSStatusItem`.
 
 ## Documentation
@@ -23,21 +23,21 @@ A macOS screen-time enforcer written in Rust.
 ## Layout
 
 ```
-screentime/
+konstantin/
 ├── Cargo.toml              # workspace root
 ├── CLAUDE.md               # design notes (handoff to future contributors)
 ├── crates/
 │   ├── proto/              # serde wire types + length-prefixed framing
 │   ├── daemon/             # `screentimed` binary
-│   └── tray/               # `screentime-status` (and later `screentime-tray`)
+│   └── tray/               # `konstantin-status` and `konstantin-tray`
 ├── docs/                   # user-facing reference
 └── packaging/
-    ├── com.qnicks.screentimed.plist        # LaunchDaemon
-    ├── com.qnicks.screentime-tray.plist    # per-user LaunchAgent
+    ├── com.gitopolis.screentimed.plist          # LaunchDaemon
+    ├── com.gitopolis.konstantin-tray.plist      # per-user LaunchAgent
     ├── config.example.toml
     ├── install.sh
     ├── uninstall.sh
-    ├── create-test-users.sh                # makes alice + bob
+    ├── create-test-users.sh                     # makes alice + bob
     └── delete-test-users.sh
 ```
 
@@ -48,13 +48,13 @@ cargo build --release
 cargo test  --workspace
 ```
 
-To produce a `Screentime.app` bundle (the user-facing distribution
+To produce a `Konstantin.app` bundle (the user-facing distribution
 artifact, ad-hoc codesigned for Apple Silicon):
 
 ```sh
 cargo build --release
-./packaging/build-app.sh                     # writes target/Screentime.app/
-open target/Screentime.app                   # launch via Launch Services
+./packaging/build-app.sh                     # writes target/Konstantin.app/
+open target/Konstantin.app                   # launch via Launch Services
 ```
 
 The bundle is currently unsigned for distribution (no Developer ID).
@@ -85,7 +85,7 @@ SCREENTIMED_LOG=debug \
 In another terminal — single status query:
 
 ```sh
-SCREENTIMED_SOCKET=./run/screentimed.sock ./target/release/screentime-status
+SCREENTIMED_SOCKET=./run/screentimed.sock ./target/release/konstantin-status
 ```
 
 For the operator's account (not in `[users.*]`) you'll get
@@ -96,7 +96,7 @@ advances every `tick_seconds`.
 Live-stream the same view:
 
 ```sh
-SCREENTIMED_SOCKET=./run/screentimed.sock ./target/release/screentime-status --watch
+SCREENTIMED_SOCKET=./run/screentimed.sock ./target/release/konstantin-status --watch
 ```
 
 ## Install on this machine
@@ -143,7 +143,7 @@ before changing the enforcement path. In short:
 | 3     | ✅ done     | midnight reset task (DST-correct) |
 | 4     | ✅ done     | `Subscribe` push channel for live tray updates |
 | 5     | ✅ done     | forced logout via `launchctl bootout` (gated by `enforcement = "logout"` + kill-switch + backoff) |
-| 6     | ✅ done     | menu-bar UI binary (`screentime-tray`) using `objc2` + `NSStatusItem`, with auto-reconnect |
+| 6     | ✅ done     | menu-bar UI binary (`konstantin-tray`) using `objc2` + `NSStatusItem`, with auto-reconnect |
 | 7     | ✅ done     | threshold notifications (e.g. 15 / 5 / 1 minutes remaining) — config-driven, fires via `osascript` |
 | 8     | ❌ dropped  | lock/idle reporting — futile in user mode, see CLAUDE.md decision #3 |
-| A1–A7 | ✅ done     | `Screentime.app` bundle, admin-gated Start/Stop/Restart/Configure/Open Log/Uninstall menu, first-launch installer, Homebrew cask formula |
+| A1–A7 | ✅ done     | `Konstantin.app` bundle, admin-gated Start/Stop/Restart/Configure/Open Log/Uninstall menu, first-launch installer, Homebrew cask formula |

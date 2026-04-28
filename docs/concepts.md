@@ -12,11 +12,11 @@ enforcement path or adding new wire types.
 * serves IPC (one-shot `GetStatus` + long-lived `Subscribe`)
 * invokes `launchctl bootout` when configured to enforce
 
-`screentime-status` (headless CLI, any user)
+`konstantin-status` (headless CLI, any user)
 * one-shot status via `GetStatus`
 * `--watch` mode subscribes and streams live updates
 
-`screentime-tray` (per-user menu-bar app, Aqua only)
+`konstantin-tray` (per-user menu-bar app, Aqua only)
 * `NSStatusItem` showing remaining time, updated live from `Subscribe`
 * current-thread tokio runtime on a worker thread; main thread runs
   `NSApplication` and a 5 Hz `NSTimer` block that drains the latest
@@ -28,7 +28,7 @@ enforcement path or adding new wire types.
 
 All three communicate over a Unix socket at `/var/run/screentimed.sock`
 (mode 0666). Wire types and framing live in the shared
-`screentime-proto` library — bumping a wire type means bumping `proto`.
+`konstantin-proto` library — bumping a wire type means bumping `proto`.
 
 ## IPC: framing + peer creds
 
@@ -197,8 +197,8 @@ Each subscriber's `compute_status` reads from the shared
 | `/etc/screentimed/disable`            | root | kill-switch (touch to disable enforcement) |
 | `/var/db/screentimed/state.json`      | root | per-user counters, persists across restarts |
 | `/var/run/screentimed.sock`           | root, mode 0666 | IPC socket |
-| `/Library/LaunchDaemons/com.qnicks.screentimed.plist`     | root | LaunchDaemon plist |
-| `/Library/LaunchAgents/com.qnicks.screentime-tray.plist`  | root | per-user LaunchAgent plist |
+| `/Library/LaunchDaemons/com.gitopolis.screentimed.plist`        | root | LaunchDaemon plist |
+| `~/Library/LaunchAgents/com.gitopolis.konstantin-tray.plist`    | user | per-user LaunchAgent plist |
 
 All five paths under `/etc` and `/var` are configurable; see
 [config.md](config.md).

@@ -32,28 +32,28 @@ uninstall_tray_for_user() {
         echo "  skipping '${user}': no home directory" >&2
         return 0
     fi
-    dst="${home}/Library/LaunchAgents/com.qnicks.screentime-tray.plist"
+    dst="${home}/Library/LaunchAgents/com.gitopolis.konstantin-tray.plist"
 
     if launchctl print "gui/${uid}" >/dev/null 2>&1; then
-        launchctl bootout "gui/${uid}/com.qnicks.screentime-tray" 2>/dev/null || true
+        launchctl bootout "gui/${uid}/com.gitopolis.konstantin-tray" 2>/dev/null || true
     fi
     rm -f "$dst"
     echo "  removed tray for ${user}"
 }
 
 echo "→ unloading LaunchDaemon"
-launchctl bootout system/com.qnicks.screentimed 2>/dev/null || true
+launchctl bootout system/com.gitopolis.screentimed 2>/dev/null || true
 
 echo "→ removing plists"
-rm -f /Library/LaunchDaemons/com.qnicks.screentimed.plist
+rm -f /Library/LaunchDaemons/com.gitopolis.screentimed.plist
 # Pre-phase-7 installs put the tray LaunchAgent here system-wide. Clean
 # up the legacy location too.
-rm -f /Library/LaunchAgents/com.qnicks.screentime-tray.plist
+rm -f /Library/LaunchAgents/com.gitopolis.konstantin-tray.plist
 
 echo "→ removing binaries"
 rm -f /usr/local/libexec/screentimed
-rm -f /usr/local/bin/screentime-status
-rm -f /usr/local/bin/screentime-tray
+rm -f /usr/local/bin/konstantin-status
+rm -f /usr/local/bin/konstantin-tray
 
 echo "→ removing socket if any"
 rm -f /var/run/screentimed.sock

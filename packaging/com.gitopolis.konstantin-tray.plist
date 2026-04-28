@@ -4,13 +4,13 @@
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>com.qnicks.screentime-tray</string>
+    <string>com.gitopolis.konstantin-tray</string>
 
     <!-- Menu-bar app. Subscribes to the daemon's push channel and shows
          remaining time live in NSStatusItem. -->
     <key>ProgramArguments</key>
     <array>
-        <string>/usr/local/bin/screentime-tray</string>
+        <string>/usr/local/bin/konstantin-tray</string>
     </array>
 
     <key>RunAtLoad</key>
@@ -24,8 +24,8 @@
     <string>Aqua</string>
 
     <key>StandardOutPath</key>
-    <string>/tmp/screentime-tray.out.log</string>
+    <string>/tmp/konstantin-tray.out.log</string>
     <key>StandardErrorPath</key>
-    <string>/tmp/screentime-tray.err.log</string>
+    <string>/tmp/konstantin-tray.err.log</string>
 </dict>
 </plist>

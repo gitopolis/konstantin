@@ -12,7 +12,7 @@ version = "0.1.0"
 edition = "2021"
 authors = ["Nikita <qnicks@gmail.com>"]
 license = "MIT"
-repository = "https://github.com/qnicks/screentime"
+repository = "https://github.com/gitopolis/konstantin"
 rust-version = "1.78"
 
 [workspace.dependencies]
@@ -82,7 +82,7 @@ objc2-app-kit = { version = "0.3", features = [
 block2 = "0.6"
 
 # Internal
-screentime-proto = { path = "crates/proto" }
+konstantin-proto = { path = "crates/proto" }
 
 [profile.release]
 lto = "thin"

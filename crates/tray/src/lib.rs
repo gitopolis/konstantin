@@ -1,11 +1,12 @@
-//! Shared client logic for talking to `screentimed`. The headless `status`
-//! binary and the menu-bar `tray` binary both use this.
+//! Shared client logic for talking to `screentimed`. The headless
+//! `konstantin-status` binary and the menu-bar `konstantin-tray` binary
+//! both use this.
 
 pub mod notifications;
 pub mod users;
 
 use anyhow::{Context, Result};
-use screentime_proto::{
+use konstantin_proto::{
     read_frame, write_frame, FrameError, Request, Response, UserStatus, DEFAULT_SOCKET_PATH,
 };
 use std::path::{Path, PathBuf};

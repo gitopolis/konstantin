@@ -20,7 +20,7 @@ use crate::state::State;
 use crate::time::next_local_midnight;
 use anyhow::{Context, Result};
 use nix::unistd::{getpeereid, User};
-use screentime_proto::{
+use konstantin_proto::{
     read_frame, write_frame, FrameError, Request, Response, SessionState, UserStatus,
 };
 use std::path::PathBuf;
