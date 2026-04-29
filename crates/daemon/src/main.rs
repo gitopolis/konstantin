@@ -182,6 +182,7 @@ async fn run_ticker(
     loop {
         iv.tick().await;
         let active = sessions::console_users();
+        tracing::debug!(?active, "console user(s) this tick");
         let today = chrono::Local::now().date_naive();
 
         let snapshot = {
