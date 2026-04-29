@@ -58,6 +58,9 @@ rm -f /usr/local/bin/konstantin-tray
 echo "→ removing socket if any"
 rm -f /var/run/screentimed.sock
 
+echo "→ removing bundle-watcher marker if any"
+rm -f /etc/screentimed/bundle_path
+
 # --- per-user tray LaunchAgent --------------------------------------
 echo "→ removing per-user tray LaunchAgent(s)"
 TRAY_USERS=("$@")

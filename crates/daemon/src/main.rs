@@ -22,6 +22,7 @@ mod ipc;
 mod sessions;
 mod state;
 mod time;
+mod uninstall;
 
 use anyhow::{Context, Result};
 use std::path::PathBuf;
@@ -175,6 +176,8 @@ async fn run_ticker(
     iv.tick().await;
 
     let mut enforcer = enforcement::Enforcer::new();
+    let mut bundle_watcher =
+        uninstall::BundleWatcher::from_marker(std::path::Path::new(uninstall::MARKER_PATH));
 
     loop {
         iv.tick().await;
@@ -201,6 +204,13 @@ async fn run_ticker(
         // last counter value is durable, and any live subscriber sees the
         // pre-kick state before the connection drops.
         enforcer.step(&cfg, &active, &snapshot.counters).await;
+
+        // Bundle-existence watch: if the operator drag-to-Trashed
+        // `Konstantin.app`, tear ourselves down so we stop enforcing
+        // limits with no UI. Does not return when it trips.
+        if bundle_watcher.tick() {
+            uninstall::self_uninstall();
+        }
     }
 }
 

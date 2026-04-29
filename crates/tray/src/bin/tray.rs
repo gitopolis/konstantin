@@ -419,6 +419,11 @@ mod imp {
             pub daemon_plist: PathBuf,
             pub config_example: PathBuf,
             pub source: Source,
+            /// `.app` bundle root (`/Applications/Konstantin.app`-ish)
+            /// when running from a real bundle. `None` in dev-tree mode.
+            /// Recorded at install time so the daemon can self-uninstall
+            /// if the operator drag-to-Trashes the app.
+            pub bundle_root: Option<PathBuf>,
         }
 
         impl Paths {
@@ -440,12 +445,14 @@ mod imp {
                     let resources = contents.join("Resources");
                     let bundled_daemon = resources.join("screentimed");
                     if bundled_daemon.is_file() {
+                        let bundle_root = contents.parent().map(PathBuf::from);
                         return Ok(Self {
                             daemon_binary: bundled_daemon,
                             daemon_plist: contents
                                 .join("Library/LaunchDaemons/com.gitopolis.screentimed.plist"),
                             config_example: resources.join("config.example.toml"),
                             source: Source::Bundle,
+                            bundle_root,
                         });
                     }
                 }
@@ -471,6 +478,7 @@ mod imp {
                         .join("packaging/com.gitopolis.screentimed.plist"),
                     config_example: workspace.join("packaging/config.example.toml"),
                     source: Source::DevTree,
+                    bundle_root: None,
                 })
             }
         }
@@ -606,10 +614,16 @@ mod imp {
         ///   1. Confirm with the user (destructive).
         ///   2. Run the privileged teardown via `admin::run_with_progress`
         ///      — bootout the daemon, remove its plist + binaries +
-        ///      socket. Mirrors `packaging/uninstall.sh`.
-        ///   3. Remove the per-user LaunchAgent plist (no auth — it's
-        ///      in our home directory).
-        ///   4. Tell the user, then terminate.
+        ///      socket, and `rm` every per-user tray LaunchAgent plist
+        ///      under `/Users/<name>/Library/LaunchAgents/`. Mirrors
+        ///      `packaging/uninstall.sh`.
+        ///   3. Tell the user, then terminate.
+        ///
+        /// We don't `launchctl bootout gui/<operator-uid>/...` for our
+        /// own tray — we *are* that agent, and bootout would terminate
+        /// us before the success alert renders. Other users' trays do
+        /// get bootout'd so they go away immediately rather than at
+        /// next login.
         ///
         /// `/etc/screentimed/` (config) and `/var/db/screentimed/`
         /// (counter state) are intentionally preserved so a reinstall
@@ -632,24 +646,13 @@ mod imp {
                 return;
             }
 
-            // Single-line bash; `;` separators so a missing file in
-            // one `rm -f` doesn't short-circuit the rest. The `bootout`
-            // is `|| true` because it errors if the daemon isn't
-            // loaded — also fine.
-            let script = "\
-                launchctl bootout system/com.gitopolis.screentimed 2>/dev/null || true; \
-                rm -f /Library/LaunchDaemons/com.gitopolis.screentimed.plist; \
-                rm -f /Library/LaunchAgents/com.gitopolis.konstantin-tray.plist; \
-                rm -f /usr/local/libexec/screentimed; \
-                rm -f /usr/local/bin/konstantin-status; \
-                rm -f /usr/local/bin/konstantin-tray; \
-                rm -f /var/run/screentimed.sock";
+            let script = build_uninstall_script();
 
             match admin::run_with_progress(
                 mtm,
                 "Uninstalling Konstantin",
                 "Stopping the background service and removing files…",
-                script,
+                &script,
             ) {
                 Ok(()) => {}
                 Err(admin::Error::Cancelled) => return,
@@ -657,16 +660,6 @@ mod imp {
                     alerts::message(mtm, "Couldn't uninstall Konstantin.", &msg);
                     return;
                 }
-            }
-
-            // User-side cleanup. We don't bootout the LaunchAgent —
-            // we *are* it (or, for first-launch flows, we soon will be).
-            // Removing the plist prevents next-login auto-start; this
-            // process exits via `terminate` below.
-            if let Ok(home) = std::env::var("HOME") {
-                let plist = std::path::PathBuf::from(home)
-                    .join("Library/LaunchAgents/com.gitopolis.konstantin-tray.plist");
-                let _ = std::fs::remove_file(&plist);
             }
 
             alerts::message(
@@ -677,6 +670,69 @@ mod imp {
             );
 
             NSApplication::sharedApplication(mtm).terminate(None);
+        }
+
+        /// Build the `osascript`-driven sudo script that tears down the
+        /// system install plus every per-user tray LaunchAgent plist.
+        ///
+        /// `;` separators (rather than `&&`) so a missing file in one
+        /// `rm` doesn't short-circuit the rest. `launchctl bootout` is
+        /// suffixed with `|| true` because it errors when the target
+        /// isn't loaded — also fine.
+        fn build_uninstall_script() -> String {
+            let mut parts: Vec<String> = vec![
+                "launchctl bootout system/com.gitopolis.screentimed 2>/dev/null || true".into(),
+                "rm -f /Library/LaunchDaemons/com.gitopolis.screentimed.plist".into(),
+                // Legacy system-level location from pre-phase-7 installs.
+                "rm -f /Library/LaunchAgents/com.gitopolis.konstantin-tray.plist".into(),
+                "rm -f /usr/local/libexec/screentimed".into(),
+                "rm -f /usr/local/bin/konstantin-status".into(),
+                "rm -f /usr/local/bin/konstantin-tray".into(),
+                "rm -f /var/run/screentimed.sock".into(),
+                // Bundle-watcher marker. Always removed so a reinstall
+                // from a different location starts clean.
+                "rm -f /etc/screentimed/bundle_path".into(),
+            ];
+
+            // Per-user tray plist cleanup. Iterate every real local
+            // account so a multi-user install (operator + others via
+            // the Configure UI) is fully cleaned. If enumeration fails,
+            // fall back to operator's `$HOME` only.
+            let me_uid = super::config_ui::current_uid();
+            let users = konstantin_tray::users::enumerate().unwrap_or_default();
+            if users.is_empty() {
+                if let Ok(home) = std::env::var("HOME") {
+                    let plist = std::path::PathBuf::from(home)
+                        .join("Library/LaunchAgents/com.gitopolis.konstantin-tray.plist");
+                    parts.push(format!(
+                        "rm -f {}",
+                        super::config_ui::shell_quote(&plist)
+                    ));
+                }
+            } else {
+                for u in &users {
+                    let plist = u
+                        .home
+                        .join("Library/LaunchAgents/com.gitopolis.konstantin-tray.plist");
+                    parts.push(format!(
+                        "rm -f {}",
+                        super::config_ui::shell_quote(&plist)
+                    ));
+                    // Don't bootout our own GUI domain — we *are* that
+                    // agent, and bootout would kill us before the
+                    // success alert renders. Other users' running trays
+                    // can safely be torn down.
+                    if u.uid != me_uid {
+                        parts.push(format!(
+                            "launchctl bootout gui/{uid}/com.gitopolis.konstantin-tray \
+                             2>/dev/null || true",
+                            uid = u.uid,
+                        ));
+                    }
+                }
+            }
+
+            parts.join("; ")
         }
     }
 
@@ -1000,20 +1056,37 @@ mod imp {
             // `launchctl bootstrap` is ORed with `true` because it fails
             // if the service is already loaded — kickstart -k afterwards
             // forces a restart either way.
-            format!(
+            //
+            // When installed from a real `.app` bundle, also drop the
+            // bundle's absolute path into `/etc/screentimed/bundle_path`
+            // so the daemon's bundle-watcher can self-uninstall if the
+            // operator drag-to-Trashes the app. In dev-tree mode
+            // (`bundle_root = None`) the marker is removed so the
+            // watcher stays disabled.
+            let mut s = format!(
                 "install -d -m 0755 /usr/local/libexec && \
                  install -d -m 0755 /etc/screentimed && \
                  install -d -m 0700 /var/db/screentimed && \
                  install -m 0755 '{daemon}' /usr/local/libexec/screentimed && \
                  install -m 0644 '{plist}' /Library/LaunchDaemons/com.gitopolis.screentimed.plist && \
-                 ([ -f /etc/screentimed/config.toml ] || install -m 0644 '{config}' /etc/screentimed/config.toml) && \
-                 (launchctl bootstrap system /Library/LaunchDaemons/com.gitopolis.screentimed.plist || true) && \
-                 launchctl enable system/com.gitopolis.screentimed && \
-                 launchctl kickstart -k system/com.gitopolis.screentimed",
+                 ([ -f /etc/screentimed/config.toml ] || install -m 0644 '{config}' /etc/screentimed/config.toml)",
                 daemon = p.daemon_binary.display(),
                 plist = p.daemon_plist.display(),
                 config = p.config_example.display(),
-            )
+            );
+            match &p.bundle_root {
+                Some(root) => s.push_str(&format!(
+                    " && printf '%s\\n' {root_q} > /etc/screentimed/bundle_path",
+                    root_q = super::config_ui::shell_quote(root),
+                )),
+                None => s.push_str(" && rm -f /etc/screentimed/bundle_path"),
+            }
+            s.push_str(
+                " && (launchctl bootstrap system /Library/LaunchDaemons/com.gitopolis.screentimed.plist || true) && \
+                 launchctl enable system/com.gitopolis.screentimed && \
+                 launchctl kickstart -k system/com.gitopolis.screentimed",
+            );
+            s
         }
 
         pub(super) fn build_user_launchagent_plist(tray_exe: &Path) -> String {
@@ -2077,17 +2150,17 @@ mod imp {
             PathBuf::from(format!("{dir}{stem}-{}.{ext}", std::process::id()))
         }
 
-        fn shell_quote(p: &Path) -> String {
+        pub(super) fn shell_quote(p: &Path) -> String {
             shell_quote_arg(&p.display().to_string())
         }
 
-        fn shell_quote_arg(s: &str) -> String {
+        pub(super) fn shell_quote_arg(s: &str) -> String {
             // Wrap in single quotes, escape any embedded single quote as
             // `'\''` (close, escape, reopen).
             format!("'{}'", s.replace('\'', "'\\''"))
         }
 
-        fn current_uid() -> u32 {
+        pub(super) fn current_uid() -> u32 {
             extern "C" {
                 fn getuid() -> u32;
             }
