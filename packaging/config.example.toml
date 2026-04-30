@@ -1,7 +1,9 @@
 # Example screentimed config.
 #
-# Install location: /etc/screentimed/config.toml (root-owned, mode 0644).
-# Reload: edit and `sudo launchctl kickstart -k system/com.gitopolis.screentimed`.
+# Install location: /etc/screentimed/config.toml (root-owned, mode 0600).
+# Edit either via the menu-bar app's `Configure…` (recommended — saves
+# atomically and reloads the daemon) or directly as root and then run
+# `sudo launchctl kickstart -k system/com.gitopolis.screentimed`.
 
 socket_path  = "/var/run/screentimed.sock"
 state_path   = "/var/db/screentimed/state.json"
@@ -17,10 +19,12 @@ warn_thresholds_minutes = [10, 2, 1]
 default_policy = "unrestricted"
 
 # Master safety switch.
-#   "log"    — log "would have kicked" but never actually log anyone out.
-#              KEEP THIS while bringing the daemon up for the first time.
 #   "logout" — actually invoke `launchctl bootout` when limits hit.
-enforcement = "log"
+#              This is the default and the whole point of running this.
+#   "log"    — only log "would have kicked" lines; never actually log
+#              anyone out. Useful while you're tuning limits or doing
+#              first-time daemon bring-up on a new machine.
+enforcement = "logout"
 
 # Live kill-switch. If this file exists, the daemon will refuse to invoke
 # `launchctl bootout` regardless of `enforcement`. Touch it to disable

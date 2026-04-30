@@ -2,8 +2,18 @@
 
 The daemon reads its config from the path in `$SCREENTIMED_CONFIG` if
 set, otherwise from `/etc/screentimed/config.toml`. Format is TOML.
-Reload by editing the file and restarting the daemon
-(`sudo launchctl kickstart -k system/com.gitopolis.screentimed`).
+
+The installed config is **mode 0600 root-owned** — only root can read
+or write it. There are two ways to edit it:
+
+* **Menu-bar `Configure…`** (recommended). Prompts for an admin
+  password, opens a native window populated from the current config,
+  and on Save writes back atomically and `launchctl kickstart -k`s the
+  daemon for you. The Configure window also lets you toggle each
+  user's per-user tray (`Start at login`).
+* **Hand edit as root**, e.g. `sudo $EDITOR /etc/screentimed/config.toml`,
+  then reload with
+  `sudo launchctl kickstart -k system/com.gitopolis.screentimed`.
 
 A complete annotated example lives in
 [`packaging/config.example.toml`](../packaging/config.example.toml).
@@ -83,15 +93,20 @@ Otherwise the daemon will boot you off your own machine.
 ### `enforcement`
 
 * **Type**: enum string — `"log"` or `"logout"`
-* **Default**: `"log"`
+* **Shipped default** (in `packaging/config.example.toml`, written to
+  `/etc/screentimed/config.toml` on first launch): `"logout"`
+* **Compile-time fallback** if the field is missing from the config
+  entirely: `"log"`
 
 Master safety switch. Determines what happens when `decide()` returns
 `Kick`:
 
-* `"log"` — write `would have kicked X (used=N, reason=...)` to the log.
-  Never spawns `launchctl`. Use this while bringing the daemon up.
 * `"logout"` — invoke `/bin/launchctl bootout user/<uid>` (with a 5 s
-  timeout). On failure, log + retry next tick.
+  timeout). On failure, log + retry next tick. This is the shipped
+  default — the whole point of installing this is to enforce.
+* `"log"` — write `would have kicked X (used=N, reason=...)` to the
+  log. Never spawns `launchctl`. Useful while bringing the daemon up
+  on a new machine, or while you're tuning per-user limits.
 
 Both modes honor the kill-switch and the recently-kicked backoff. Both
 modes update the per-uid backoff timestamp on success.
@@ -142,7 +157,7 @@ tick_seconds = 5
 
 warn_thresholds_minutes = [15, 5, 1]
 default_policy = "unrestricted"
-enforcement    = "log"
+enforcement    = "logout"
 
 kill_switch_path = "/etc/screentimed/disable"
 

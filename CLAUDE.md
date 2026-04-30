@@ -22,9 +22,11 @@ into a single `Konstantin.app` bundle (see "App bundle architecture"
 below).
 
 * **`screentimed`** — privileged LaunchDaemon, runs as root. Owns
-  config loading, per-user counters, console-session enumeration via
-  `utmpx`, midnight resets, the `Subscribe` push channel, and forced
-  logouts via `launchctl bootout user/<uid>`.
+  config loading, per-user counters, console-user detection via
+  `SCDynamicStoreCopyConsoleUser` (SystemConfiguration framework),
+  midnight resets, the `Subscribe` push channel, and forced logouts
+  via the `launchctl bootout` → `pkill` escalation in
+  `enforcement::force_logout`.
 * **`konstantin-tray`** — per-user LaunchAgent (Aqua only). `NSStatusBar`
   / `NSStatusItem` menu-bar app subscribed to the daemon's push channel.
   Shows remaining time live, fires threshold notifications, and (in
@@ -95,16 +97,25 @@ red-dot status indicator.
 
 These were Nikita's choices; revisit explicitly before changing them.
 
-1. **Lockout method: soft re-logout.** When a user hits zero, the
-   daemon calls `launchctl bootout user/<uid>`. If they log back in,
-   the next session-poll tick re-bootouts them. No `pwpolicy` or
-   auth-plugin tampering. 10-second per-uid recently-kicked backoff
-   prevents tight loops.
+1. **Lockout method: soft re-logout, with escalation.** When a user
+   hits zero the daemon runs `enforcement::force_logout`:
+   `launchctl bootout gui/<uid>` → `launchctl bootout user/<uid>` →
+   ~1 s settle → re-check `console_users()` → `pkill -KILL -U <uid>`
+   if the session is still up. Plain `bootout` alone is *not*
+   sufficient on macOS Tahoe — production logs have shown it return
+   exit 0 for 14+ hours straight while the loginwindow session and
+   `SCDynamicStoreCopyConsoleUser` keep reporting the user, so the
+   escalation is mandatory. 10-second per-uid recently-kicked backoff
+   prevents tight loops. No `pwpolicy` or auth-plugin tampering.
 
-2. **Time accounting v1: logged-in time.** Daemon parses `utmpx` and
-   increments per-user counters every tick. No idle / lock detection
-   in v1. Console sessions only (filter `ut_line` starting with
-   `console`); SSH and tty are skipped.
+2. **Time accounting v1: foreground console user only.** Daemon
+   asks `SCDynamicStoreCopyConsoleUser` who's currently at the
+   console each tick and bumps that user's counter. The API returns
+   0 or 1 username — Fast User Switching pauses the
+   previously-foreground user automatically (the wrong-by-default
+   behavior in the original `utmpx` walk, which counted everyone
+   logged in). No idle / lock detection in v1. SSH / tty are not
+   "console"; the API never reports them.
 
 3. **Time accounting stays v1 — phase 8 is dropped.** We considered
    pausing counters on user-reported lock / idle (the proto already
@@ -116,12 +127,13 @@ These were Nikita's choices; revisit explicitly before changing them.
    the tray's report makes it trivially fakeable — a 5-line script
    sending `locked: true` every few seconds would pause the counter
    forever, and the 30 s sanity-check only catches "user killed their
-   tray," not "user sends fake reports." Logged-in time is what we
-   have; it's adversarially robust by accident (utmpx is daemon-owned)
-   and "be at the keyboard for 2 hours" is arguably the limit you
-   actually want. The wire type stays in `proto` as dead surface — the
-   daemon `Ack`s and ignores it. Remove it on the next breaking proto
-   bump if it bothers you.
+   tray," not "user sends fake reports." Foreground-console time is
+   what we have; it's adversarially robust by accident
+   (`SCDynamicStoreCopyConsoleUser` is daemon-owned and not
+   user-controlled) and "be at the keyboard for 2 hours" is arguably
+   the limit you actually want. The wire type stays in `proto` as
+   dead surface — the daemon `Ack`s and ignores it. Remove it on the
+   next breaking proto bump if it bothers you.
 
 4. **Reset: local midnight.** Compute `next_local_midnight()` by
    recomputing via `Local.from_local_datetime` after each reset —
@@ -165,7 +177,10 @@ These were Nikita's choices; revisit explicitly before changing them.
 
 * **Phase 1** — proto + framing + peer-creds auth, `GetStatus` returns
   real status from current state.
-* **Phase 2** — `utmpx` walk, per-user counters, atomic `state.json`
+* **Phase 2** — Console-user detection (originally a `utmpx` walk;
+  replaced post-A7 with `SCDynamicStoreCopyConsoleUser` for FUS
+  correctness and prompt logout detection — see `sessions.rs` module
+  docs for the rationale), per-user counters, atomic `state.json`
   (write `<path>.tmp` + `rename(2)`), in-memory `active_now` set.
 * **Phase 3** — DST-correct midnight reset task with opportunistic
   per-tick check as defense in depth.
@@ -174,11 +189,14 @@ These were Nikita's choices; revisit explicitly before changing them.
   `Lagged(n)` recovers with a fresh snapshot, no disconnect.
 * **Phase 5** — enforcement: pure `decide()` function;
   `Enforcer::act_on` with kill-switch (`kill_switch_path`, default
-  `/etc/screentimed/disable`) and 10 s per-uid backoff. `enforcement
-  = "log"` is the default; `"logout"` invokes `/bin/launchctl bootout
-  user/<uid>` with a 5 s timeout and best-effort retry on failure.
-  **Live verification of Logout mode against `alice`/`bob` is still
-  pending.**
+  `/etc/screentimed/disable`) and 10 s per-uid backoff. The
+  shipped `config.example.toml` sets `enforcement = "logout"`;
+  the compile-time fallback when the field is missing is `"log"`.
+  `force_logout` runs `bootout gui/<uid>` → `bootout user/<uid>` →
+  re-check → `pkill -KILL -U <uid>` (see decision #1) with a 5 s
+  per-subprocess timeout. The escalation path is unit-tested against
+  a fake `LogoutRunner`; the live `launchctl` invocation has been
+  verified manually against `alice` / `bob`.
 * **Phase 6** — `konstantin-tray` binary using `objc2 = "0.6"`,
   `objc2-app-kit = "0.3"`, `objc2-foundation = "0.3"`, `block2 = "0.6"`.
   Main thread runs `NSApplication` and a 5 Hz `NSTimer` block; worker
@@ -213,15 +231,36 @@ These were Nikita's choices; revisit explicitly before changing them.
   `~/Library/LaunchAgents/` with a dev path.
 * **A7** — `Uninstall…` menu item: confirm → privileged teardown
   (`launchctl bootout` + `rm` of system files) → user LaunchAgent
-  cleanup → `NSApplication::terminate`. `/etc/screentimed/` and
-  `/var/db/screentimed/` preserved by default.
+  cleanup → `NSApplication::terminate`.
   `packaging/konstantin.rb` cask formula has matching `uninstall` +
   `zap` stanzas for non-interactive `brew uninstall --zap`.
+* **A8** — security/UX hardening on top of A1–A7:
+  * `/etc/screentimed/config.toml` is now mode 0600 root-owned at
+    every write site (`packaging/install.sh`, the tray's first-launch
+    `install::build_install_script`, and the Save flow's
+    `config_ui::build_admin_script`). Other users on the machine
+    can't see whose limits are configured.
+  * `Configure…` therefore prompts for an admin password to *open*
+    the window: a single `admin::run_with_progress` invocation
+    (`config_ui::build_open_admin_script`) copies the config out to
+    a user-owned temp *and* dumps a manifest of per-user
+    LaunchAgent-plist presence (`<username> 0|1` lines) in the same
+    elevation. Drops the old operator-owned `UiCache` (the
+    `~/Library/Application Support/com.gitopolis.konstantin/ui-state.json`
+    file) — root can stat hardened homes directly, no cache needed.
+  * `Uninstall…` and `packaging/uninstall.sh` now `rm -rf
+    /var/db/screentimed/` (counter state). `/etc/screentimed/`
+    (config) is still preserved on uninstall; `--zap` still removes
+    both. Cask `uninstall` stanza updated to match.
+  * Post-password window-show uses
+    `activateIgnoringOtherApps(true)` + `orderFrontRegardless()` so
+    the Configure window actually steals focus from the previously
+    frontmost app. `NSApplication::activate()` is cooperative on
+    macOS 14+ and isn't sufficient for accessory apps.
 
-Tests: 21 passing at last commit (proto×2, daemon×13, tray×6). Unsafe
-block count: 4 (one selector cast, one `NSTimer` block ABI, two
-`utmpx` FFI walks). Both numbers will drift — they're a "currently
-healthy" marker, not a target.
+Tests, unsafe-block count: both will drift. The CI signal is
+`cargo test --workspace` clean. Don't pin counts here — they
+incentivize the wrong thing.
 
 ## What's NOT built yet
 
@@ -230,10 +269,6 @@ decision #3.
 
 Open items that aren't on the roadmap but are worth doing before any
 wider distribution:
-* **Live-fire verification of `enforcement = "logout"`** against
-  `alice` / `bob`. The decision logic is unit-tested but the actual
-  `launchctl bootout user/<uid>` invocation has never run against a
-  real test account.
 * **Developer ID + notarization** so the `.app` bundle can ship signed,
   and so we can move to `SMAppService` and `UNUserNotificationCenter`.
 * **Real `AppIcon.iconset/`** in `packaging/`. Currently the bundle
@@ -251,9 +286,14 @@ machine.
   `bob` test accounts created by `packaging/create-test-users.sh`.
   UIDs 601 / 602; passwords `screentime-test-alice` /
   `screentime-test-bob`.
-* **Keep `enforcement = "log"`** until you have manually verified
-  `enforcement = "logout"` against alice or bob. The decision logic is
-  unit-tested but the live `launchctl bootout` invocation is not.
+* **The shipped `config.example.toml` now defaults to
+  `enforcement = "logout"`.** When developing on your own machine,
+  override that to `"log"` in your dev config (or use a separate
+  `/tmp/screentimed-smoketest.toml` per the smoke-test recipe in
+  `docs/concepts.md`) before running the daemon — otherwise a bug
+  in your branch can actually log out an `alice` / `bob` test
+  session. The default flipped because `"log"` mode shipped to end
+  users is functionally a no-op product.
 * **Keep `default_policy = "unrestricted"`.** Switching to `"block"`
   before every account is enumerated will kick everyone, including
   admins.
@@ -340,13 +380,16 @@ konstantin/
   `SMAppService.daemon(plistName:)` over hand-placed
   `/Library/LaunchDaemons/` files. We use the hand-placed approach
   via `run_as_root` because it works without code signing.
-* **Fast user switching.** `utmpx` will show every logged-in user;
-  counters advance per-user in parallel. State file already keys by
-  username for this reason.
-* **`launchctl bootout` is best-effort.** It can fail mid-transition,
-  especially under fast user switching. Treat as best-effort, log
-  failures, retry next tick (already the behavior in
-  `enforcement::Enforcer::act_on`).
+* **Fast user switching.** `SCDynamicStoreCopyConsoleUser` reports
+  only the foreground user, so backgrounded FUS users have their
+  counters paused while another account is at the keyboard. State
+  file still keys by username so re-foregrounding resumes from the
+  same accumulated total.
+* **`launchctl bootout` is best-effort and not always sufficient.**
+  See decision #1 + the `enforcement::force_logout` module docs:
+  bootout can return success while the loginwindow session persists,
+  hence the gui+user bootout → re-check → `pkill -KILL -U <uid>`
+  escalation. All steps still log failures and retry next tick.
 
 ## Style notes
 

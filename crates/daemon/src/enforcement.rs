@@ -4,8 +4,10 @@
 //! the side effect (force-logout). Wiring lives in [`Enforcer::step`].
 //!
 //! Safety-critical paths gated here:
-//!   * `Enforcement::Log` (default in `config.example.toml`) — never spawns
-//!     `launchctl`; only logs `"would have kicked"`.
+//!   * `Enforcement::Log` (compile-time default if the field is missing
+//!     from `config.toml`) — never spawns `launchctl`; only logs
+//!     `"would have kicked"`. The shipped `config.example.toml` sets
+//!     `enforcement = "logout"` so a fresh install actually enforces.
 //!   * Kill-switch file — if `cfg.kill_switch_path` exists, we skip the
 //!     logout even when `enforcement = "logout"`. Touch the file to
 //!     disable enforcement live; remove it to re-enable.

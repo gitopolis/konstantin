@@ -6,7 +6,8 @@ enforcement path or adding new wire types.
 ## Three artifacts, one workspace
 
 `screentimed` (privileged daemon, runs as root)
-* enumerates console sessions via `utmpx`
+* asks the system who's at the console via
+  `SCDynamicStoreCopyConsoleUser`
 * tracks per-user counters and persists `state.json`
 * runs the midnight reset task
 * serves IPC (one-shot `GetStatus` + long-lived `Subscribe`)
@@ -62,13 +63,22 @@ Two request lifecycles:
 
 The ticker fires every `tick_seconds`. On each tick:
 
-1. Enumerate console sessions via `utmpx` (`getutxent` walk, filtering
-   `ut_type == USER_PROCESS` and `ut_line` starting with `console`). SSH
-   sessions and ptys are skipped — only Aqua / loginwindow time counts.
+1. Ask the system who's at the console via
+   `SCDynamicStoreCopyConsoleUser` (a `SystemConfiguration` framework
+   call). Returns 0 or 1 username — macOS has a single foreground
+   console user at any moment. Empty at the login window or when no
+   one is signed in.
 2. For each active username, increment its counter by `tick_seconds`.
 3. Atomically persist `state.json` (write `<path>.tmp`, then `rename(2)`).
 4. Broadcast a wakeup to all `Subscribe` connections.
 5. Run an enforcement pass.
+
+This replaces an earlier `utmpx` walk. `utmpx` reported every
+logged-in user (including ones backgrounded by Fast User Switching)
+and lagged on graceful logout, so a user could continue accruing time
+after they'd actually left.
+`SCDynamicStoreCopyConsoleUser` reports only the FUS-foreground user
+and flips immediately on logout.
 
 `state.json` shape:
 
@@ -83,8 +93,9 @@ The ticker fires every `tick_seconds`. On each tick:
 *currently-active* users is held only in memory (`#[serde(skip)]`) — a
 stale state file on disk can't claim someone is logged in.
 
-`utmpx` entries don't carry a UID; usernames are resolved to UIDs lazily
-via `getpwnam` only when enforcement is about to act on someone.
+`SCDynamicStoreCopyConsoleUser` returns just the username; UIDs are
+resolved lazily via `getpwnam` only when enforcement is about to act
+on someone.
 
 ## Midnight reset
 
@@ -111,7 +122,7 @@ handled in `time::next_local_midnight_after`.
 | `Active`        | Configured, has a console session, under limit, timer advancing. |
 | `Offline`       | Configured but not currently logged in to a console session. |
 | `LimitReached`  | Configured, over limit. `enforcement` decides what happens next. |
-| `Paused`        | (v2 / phase 8) Logged in but locked or idle. Not used in v1. |
+| `Paused`        | Wire-level only (proto carries the variant). The daemon never produces it — phase 8 was dropped, see CLAUDE.md decision #3. |
 
 The transition `Active → LimitReached` happens silently inside
 `compute_status`; the actual kick is decided by the enforcement pass.
@@ -191,17 +202,23 @@ Each subscriber's `compute_status` reads from the shared
 
 ## Files & paths
 
-| Path | Owner | Purpose |
-|------|-------|---------|
-| `/etc/screentimed/config.toml`        | root | daemon config |
+| Path | Owner / mode | Purpose |
+|------|--------------|---------|
+| `/etc/screentimed/config.toml`        | root, 0600 | daemon config; readable only by root, so the tray's `Configure…` window prompts for admin auth before opening |
 | `/etc/screentimed/disable`            | root | kill-switch (touch to disable enforcement) |
-| `/var/db/screentimed/state.json`      | root | per-user counters, persists across restarts |
-| `/var/run/screentimed.sock`           | root, mode 0666 | IPC socket |
-| `/Library/LaunchDaemons/com.gitopolis.screentimed.plist`        | root | LaunchDaemon plist |
-| `~/Library/LaunchAgents/com.gitopolis.konstantin-tray.plist`    | user | per-user LaunchAgent plist |
+| `/var/db/screentimed/state.json`      | root, 0600 (parent dir 0700) | per-user counters, persists across restarts |
+| `/var/run/screentimed.sock`           | root, 0666 | IPC socket; world-connectable, peer-creds-authenticated |
+| `/Library/LaunchDaemons/com.gitopolis.screentimed.plist` | root | LaunchDaemon plist |
+| `~/Library/LaunchAgents/com.gitopolis.konstantin-tray.plist` | user | per-user LaunchAgent plist |
 
 All five paths under `/etc` and `/var` are configurable; see
 [config.md](config.md).
+
+Uninstall (in-app `Uninstall…`, `packaging/uninstall.sh`, or
+`brew uninstall konstantin`) wipes `/var/db/screentimed/` along with
+the binaries and plists, but preserves `/etc/screentimed/` so a
+reinstall picks up your settings. Use `brew uninstall --zap konstantin`
+(or delete `/etc/screentimed/` by hand) for a full wipe.
 
 ## Threshold notifications
 

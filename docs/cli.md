@@ -133,6 +133,24 @@ GUI terminal session.
 No arguments. Show or hide via the menu-bar item; quit via the menu's
 "Quit" option (`⌘Q`).
 
+### Privileged menu actions
+
+`Start / Stop / Restart`, `Configure…`, and `Uninstall…` all funnel
+through one `osascript … with administrator privileges` helper —
+macOS shows the standard password sheet, the command runs as root for
+that one invocation, then privilege is released. There is no
+persistent privilege handle.
+
+Notable consequences:
+
+* `Configure…` requires an admin password to *open* the window
+  (because `/etc/screentimed/config.toml` is mode 0600 root-owned).
+  Save then prompts a second time to write the file back. Cancel the
+  password sheet → the window doesn't open and nothing is changed.
+* `Uninstall…` removes the binaries, plists, socket, and counter state
+  at `/var/db/screentimed/`. It preserves `/etc/screentimed/` so a
+  reinstall picks up your settings.
+
 ### Environment variables
 
 | Variable | Default | Description |
@@ -149,7 +167,6 @@ No arguments. Show or hide via the menu-bar item; quit via the menu's
   * `LimitReached` → `0s`
   * `Offline` → `offline`
   * `NotConfigured` → `—`
-  * `Paused` (phase 8 only) → `⏸ <remaining>`
 * When the daemon stops the title becomes `🔴` and the worker retries
   `Subscription::open` every 2 s. Reconnect is automatic; no user
   action needed.
@@ -179,7 +196,8 @@ and stripped symbols (see workspace `Cargo.toml`).
 cargo test --workspace
 ```
 
-Covers proto framing roundtrips, state save/load, utmpx field parsing,
-midnight computation, and the enforcement decision matrix. The
-`launchctl bootout` invocation itself is not unit-tested — verify it
-manually against an `alice` / `bob` test account at install time.
+Covers proto framing roundtrips, state save/load, console-user
+enumeration shape, midnight computation, and the enforcement decision
+matrix. The `launchctl bootout` invocation itself is not unit-tested
+— verify it manually against an `alice` / `bob` test account at
+install time.
