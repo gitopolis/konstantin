@@ -1,0 +1,66 @@
+name: Tag
+
+on:
+  push:
+    branches: [release]
+
+permissions:
+  contents: write
+
+jobs:
+  tag:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+          token: ${{ secrets.RELEASE_PAT }}
+
+      - name: Verify HEAD is a merge commit
+        run: |
+          set -euo pipefail
+          if ! git rev-parse --verify HEAD^2 >/dev/null 2>&1; then
+            echo "::error::HEAD has no second parent. The release branch must be updated via a non-fast-forward merge commit (squash and rebase merges are not supported)."
+            exit 1
+          fi
+          TAG_TARGET=$(git rev-parse HEAD^2)
+          echo "TAG_TARGET=$TAG_TARGET" >> "$GITHUB_ENV"
+          echo "Tagging $TAG_TARGET (HEAD^2 of merge commit $(git rev-parse HEAD))"
+
+      - name: Install svu
+        run: |
+          set -euo pipefail
+          SVU_VERSION="3.4.0"
+          curl -fsSL "https://github.com/caarlos0/svu/releases/download/v${SVU_VERSION}/svu_${SVU_VERSION}_linux_amd64.tar.gz" \
+            | sudo tar -xz -C /usr/local/bin svu
+          svu --version
+
+      - name: Compute next version
+        run: |
+          set -euo pipefail
+          git -c advice.detachedHead=false checkout "$TAG_TARGET"
+          VERSION=$(svu next)
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          echo "Next version: $VERSION"
+
+      - name: Skip if tag already exists
+        run: |
+          set -euo pipefail
+          if git rev-parse --verify "refs/tags/$VERSION" >/dev/null 2>&1; then
+            echo "::notice::Tag $VERSION already exists; nothing to do."
+            echo "SKIP=1" >> "$GITHUB_ENV"
+          fi
+
+      - name: Configure git identity
+        if: env.SKIP != '1'
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Create and push annotated tag
+        if: env.SKIP != '1'
+        run: |
+          set -euo pipefail
+          git tag -a "$VERSION" "$TAG_TARGET" -m "Release $VERSION"
+          git push origin "$VERSION"
