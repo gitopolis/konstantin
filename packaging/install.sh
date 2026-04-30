@@ -97,7 +97,7 @@ install -m 0755 "${TARGET}/konstantin-tray"    /usr/local/bin/konstantin-tray
 echo "→ creating /etc/screentimed/"
 install -d -m 0755 /etc/screentimed
 if [[ ! -e /etc/screentimed/config.toml ]]; then
-    install -m 0644 "${ROOT}/packaging/config.example.toml" /etc/screentimed/config.toml
+    install -m 0600 "${ROOT}/packaging/config.example.toml" /etc/screentimed/config.toml
     echo "  wrote /etc/screentimed/config.toml from example"
 else
     echo "  /etc/screentimed/config.toml already exists, leaving it alone"

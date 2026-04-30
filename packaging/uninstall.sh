@@ -2,8 +2,9 @@
 # Remove the system-side install of screentimed (daemon + binaries),
 # plus per-user tray LaunchAgents for the listed users.
 #
-# Leaves /etc/screentimed and /var/db/screentimed intact so you don't
-# lose configs / state on a reinstall.
+# Wipes /var/db/screentimed (counter state) so a reinstall starts
+# users at zero accumulated time. /etc/screentimed (config) is left
+# intact so reinstalls pick up the operator's settings.
 #
 # Usage:
 #     sudo ./packaging/uninstall.sh                   # tray for $SUDO_USER
@@ -61,6 +62,9 @@ rm -f /var/run/screentimed.sock
 echo "→ removing bundle-watcher marker if any"
 rm -f /etc/screentimed/bundle_path
 
+echo "→ removing counter state"
+rm -rf /var/db/screentimed
+
 # --- per-user tray LaunchAgent --------------------------------------
 echo "→ removing per-user tray LaunchAgent(s)"
 TRAY_USERS=("$@")
@@ -80,7 +84,6 @@ cat <<EOF
 
 done. system-side cleanup complete.
 
-preserved on disk (remove manually if you really want them gone):
+preserved on disk (remove manually if you really want it gone):
     /etc/screentimed/      (config)
-    /var/db/screentimed/   (counter state)
 EOF

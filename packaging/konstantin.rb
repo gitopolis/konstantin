@@ -29,8 +29,8 @@ cask "konstantin" do
 
   # `brew uninstall konstantin` runs this. Mirrors the in-app
   # `Uninstall…` menu item — stops the daemon, removes binaries +
-  # plists. Preserves config and counter state at /etc/screentimed/
-  # and /var/db/screentimed/.
+  # plists, and wipes counter state at /var/db/screentimed/.
+  # Preserves config at /etc/screentimed/.
   uninstall launchctl: "com.gitopolis.screentimed",
             delete: [
               "/usr/local/libexec/screentimed",
@@ -39,6 +39,7 @@ cask "konstantin" do
               "/Library/LaunchDaemons/com.gitopolis.screentimed.plist",
               "/Library/LaunchAgents/com.gitopolis.konstantin-tray.plist",
               "/var/run/screentimed.sock",
+              "/var/db/screentimed",
             ]
 
   # `brew uninstall --zap konstantin` runs this *in addition to*

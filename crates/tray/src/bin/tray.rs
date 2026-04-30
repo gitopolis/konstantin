@@ -625,21 +625,22 @@ mod imp {
         /// get bootout'd so they go away immediately rather than at
         /// next login.
         ///
-        /// `/etc/screentimed/` (config) and `/var/db/screentimed/`
-        /// (counter state) are intentionally preserved so a reinstall
-        /// resumes where the user left off. The Homebrew cask's `zap`
-        /// block at `packaging/konstantin.rb` removes those for users
-        /// who want a clean wipe.
+        /// `/etc/screentimed/` (config) is intentionally preserved so a
+        /// reinstall resumes with the user's settings. `/var/db/screentimed/`
+        /// (counter state) *is* removed — uninstall means uninstall.
+        /// The Homebrew cask's `zap` block at `packaging/konstantin.rb`
+        /// also removes the config directory for users who want a
+        /// clean wipe.
         fn uninstall_flow(mtm: MainThreadMarker) {
             if !alerts::confirm(
                 mtm,
                 "Uninstall Konstantin?",
-                "Stops the background service and removes its files.\n\n\
-                 Your configuration (/etc/screentimed/) and counter state \
-                 (/var/db/screentimed/) will be preserved so a reinstall \
-                 picks up where you left off. To remove those too, run \
-                 `brew uninstall --zap konstantin` after this finishes, \
-                 or delete them by hand.",
+                "Stops the background service and removes its files, \
+                 including saved counter state.\n\n\
+                 Your configuration (/etc/screentimed/) is preserved so \
+                 a reinstall picks up your settings. To remove that too, \
+                 run `brew uninstall --zap konstantin` after this \
+                 finishes, or delete it by hand.",
                 "Uninstall",
                 "Cancel",
             ) {
@@ -692,6 +693,11 @@ mod imp {
                 // Bundle-watcher marker. Always removed so a reinstall
                 // from a different location starts clean.
                 "rm -f /etc/screentimed/bundle_path".into(),
+                // Counter state. A reinstall starts users at zero
+                // accumulated time rather than picking up where they
+                // left off — matches the user's expectation that
+                // uninstalling actually removes their data.
+                "rm -rf /var/db/screentimed".into(),
             ];
 
             // Per-user tray plist cleanup. Iterate every real local
@@ -1069,7 +1075,7 @@ mod imp {
                  install -d -m 0700 /var/db/screentimed && \
                  install -m 0755 '{daemon}' /usr/local/libexec/screentimed && \
                  install -m 0644 '{plist}' /Library/LaunchDaemons/com.gitopolis.screentimed.plist && \
-                 ([ -f /etc/screentimed/config.toml ] || install -m 0644 '{config}' /etc/screentimed/config.toml)",
+                 ([ -f /etc/screentimed/config.toml ] || install -m 0600 '{config}' /etc/screentimed/config.toml)",
                 daemon = p.daemon_binary.display(),
                 plist = p.daemon_plist.display(),
                 config = p.config_example.display(),
@@ -1254,12 +1260,14 @@ mod imp {
                     .unwrap_or(false)
             });
             if already_visible {
+                #[allow(deprecated)]
+                NSApplication::sharedApplication(mtm).activateIgnoringOtherApps(true);
                 UI_HANDLE.with(|cell| {
                     if let Some(h) = cell.borrow().as_ref() {
                         h.window.makeKeyAndOrderFront(None);
+                        h.window.orderFrontRegardless();
                     }
                 });
-                NSApplication::sharedApplication(mtm).activate();
                 return;
             }
 
@@ -1272,20 +1280,6 @@ mod imp {
                 );
                 return;
             }
-            let config_text = match std::fs::read_to_string(config_path) {
-                Ok(t) => t,
-                Err(e) => {
-                    super::alerts::message(mtm, "Couldn't read configuration.", &e.to_string());
-                    return;
-                }
-            };
-            let config_value: toml::Value = match toml::from_str(&config_text) {
-                Ok(v) => v,
-                Err(e) => {
-                    super::alerts::message(mtm, "Couldn't parse configuration.", &e.to_string());
-                    return;
-                }
-            };
 
             let users_list = match users::enumerate() {
                 Ok(u) => u,
@@ -1299,10 +1293,64 @@ mod imp {
                 return;
             }
 
-            let initial_thresholds = current_thresholds(&config_value);
+            // /etc/screentimed/config.toml is 0600 root-owned, so the
+            // unprivileged tray can't read it directly. Single admin
+            // elevation: copy the file out (chowned to the operator)
+            // and, in the same script, dump a manifest of which users
+            // currently have a tray LaunchAgent plist on disk —
+            // hardened macOS denies an unprivileged tray `stat` access
+            // to other users' homes, but root can see them all.
             let operator = current_username();
-            let cache = load_ui_cache();
-            let user_initials = collect_user_settings(&users_list, &config_value, &operator, &cache);
+            let staged_config = tmp_path("konstantin-config-staging", "toml");
+            let staged_manifest = tmp_path("konstantin-autostart-staging", "txt");
+            let script =
+                build_open_admin_script(&operator, &users_list, &staged_config, &staged_manifest);
+
+            match super::admin::run_with_progress(
+                mtm,
+                "Open Configuration",
+                "Reading /etc/screentimed/config.toml…",
+                &script,
+            ) {
+                Ok(()) => {}
+                Err(super::admin::Error::Cancelled) => {
+                    let _ = std::fs::remove_file(&staged_config);
+                    let _ = std::fs::remove_file(&staged_manifest);
+                    return;
+                }
+                Err(super::admin::Error::Failed(msg)) => {
+                    super::alerts::message(mtm, "Couldn't read configuration.", &msg);
+                    let _ = std::fs::remove_file(&staged_config);
+                    let _ = std::fs::remove_file(&staged_manifest);
+                    return;
+                }
+            }
+
+            let config_text = match std::fs::read_to_string(&staged_config) {
+                Ok(t) => t,
+                Err(e) => {
+                    super::alerts::message(mtm, "Couldn't read configuration.", &e.to_string());
+                    let _ = std::fs::remove_file(&staged_config);
+                    let _ = std::fs::remove_file(&staged_manifest);
+                    return;
+                }
+            };
+            let manifest_text = std::fs::read_to_string(&staged_manifest).unwrap_or_default();
+            let _ = std::fs::remove_file(&staged_config);
+            let _ = std::fs::remove_file(&staged_manifest);
+
+            let config_value: toml::Value = match toml::from_str(&config_text) {
+                Ok(v) => v,
+                Err(e) => {
+                    super::alerts::message(mtm, "Couldn't parse configuration.", &e.to_string());
+                    return;
+                }
+            };
+
+            let manifest = parse_autostart_manifest(&manifest_text);
+            let initial_thresholds = current_thresholds(&config_value);
+            let user_initials =
+                collect_user_settings(&users_list, &config_value, &operator, &manifest);
 
             let controller = ConfigController::new(mtm);
             let built = build_window(
@@ -1325,8 +1373,20 @@ mod imp {
                 });
             });
 
+            // After `osascript … with administrator privileges`,
+            // SecurityAgent dismisses and macOS hands focus back to
+            // whichever app was previously frontmost (e.g. VSCode),
+            // *not* us — accessory apps (`LSUIElement=true`) don't
+            // auto-activate. `NSApplication::activate` is *cooperative*
+            // on macOS 14+ ("the framework does not guarantee that the
+            // app will be activated at all" — Apple), so it's not
+            // enough to steal focus from a regular app. Use the
+            // deprecated-but-functional `activateIgnoringOtherApps:`
+            // which is the only reliable way to do so.
+            #[allow(deprecated)]
+            NSApplication::sharedApplication(mtm).activateIgnoringOtherApps(true);
             window_clone.makeKeyAndOrderFront(None);
-            NSApplication::sharedApplication(mtm).activate();
+            window_clone.orderFrontRegardless();
         }
 
         fn close_and_clear() {
@@ -1366,7 +1426,7 @@ mod imp {
             users: &[LocalUser],
             cfg: &toml::Value,
             operator: &str,
-            cache: &UiCache,
+            manifest: &std::collections::HashMap<String, bool>,
         ) -> Vec<InitialUserSetting> {
             let users_table = cfg
                 .as_table()
@@ -1385,7 +1445,7 @@ mod imp {
                     InitialUserSetting {
                         limited: entry.is_some(),
                         minutes,
-                        autostart: autostart_state(u, operator, cache),
+                        autostart: autostart_state(u, operator, manifest),
                     }
                 })
                 .collect()
@@ -1393,23 +1453,21 @@ mod imp {
 
         /// Initial autostart state for a row.
         ///
-        /// For the operator's own user, `stat` is authoritative — they
-        /// can always read their own home and the file location is
-        /// stable. For *other* users, hardened macOS denies `stat` on
-        /// `/Users/<other>/Library/LaunchAgents/`, so we keep a small
-        /// operator-owned JSON cache (`ui_cache_path`) that records the
-        /// last saved state. Cache hits win; cache misses fall back to
-        /// `stat` (which usually returns false for inaccessible homes —
-        /// fine, then the operator just re-asserts the toggle).
-        fn autostart_state(user: &LocalUser, operator: &str, cache: &UiCache) -> bool {
+        /// For the operator's own user, `stat` is authoritative. For
+        /// other users, hardened macOS denies the unprivileged tray
+        /// `stat` access to `/Users/<other>/Library/LaunchAgents/` —
+        /// so the open-flow admin script (run as root) emits a
+        /// manifest of plist presence per user, and we look up the
+        /// answer there.
+        fn autostart_state(
+            user: &LocalUser,
+            operator: &str,
+            manifest: &std::collections::HashMap<String, bool>,
+        ) -> bool {
             if user.username == operator {
                 return autostart_present(user);
             }
-            cache
-                .autostart
-                .get(&user.username)
-                .copied()
-                .unwrap_or_else(|| autostart_present(user))
+            manifest.get(&user.username).copied().unwrap_or(false)
         }
 
         fn autostart_present(user: &LocalUser) -> bool {
@@ -1438,58 +1496,63 @@ mod imp {
                 .unwrap_or_default()
         }
 
-        // ─── Operator-owned UI state cache ─────────────────────────────
-        //
-        // `~/Library/Application Support/com.gitopolis.konstantin/ui-state.json`.
-        // Tracks per-user "Start at login" intent across tray restarts.
-        // The on-disk plist for *other* users isn't stat-able from the
-        // operator's process on hardened macOS, so this cache is the
-        // source of truth for those rows.
-
-        #[derive(Default, serde::Serialize, serde::Deserialize)]
-        struct UiCache {
-            #[serde(default)]
-            autostart: std::collections::HashMap<String, bool>,
-        }
-
-        fn ui_cache_path() -> Option<PathBuf> {
-            let home = std::env::var_os("HOME")?;
-            Some(
-                PathBuf::from(home)
-                    .join("Library/Application Support/com.gitopolis.konstantin/ui-state.json"),
-            )
-        }
-
-        fn load_ui_cache() -> UiCache {
-            let path = match ui_cache_path() {
-                Some(p) => p,
-                None => return UiCache::default(),
-            };
-            match std::fs::read_to_string(&path) {
-                Ok(text) => serde_json::from_str(&text).unwrap_or_default(),
-                Err(_) => UiCache::default(),
-            }
-        }
-
-        fn save_ui_cache(cache: &UiCache) {
-            let path = match ui_cache_path() {
-                Some(p) => p,
-                None => return,
-            };
-            if let Some(parent) = path.parent() {
-                if let Err(e) = std::fs::create_dir_all(parent) {
-                    tracing::warn!(error = %e, "creating UI cache dir");
-                    return;
-                }
-            }
-            match serde_json::to_string_pretty(cache) {
-                Ok(text) => {
-                    if let Err(e) = std::fs::write(&path, text) {
-                        tracing::warn!(error = %e, "writing UI cache");
+        /// Parse the per-user autostart manifest dumped by the
+        /// open-flow admin script. Format: one `<username> 0|1` line
+        /// per user. Empty / malformed input yields an empty map.
+        fn parse_autostart_manifest(text: &str) -> std::collections::HashMap<String, bool> {
+            text.lines()
+                .filter_map(|line| {
+                    let mut it = line.splitn(2, ' ');
+                    let user = it.next()?.trim();
+                    let flag = it.next()?.trim();
+                    if user.is_empty() {
+                        return None;
                     }
-                }
-                Err(e) => tracing::warn!(error = %e, "serializing UI cache"),
+                    Some((user.to_string(), flag == "1"))
+                })
+                .collect()
+        }
+
+        /// Build the open-flow admin script: copy the 0600 root-owned
+        /// config out to a user-owned temp, and dump a manifest of
+        /// per-user tray-LaunchAgent plist presence to a sibling temp.
+        /// One elevation, both side effects.
+        fn build_open_admin_script(
+            operator: &str,
+            users: &[LocalUser],
+            staged_config: &Path,
+            staged_manifest: &Path,
+        ) -> String {
+            let mut parts: Vec<String> = vec![format!(
+                "install -m 0600 -o {user} -g staff /etc/screentimed/config.toml {dst}",
+                user = shell_quote_arg(operator),
+                dst = shell_quote(staged_config),
+            )];
+
+            let mut probe = String::from("(");
+            for u in users {
+                let p = u.home.join("Library/LaunchAgents").join(TRAY_AGENT_FILENAME);
+                probe.push_str(&format!(
+                    "if test -f {path}; then echo {name} 1; else echo {name} 0; fi; ",
+                    path = shell_quote(&p),
+                    name = shell_quote_arg(&u.username),
+                ));
             }
+            probe.push_str(") > ");
+            probe.push_str(&shell_quote(staged_manifest));
+            parts.push(probe);
+
+            parts.push(format!(
+                "chown {user}:staff {dst}",
+                user = shell_quote_arg(operator),
+                dst = shell_quote(staged_manifest),
+            ));
+            parts.push(format!(
+                "chmod 0600 {dst}",
+                dst = shell_quote(staged_manifest),
+            ));
+
+            parts.join(" && ")
         }
 
         // ─── Window construction ──────────────────────────────────────
@@ -1943,28 +2006,12 @@ mod imp {
             }
 
             match outcome {
-                Ok(()) => {
-                    persist_autostart_targets(&snapshot);
-                    close_and_clear();
-                }
+                Ok(()) => close_and_clear(),
                 Err(super::admin::Error::Cancelled) => {}
                 Err(super::admin::Error::Failed(msg)) => {
                     super::alerts::message(mtm, "Couldn't save settings.", &msg);
                 }
             }
-        }
-
-        /// Update the operator-owned cache so the next Configure open
-        /// renders the same `Start at login` state we just committed —
-        /// even for users whose home directory we can't `stat`.
-        fn persist_autostart_targets(snap: &Snapshot) {
-            let mut cache = load_ui_cache();
-            for row in &snap.rows {
-                cache
-                    .autostart
-                    .insert(row.username.clone(), row.autostart_target);
-            }
-            save_ui_cache(&cache);
         }
 
         fn capture_snapshot() -> Option<Snapshot> {
@@ -2078,7 +2125,7 @@ mod imp {
         ) -> String {
             let mut parts: Vec<String> = Vec::new();
             parts.push(format!(
-                "install -m 0644 {src} /etc/screentimed/config.toml",
+                "install -m 0600 {src} /etc/screentimed/config.toml",
                 src = shell_quote(config_temp),
             ));
             for (plist_temp, row, enable) in other_user_changes {
