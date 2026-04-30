@@ -94,3 +94,57 @@ jobs:
             artifacts/*/*.zip \
             --title "Konstantin $TAG" \
             --generate-notes
+
+  bump-tap:
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Extract version from tag
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF#refs/tags/}"
+          VERSION="${TAG#v}"
+          echo "TAG=$TAG"         >> "$GITHUB_ENV"
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+
+      - name: Download release zip and compute sha256
+        run: |
+          set -euo pipefail
+          ASSET="Konstantin-${VERSION}-arm64.zip"
+          URL="https://github.com/${{ github.repository }}/releases/download/${TAG}/${ASSET}"
+          curl -fsSL -o "$ASSET" "$URL"
+          SHA256=$(shasum -a 256 "$ASSET" | awk '{print $1}')
+          echo "SHA256=$SHA256" >> "$GITHUB_ENV"
+          echo "Computed sha256 for $ASSET: $SHA256"
+
+      - name: Checkout tap repo
+        uses: actions/checkout@v4
+        with:
+          repository: gitopolis/homebrew-konstantin
+          token: ${{ secrets.TAP_PAT }}
+          path: tap
+
+      - name: Update cask formula
+        run: |
+          set -euo pipefail
+          cd tap
+          # Cask is Ruby, not TOML — sed against uniquely-formatted lines
+          # is the right tool here.
+          sed -i.bak -E "s|^  version \"[^\"]+\"|  version \"${VERSION}\"|" Casks/konstantin.rb
+          sed -i.bak -E "s|^  sha256 \"[^\"]+\"|  sha256 \"${SHA256}\"|"   Casks/konstantin.rb
+          rm Casks/konstantin.rb.bak
+          grep -E '^  (version|sha256)' Casks/konstantin.rb
+
+      - name: Commit and push
+        run: |
+          set -euo pipefail
+          cd tap
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if git diff --quiet; then
+            echo "::notice::cask is already at $VERSION/$SHA256 — nothing to commit"
+            exit 0
+          fi
+          git add Casks/konstantin.rb
+          git commit -m "konstantin ${VERSION}"
+          git push origin HEAD
