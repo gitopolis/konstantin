@@ -29,20 +29,21 @@ jobs:
           echo "VERSION=$VERSION" >> "$GITHUB_ENV"
           echo "Building $TAG ($VERSION) for ${{ matrix.target }}"
 
-      - name: Update workspace version (uncommitted)
-        uses: colt-1/toml-editor@1.1.1
-        with:
-          file: Cargo.toml
-          key: workspace.package.version
-          value: ${{ env.VERSION }}
-
-      - name: Show updated version line
-        run: grep '^version' Cargo.toml
-
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+
+      - name: Install cargo-edit
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-edit
+
+      - name: Update workspace version (uncommitted)
+        run: |
+          set -euo pipefail
+          cargo set-version --workspace "$VERSION"
+          grep -nE '^version[[:space:]]*=' Cargo.toml
 
       - name: Build release binaries
         run: |

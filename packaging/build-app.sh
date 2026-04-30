@@ -18,11 +18,16 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TARGET="${ROOT}/target/release"
 APP="${ROOT}/target/Konstantin.app"
 
-# Read version from the workspace Cargo.toml (single source of truth).
-VERSION=$(awk -F'"' '/^version[[:space:]]*=/ { print $2; exit }' \
-    "${ROOT}/Cargo.toml")
+# Resolve the bundle version. CI passes it via $VERSION (extracted from
+# the release tag); for local dev we ask cargo for the workspace version
+# so we don't depend on Cargo.toml's textual layout.
+if [[ -z "${VERSION:-}" ]]; then
+    VERSION=$(cargo metadata --no-deps --format-version 1 \
+        --manifest-path "${ROOT}/Cargo.toml" \
+        | python3 -c 'import sys, json; print(json.load(sys.stdin)["packages"][0]["version"])')
+fi
 if [[ -z "${VERSION}" ]]; then
-    echo "could not read version from Cargo.toml" >&2
+    echo "could not resolve version (set \$VERSION or check cargo metadata)" >&2
     exit 1
 fi
 
