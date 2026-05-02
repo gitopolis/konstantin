@@ -42,6 +42,7 @@ directories and can be removed with one menu click.
 ```sh
 brew tap gitopolis/konstantin
 brew install --cask konstantin
+xattr -dr com.apple.quarantine "/Applications/Konstantin.app" # Remove the quarantine Apple tag
 open -a Konstantin
 ```
 
@@ -84,8 +85,9 @@ people you actually want to limit.
 
 Click the menu-bar icon to see:
 
-* The remaining-time display in the icon itself (e.g. `1h23m`,
-  `12m05s`, `0s`, or `🔴` when the daemon is down).
+* A clock glyph plus the remaining-time display (e.g. `🕒 1h23m`,
+  `🕒 12m05s`, `🕒 0s`). When the daemon is down, the clock goes
+  muted gray and the time disappears.
 * `Start Daemon` / `Stop Daemon` / `Restart Daemon` — controls the
   background service. Each prompts for an admin password.
 * `Configure…` — opens the settings window. Asks for an admin

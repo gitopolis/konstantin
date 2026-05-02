@@ -35,8 +35,8 @@ mod imp {
     use objc2::rc::Retained;
     use objc2::sel;
     use objc2_app_kit::{
-        NSAlert, NSApplication, NSMenu, NSMenuItem, NSStatusBar, NSStatusItem,
-        NSVariableStatusItemLength,
+        NSAlert, NSApplication, NSCellImagePosition, NSColor, NSImage, NSImageSymbolConfiguration,
+        NSMenu, NSMenuItem, NSStatusBar, NSStatusItem, NSVariableStatusItemLength,
     };
     // `NSApplicationActivationPolicy` is declared in the
     // NSRunningApplication header, not NSApplication's.
@@ -72,8 +72,8 @@ mod imp {
 
     impl Default for Latest {
         fn default() -> Self {
-            // Start "disconnected" so the UI shows 🔴 honestly until the
-            // worker confirms it can reach the daemon.
+            // Start "disconnected" so the UI shows the muted clock
+            // honestly until the worker confirms it can reach the daemon.
             Self {
                 pending: None,
                 disconnected: true,
@@ -122,9 +122,9 @@ mod imp {
         let tray = build_status_item(mtm, &controller);
         let latest = Arc::new(Mutex::new(Latest::default()));
 
-        // Initial title before any update arrives — match the default
-        // `disconnected: true` state.
-        set_title(&tray.status_item, "🔴", mtm);
+        // Initial visuals before any update arrives — match the default
+        // `disconnected: true` state (muted clock, no time label).
+        apply_visual(&tray.status_item, true, "", mtm);
 
         // Idempotent: write our per-user LaunchAgent plist so launchd
         // auto-starts the tray on next login. Doesn't bootstrap — we
@@ -332,15 +332,15 @@ mod imp {
             tray.stop_item.setEnabled(!disconnected);
             tray.restart_item.setEnabled(!disconnected);
 
-            // Title. 🔴 trumps any pending status if we're currently
-            // disconnected — even if a stale `pending` is sitting
-            // around, the daemon is unreachable *now*.
+            // Visuals. The muted clock trumps any pending status if
+            // we're currently disconnected — even if a stale `pending`
+            // is sitting around, the daemon is unreachable *now*.
             if disconnected {
-                set_title(&tray.status_item, "🔴", mtm);
+                apply_visual(&tray.status_item, true, "", mtm);
             } else if let Some(status) = pending {
-                apply_status(&tray.status_item, &status, mtm);
+                apply_visual(&tray.status_item, false, &status_label(&status), mtm);
             }
-            // else: connected, no fresh status — leave title alone.
+            // else: connected, no fresh status — leave visuals alone.
         });
 
         let interval = 1.0 / DRAIN_HZ;
@@ -353,23 +353,60 @@ mod imp {
         }
     }
 
-    fn apply_status(item: &NSStatusItem, status: &UserStatus, mtm: MainThreadMarker) {
-        let label = match status.state {
-            SessionState::NotConfigured => "—".to_string(),
+    fn status_label(status: &UserStatus) -> String {
+        match status.state {
+            // No limit configured for this account — clock glyph alone
+            // is enough; an em-dash next to it just looks like noise.
+            SessionState::NotConfigured => String::new(),
             SessionState::Offline => "offline".to_string(),
             SessionState::LimitReached => "0s".to_string(),
             SessionState::Active => format_remaining(status.remaining_seconds),
             SessionState::Paused => {
                 format!("⏸ {}", format_remaining(status.remaining_seconds))
             }
-        };
-        set_title(item, &label, mtm);
+        }
     }
 
-    fn set_title(item: &NSStatusItem, title: &str, mtm: MainThreadMarker) {
-        if let Some(button) = item.button(mtm) {
-            button.setTitle(&NSString::from_str(title));
+    /// Render the status item's icon + title.
+    ///
+    /// The icon is the `clock` SF Symbol. When connected, it's marked
+    /// as a template image so the menu bar tints it the right color
+    /// for light/dark mode. When `disconnected`, we bake `secondaryLabelColor`
+    /// into the symbol via an `NSImageSymbolConfiguration` and drop the
+    /// template flag — `NSStatusBarButton` ignores `contentTintColor`
+    /// for template images, so we have to encode the gray in the image
+    /// itself.
+    fn apply_visual(
+        item: &NSStatusItem,
+        disconnected: bool,
+        label: &str,
+        mtm: MainThreadMarker,
+    ) {
+        let Some(button) = item.button(mtm) else {
+            return;
+        };
+
+        let symbol = NSString::from_str("clock");
+        if let Some(base) =
+            NSImage::imageWithSystemSymbolName_accessibilityDescription(&symbol, None)
+        {
+            let image = if disconnected {
+                let cfg = NSImageSymbolConfiguration::configurationWithHierarchicalColor(
+                    &NSColor::secondaryLabelColor(),
+                );
+                let tinted = base.imageWithSymbolConfiguration(&cfg).unwrap_or(base);
+                // Non-template so the menu bar uses our embedded color
+                // instead of overriding it with the menu-bar foreground.
+                tinted.setTemplate(false);
+                tinted
+            } else {
+                base.setTemplate(true);
+                base
+            };
+            button.setImage(Some(&image));
         }
+        button.setImagePosition(NSCellImagePosition::ImageLeading);
+        button.setTitle(&NSString::from_str(label));
     }
 
     fn install_tracing() {

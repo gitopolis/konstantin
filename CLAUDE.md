@@ -3,7 +3,7 @@
 A macOS screen-time enforcer in Rust. This file is the design handoff —
 read it before making changes so decisions stay consistent.
 
-Owner: Nikita (qnicks@gmail.com). Target machine: macOS Tahoe on Apple
+Owner: Nikita Kutselev. Target machine: macOS Tahoe on Apple
 Silicon. Rust edition 2021, MSRV 1.78. Distribution intent: Homebrew
 cask shipping an unsigned `Konstantin.app` bundle. Developer ID
 notarization is out of scope for v1.
@@ -91,7 +91,7 @@ root. Each invocation is one-shot — no persistent privilege handle.
 Daemon-running detection: try to connect to the socket. Cheap, no
 privileges, no `launchctl print` parsing. The worker thread's existing
 `disconnected` flag drives both the menu-item enabled state and the
-red-dot status indicator.
+muted-glyph status indicator.
 
 ## Decisions locked in
 
@@ -169,9 +169,15 @@ These were Nikita's choices; revisit explicitly before changing them.
    / Restart affect the one shared daemon; Configure edits
    `/etc/screentimed/config.toml`. There is no per-user mode.
 
-10. **Status item: red dot when daemon is down**, formatted remaining
-    time when it's up. Detection is the worker's `disconnected` flag,
-    driven by socket-connect success.
+10. **Status item: `clock` SF Symbol always.** When connected the
+    image is a template (menu bar tints it for light/dark); when
+    disconnected we apply an `NSImageSymbolConfiguration` with
+    `secondaryLabelColor` and clear the template flag so the muted
+    gray sticks — `NSStatusBarButton` ignores `contentTintColor` for
+    template images, so the color has to be baked into the symbol.
+    Connected state shows the glyph followed by formatted remaining
+    time; disconnected shows the gray glyph alone. Detection is the
+    worker's `disconnected` flag, driven by socket-connect success.
 
 ## What's already built (phases 1–7 + A1–A7)
 
@@ -220,10 +226,12 @@ These were Nikita's choices; revisit explicitly before changing them.
   / configure: / openLog: / uninstall:` selectors. Lifecycle commands
   use `|| true`-tolerant launchctl chains so already-loaded /
   already-stopped states are idempotent.
-* **A5** — state-driven UI: 🔴 when `disconnected`, formatted time
-  otherwise. Menu items enable/disable from the same flag.
-  `Latest::default()` starts in `disconnected: true` so initial UI is
-  honest.
+* **A5** — state-driven UI: muted `clock` SF Symbol when
+  `disconnected` (gray baked into the image via an
+  `NSImageSymbolConfiguration` with `secondaryLabelColor`), the same
+  glyph as a template image plus formatted time when connected. Menu
+  items enable/disable from the same flag. `Latest::default()` starts
+  in `disconnected: true` so initial UI is honest.
 * **A6** — `bundle::Paths::resolve()` handles both real `.app` bundles
   and dev-tree (`target/<profile>/` + `packaging/`). Source labelled
   in startup log. User LaunchAgent rewrite is bundle-only — running
@@ -231,9 +239,11 @@ These were Nikita's choices; revisit explicitly before changing them.
   `~/Library/LaunchAgents/` with a dev path.
 * **A7** — `Uninstall…` menu item: confirm → privileged teardown
   (`launchctl bootout` + `rm` of system files) → user LaunchAgent
-  cleanup → `NSApplication::terminate`.
-  `packaging/konstantin.rb` cask formula has matching `uninstall` +
-  `zap` stanzas for non-interactive `brew uninstall --zap`.
+  cleanup → `NSApplication::terminate`. The cask formula in the
+  separate tap repo (`github.com/gitopolis/homebrew-konstantin`,
+  `Casks/konstantin.rb`) carries matching `uninstall` + `zap` stanzas
+  for non-interactive `brew uninstall --zap`; the release workflow
+  auto-bumps version + sha256 there on each tag.
 * **A8** — security/UX hardening on top of A1–A7:
   * `/etc/screentimed/config.toml` is now mode 0600 root-owned at
     every write site (`packaging/install.sh`, the tray's first-launch
@@ -273,9 +283,10 @@ wider distribution:
   and so we can move to `SMAppService` and `UNUserNotificationCenter`.
 * **Real `AppIcon.iconset/`** in `packaging/`. Currently the bundle
   ships with macOS's generic application icon.
-* **Homebrew tap repo** (`github.com/gitopolis/homebrew-konstantin`) hosting
-  the cask formula at `packaging/konstantin.rb`. Plus a release pipeline
-  that builds, zips, and pushes `Konstantin-<version>.zip` artifacts.
+
+The Homebrew tap is live at `github.com/gitopolis/homebrew-konstantin`
+(cask at `Casks/konstantin.rb`); the release workflow zips, uploads,
+and bumps the cask on each tag.
 
 ## Hard safety rules
 
