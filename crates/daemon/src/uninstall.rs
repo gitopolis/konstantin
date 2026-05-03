@@ -96,36 +96,57 @@ impl BundleWatcher {
 /// Perform the system-side teardown and exit the process. Does not
 /// return.
 ///
-/// Order matters: we remove the binary first so launchd's
-/// `KeepAlive=true` can't respawn us, then the LaunchDaemon plist
-/// (so a reboot doesn't try to re-load the unit), then per-user tray
-/// LaunchAgents, then runtime crumbs (sockets, marker, helper bins).
-/// Finally we ask launchd to bootout our own service and exit.
+/// Order matters: legacy `/usr/local/libexec/screentimed` first
+/// (cleanup for users upgrading from the pre-SMAppService layout —
+/// no-op on fresh installs), then the legacy LaunchDaemon plist (so
+/// a reboot doesn't try to re-load the unit if SMAppService didn't
+/// already retire it), then per-user tray LaunchAgents, then
+/// state, runtime crumbs, and finally the bootout. SMAppService-
+/// registered installs are torn down by the tray's
+/// `sm::unregister_daemon()` call after we've sent our `Ack` on the
+/// IPC `SelfUninstall` request — that's the kill signal that
+/// actually stops launchd respawning us.
 ///
 /// All `rm`s are best-effort — a missing file just means a partial
 /// install; we still want to finish the teardown.
 pub fn self_uninstall() -> ! {
     info!("self-uninstall starting");
 
-    // 1. Our own binary first. The kernel keeps the running file
-    //    available via the open inode, but `KeepAlive=true` can no
-    //    longer find a binary to relaunch, so this is what makes
-    //    "exit and stay dead" work.
+    // 1. Legacy daemon binary location. With SMAppService, the
+    //    daemon runs from inside the bundle (`BundleProgram`) and
+    //    nothing lives here anymore. Kept as a one-release cleanup
+    //    for users upgrading from the hand-installed layout.
     rm_f("/usr/local/libexec/screentimed");
 
-    // 2. LaunchDaemon plist. After this, a reboot won't try to load us.
+    // 2. Legacy LaunchDaemon plist. SMAppService-registered installs
+    //    don't put a plist here; pre-SMAppService installs did. Same
+    //    rationale as step 1.
     rm_f("/Library/LaunchDaemons/com.gitopolis.screentimed.plist");
 
-    // 3. Per-user tray LaunchAgent plists. Iterate `/Users/*` and
+    // 3. Counter state. Decision #8 / phase A8: uninstall removes
+    //    accumulated daily totals so a reinstall starts from zero.
+    rm_rf("/var/db/screentimed");
+
+    // 4. Per-user tray LaunchAgent plists. Iterate `/Users/*` and
     //    delete each one we find. Other users' running trays will
     //    already be confused (their bundle exe is gone), but the
     //    plist removal stops them from being respawned at next login.
+    //    Best-effort `bootout gui/<uid>` so a logged-in tray exits
+    //    immediately rather than at next login.
     if let Ok(entries) = std::fs::read_dir("/Users") {
         for entry in entries.flatten() {
             let plist = entry
                 .path()
                 .join("Library/LaunchAgents/com.gitopolis.konstantin-tray.plist");
             if plist.exists() {
+                if let Some(uid) = stat_uid(&entry.path()) {
+                    let _ = Command::new("/bin/launchctl")
+                        .args([
+                            "bootout",
+                            &format!("gui/{uid}/com.gitopolis.konstantin-tray"),
+                        ])
+                        .status();
+                }
                 rm_f_path(&plist);
             }
         }
@@ -133,17 +154,17 @@ pub fn self_uninstall() -> ! {
     // Legacy system-level location from pre-phase-7 installs.
     rm_f("/Library/LaunchAgents/com.gitopolis.konstantin-tray.plist");
 
-    // 4. Helper binaries from the dev-tree install path.
+    // 5. Helper binaries from the dev-tree install path.
     rm_f("/usr/local/bin/konstantin-status");
     rm_f("/usr/local/bin/konstantin-tray");
 
-    // 5. Runtime crumbs.
+    // 6. Runtime crumbs.
     rm_f("/var/run/screentimed.sock");
     rm_f(MARKER_PATH);
 
-    // 6. Bootout self. Best-effort — even if the call fails or races
-    //    with our exit, the binary and plist are already gone, so
-    //    launchd won't bring us back.
+    // 7. Bootout self. Best-effort — for SMAppService installs the
+    //    actual stop is driven by the tray's `sm::unregister_daemon`,
+    //    but this covers the legacy hand-install layout.
     let _ = Command::new("/bin/launchctl")
         .args(["bootout", "system/com.gitopolis.screentimed"])
         .status();
@@ -162,6 +183,22 @@ fn rm_f_path(path: &Path) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => warn!(path = %path.display(), error = %e, "remove failed"),
     }
+}
+
+fn rm_rf(path: &str) {
+    let p = Path::new(path);
+    match std::fs::remove_dir_all(p) {
+        Ok(()) => info!(path = %p.display(), "removed (recursive)"),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => warn!(path = %p.display(), error = %e, "remove (recursive) failed"),
+    }
+}
+
+/// Owner uid of a path, via `stat(2)`. Used to derive the gui-domain
+/// argument for `launchctl bootout gui/<uid>/...`.
+fn stat_uid(path: &Path) -> Option<u32> {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(path).ok().map(|m| m.uid())
 }
 
 #[cfg(test)]

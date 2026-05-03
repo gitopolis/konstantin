@@ -25,6 +25,13 @@ pub const MAX_FRAME_BYTES: usize = 1 << 20; // 1 MiB
 pub const DEFAULT_SOCKET_PATH: &str = "/var/run/screentimed.sock";
 
 /// Requests sent from a client to the daemon.
+///
+/// **Auth model.** All requests are accepted from any peer connected
+/// to the socket — peer credentials (uid/gid) are derived via
+/// `getpeereid`. Daemon-side handlers gate sensitive ops on
+/// `peer_is_admin(uid)` (uid is a member of the macOS `admin` group,
+/// gid 80). The `admin: true` markers in this enum's doc comments
+/// indicate where that gate fires.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Request {
@@ -39,6 +46,26 @@ pub enum Request {
         locked: bool,
         idle_seconds: u32,
     },
+    /// Read the active config TOML. Open to all peers — the file is
+    /// sensitive (mode 0600) but reading via the daemon is the
+    /// non-privileged way for a tray to display current settings.
+    ReadConfig,
+    /// Replace the on-disk config and reload it in-process. **admin**.
+    /// `contents` must parse as the daemon's TOML schema; the daemon
+    /// validates before writing and rejects malformed input.
+    /// On success, all subscribers receive a refreshed `StatusUpdate`.
+    WriteConfig { contents: String },
+    /// Probe each local user's tray-autostart LaunchAgent plist and
+    /// report which ones are present. Open to all peers.
+    ReadAutostartManifest,
+    /// Install or remove `<home>/Library/LaunchAgents/com.gitopolis.
+    /// konstantin-tray.plist` for the named user. **admin**.
+    WriteAutostart { username: String, enable: bool },
+    /// Tear down: bootout the daemon, remove `/var/db/screentimed/`,
+    /// remove every user's tray-autostart plist, and exit. **admin**.
+    /// The daemon ACKs as soon as it has committed to dying — clients
+    /// may see EOF immediately afterwards.
+    SelfUninstall,
 }
 
 /// Responses from the daemon to a client.
@@ -48,7 +75,28 @@ pub enum Response {
     Status(UserStatus),
     StatusUpdate(UserStatus),
     Ack,
-    Error { message: String },
+    Error {
+        message: String,
+    },
+    /// Successful response to `Request::ReadConfig`. `contents` is the
+    /// raw TOML text the daemon read from disk — clients deserialize
+    /// it themselves so the daemon doesn't have to know about every
+    /// schema permutation.
+    Config {
+        contents: String,
+    },
+    /// Successful response to `Request::ReadAutostartManifest`.
+    AutostartManifest {
+        entries: Vec<AutostartEntry>,
+    },
+}
+
+/// One row of the `ReadAutostartManifest` response: a local user and
+/// whether their tray-autostart plist is currently installed.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AutostartEntry {
+    pub username: String,
+    pub enabled: bool,
 }
 
 /// What the daemon thinks is going on for a particular user.

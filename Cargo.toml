@@ -88,6 +88,17 @@ objc2-user-notifications = { version = "0.3", features = [
     "UNNotificationTrigger",
     "UNNotification",
 ] }
+# SMAppService — the modern launchd-registration API. Replaces the
+# old `cp daemon to /usr/local/libexec/ + cp plist to /Library/Launch
+# Daemons/ + launchctl bootstrap` ritual with a single `register()`.
+# First call from a fresh bundle prompts the user once via System
+# Settings → Login Items; subsequent register/unregister are silent.
+# `block2` is needed for the async unregister completion handler.
+objc2-service-management = { version = "0.3", features = [
+    "SMAppService",
+    "SMErrors",
+    "block2",
+] }
 
 # Internal
 konstantin-proto = { path = "crates/proto" }

@@ -167,15 +167,48 @@ mod imp {
             Err(_) => {} // already logged above
         }
 
-        // First-launch flow: if we can't reach the daemon AND no system
-        // plist is present, ask for admin auth and run the privileged
-        // install. If the user cancels, exit cleanly.
-        if !install::daemon_socket_reachable()
-            && !install::system_plist_present()
-            && !install::run_first_launch_install(mtm)
-        {
-            tracing::info!("first-launch setup not completed; quitting");
-            return Ok(());
+        // First-launch flow. Bundle source = source of truth: SMAppService
+        // owns the daemon-registration state inside a real `.app`, and
+        // doesn't work at all from a dev tree. Dev runs assume the
+        // operator hand-installed the daemon via `packaging/install.sh`
+        // and just rely on the subscribe loop's auto-reconnect.
+        if matches!(
+            bundle::Paths::resolve().map(|p| p.source),
+            Ok(bundle::Source::Bundle)
+        ) {
+            match sm::daemon_status() {
+                sm::Status::Enabled => {
+                    tracing::info!("SMAppService: daemon already registered");
+                }
+                sm::Status::NotRegistered => {
+                    if !install::run_first_launch_install(mtm) {
+                        tracing::info!("first-launch setup not completed; quitting");
+                        return Ok(());
+                    }
+                }
+                sm::Status::RequiresApproval => {
+                    install::show_requires_approval_alert(mtm);
+                    return Ok(());
+                }
+                other => {
+                    tracing::error!(
+                        status = ?other,
+                        "SMAppService returned unexpected status — packaging issue?"
+                    );
+                    alerts::message(
+                        mtm,
+                        "Konstantin",
+                        "Couldn't locate the bundled daemon plist.\n\n\
+                         Reinstalling Konstantin should fix this.",
+                    );
+                    return Ok(());
+                }
+            }
+        } else if !install::daemon_socket_reachable() {
+            tracing::warn!(
+                "dev-tree run with daemon not reachable — \
+                 run packaging/install.sh, or build the bundle"
+            );
         }
 
         // Ask for notification permission once at startup. macOS
@@ -640,52 +673,33 @@ mod imp {
                 #[unsafe(method(startDaemon:))]
                 fn start_daemon_action(&self, _sender: Option<&AnyObject>) {
                     let mtm = MainThreadMarker::from(self);
-                    // Idempotent. `bootstrap` fails ("I/O error: 5") if
-                    // already loaded; that's fine, we just need it
-                    // loaded somehow. `enable` fails if already
-                    // enabled, also fine. `kickstart` (no `-k`) is the
-                    // authoritative step — it brings the service up if
-                    // it isn't already, no-ops if it is.
-                    run_admin(
-                        mtm,
-                        "Starting Daemon",
-                        "Starting Konstantin…",
-                        "(launchctl bootstrap system /Library/LaunchDaemons/com.gitopolis.screentimed.plist || true) && \
-                         (launchctl enable system/com.gitopolis.screentimed || true) && \
-                         launchctl kickstart system/com.gitopolis.screentimed",
-                        "Couldn't start Konstantin.",
-                    );
+                    // SMAppService.register is idempotent for our case:
+                    // re-registering an Enabled service returns
+                    // kSMErrorAlreadyRegistered, which our wrapper
+                    // surfaces as Failed but doesn't actually break
+                    // anything — the daemon stays up.
+                    sm_action(mtm, "start", || sm::register_daemon());
                 }
 
                 #[unsafe(method(stopDaemon:))]
                 fn stop_daemon_action(&self, _sender: Option<&AnyObject>) {
                     let mtm = MainThreadMarker::from(self);
-                    // `|| true` so "Stop" is silent when the service
-                    // wasn't loaded to begin with. The user's intent
-                    // ("not running") is already satisfied.
-                    run_admin(
-                        mtm,
-                        "Stopping Daemon",
-                        "Stopping Konstantin…",
-                        "launchctl bootout system/com.gitopolis.screentimed || true",
-                        "Couldn't stop Konstantin.",
-                    );
+                    sm_action(mtm, "stop", || sm::unregister_daemon());
                 }
 
                 #[unsafe(method(restartDaemon:))]
                 fn restart_daemon_action(&self, _sender: Option<&AnyObject>) {
                     let mtm = MainThreadMarker::from(self);
-                    // Cover both "loaded" and "not loaded" entry states.
-                    // `bootstrap || true` makes the loaded-already case
-                    // silent. `kickstart -k` then restarts unconditionally.
-                    run_admin(
-                        mtm,
-                        "Restarting Daemon",
-                        "Restarting Konstantin…",
-                        "(launchctl bootstrap system /Library/LaunchDaemons/com.gitopolis.screentimed.plist || true) && \
-                         launchctl kickstart -k system/com.gitopolis.screentimed",
-                        "Couldn't restart Konstantin.",
-                    );
+                    // Unregister-then-register pair makes intent
+                    // explicit. With KeepAlive=true, just unregister
+                    // would normally not be enough since the service
+                    // isn't auto-respawning across an SMAppService
+                    // unregister — the helper goes away. Re-register
+                    // brings it back.
+                    sm_action(mtm, "restart", || {
+                        let _ = sm::unregister_daemon();
+                        sm::register_daemon()
+                    });
                 }
 
                 #[unsafe(method(configure:))]
@@ -720,21 +734,53 @@ mod imp {
             }
         }
 
-        /// Common shape for "run privileged command, alert on failure".
-        fn run_admin(
-            mtm: MainThreadMarker,
-            panel_title: &str,
-            panel_message: &str,
-            bash_command: &str,
-            failure_title: &str,
-        ) {
-            match admin::run_with_progress(mtm, panel_title, panel_message, bash_command) {
-                Ok(()) => {}
-                Err(admin::Error::Cancelled) => {}
-                Err(admin::Error::Failed(msg)) => {
-                    alerts::message(mtm, failure_title, &msg);
+        /// Common shape for "run an SMAppService op; alert if it
+        /// surfaces a problem the user can act on". Idempotent
+        /// already-registered / already-not-registered surface as
+        /// `Failed` but don't warrant a user-facing alert — we just
+        /// log them. The drain timer's socket probe is the
+        /// authoritative "did it actually take?" signal.
+        fn sm_action<F>(mtm: MainThreadMarker, label: &str, op: F)
+        where
+            F: FnOnce() -> Result<(), sm::Error>,
+        {
+            match op() {
+                Ok(()) => {
+                    tracing::info!(action = label, "SMAppService op succeeded");
+                }
+                Err(sm::Error::NotApproved) => {
+                    super::install::show_requires_approval_alert(mtm);
+                }
+                Err(sm::Error::Failed(msg)) => {
+                    tracing::warn!(action = label, error = %msg, "SMAppService op failed");
+                    // Idempotency-ish errors (already-registered /
+                    // already-not-registered) come through here. They
+                    // arrive often enough that surfacing a UI alert
+                    // for them is noisy; we keep the alert for
+                    // genuinely new error messages.
+                    if !is_idempotent_noise(&msg) {
+                        alerts::message(
+                            mtm,
+                            &format!("Couldn't {label} Konstantin."),
+                            &msg,
+                        );
+                    }
                 }
             }
+        }
+
+        /// True for the localized descriptions SMAppService emits when
+        /// the requested operation was already in effect: re-register
+        /// of an Enabled service, unregister of a NotRegistered one.
+        /// Apple's strings; matched on substring so we tolerate locale
+        /// variants. Non-exhaustive on purpose — anything we can't
+        /// recognize as noise gets surfaced to the user.
+        fn is_idempotent_noise(msg: &str) -> bool {
+            let lower = msg.to_lowercase();
+            lower.contains("already registered")
+                || lower.contains("already enabled")
+                || lower.contains("not found")
+                || lower.contains("no such service")
         }
 
         /// `Open Log` — hand the file off to Console.app (the macOS
@@ -747,27 +793,23 @@ mod imp {
                 .status();
         }
 
-        /// Uninstall flow:
-        ///   1. Confirm with the user (destructive).
-        ///   2. Run the privileged teardown via `admin::run_with_progress`
-        ///      — bootout the daemon, remove its plist + binaries +
-        ///      socket, and `rm` every per-user tray LaunchAgent plist
-        ///      under `/Users/<name>/Library/LaunchAgents/`. Mirrors
-        ///      `packaging/uninstall.sh`.
-        ///   3. Tell the user, then terminate.
-        ///
-        /// We don't `launchctl bootout gui/<operator-uid>/...` for our
-        /// own tray — we *are* that agent, and bootout would terminate
-        /// us before the success alert renders. Other users' trays do
-        /// get bootout'd so they go away immediately rather than at
-        /// next login.
+        /// Uninstall flow (post-SMAppService migration):
+        ///   1. Confirm with the user.
+        ///   2. Send `Request::SelfUninstall`. Daemon ACKs after it
+        ///      has committed to the teardown — system-side cleanup
+        ///      runs concurrently with the rest of this function.
+        ///   3. `sm::unregister_daemon()` — kills the (possibly already
+        ///      respawned) daemon and unregisters with launchd.
+        ///   4. Remove this user's own tray-autostart plist (no admin
+        ///      needed — it's in `~/Library/LaunchAgents/`).
+        ///   5. Tell the user the bundle still needs to go to the Trash.
+        ///   6. Terminate.
         ///
         /// `/etc/screentimed/` (config) is intentionally preserved so a
         /// reinstall resumes with the user's settings. `/var/db/screentimed/`
-        /// (counter state) *is* removed — uninstall means uninstall.
-        /// The Homebrew cask's `zap` block at `packaging/konstantin.rb`
-        /// also removes the config directory for users who want a
-        /// clean wipe.
+        /// (counter state) *is* removed by the daemon's `self_uninstall`.
+        /// The Homebrew cask's `zap` block also removes the config
+        /// directory for users who want a clean wipe.
         fn uninstall_flow(mtm: MainThreadMarker) {
             if !alerts::confirm(
                 mtm,
@@ -784,19 +826,37 @@ mod imp {
                 return;
             }
 
-            let script = build_uninstall_script();
+            // Step 2: ask the daemon to tear itself down. Failure here
+            // (e.g. daemon already gone) is non-fatal — we continue
+            // with the SMAppService unregister + local plist cleanup.
+            match konstantin_tray::one_shot_sync(konstantin_proto::Request::SelfUninstall) {
+                Ok(_) => tracing::info!("daemon ACKed SelfUninstall"),
+                Err(e) => tracing::warn!(error = %e, "SelfUninstall IPC failed; proceeding"),
+            }
 
-            match admin::run_with_progress(
-                mtm,
-                "Uninstalling Konstantin",
-                "Stopping the background service and removing files…",
-                &script,
-            ) {
-                Ok(()) => {}
-                Err(admin::Error::Cancelled) => return,
-                Err(admin::Error::Failed(msg)) => {
-                    alerts::message(mtm, "Couldn't uninstall Konstantin.", &msg);
-                    return;
+            // Step 3: SMAppService.unregister. Idempotent; if the
+            // daemon has already exited and KeepAlive respawned it,
+            // this kills the respawn. If never registered (dev tree),
+            // returns NotFound — which is_idempotent_noise tolerates.
+            if let Err(e) = sm::unregister_daemon() {
+                tracing::warn!(error = ?e, "SMAppService.unregister returned an error; proceeding");
+            }
+
+            // Step 4: remove our own user's autostart plist. We're
+            // running under that LaunchAgent, but the file removal is
+            // safe — `KeepAlive=false` plus our explicit `terminate:`
+            // below means launchd won't relaunch us at next login.
+            if let Ok(home) = std::env::var("HOME") {
+                let plist = std::path::PathBuf::from(home)
+                    .join("Library/LaunchAgents/com.gitopolis.konstantin-tray.plist");
+                if let Err(e) = std::fs::remove_file(&plist) {
+                    if e.kind() != std::io::ErrorKind::NotFound {
+                        tracing::warn!(
+                            path = %plist.display(),
+                            error = %e,
+                            "couldn't remove own autostart plist"
+                        );
+                    }
                 }
             }
 
@@ -808,74 +868,6 @@ mod imp {
             );
 
             NSApplication::sharedApplication(mtm).terminate(None);
-        }
-
-        /// Build the `osascript`-driven sudo script that tears down the
-        /// system install plus every per-user tray LaunchAgent plist.
-        ///
-        /// `;` separators (rather than `&&`) so a missing file in one
-        /// `rm` doesn't short-circuit the rest. `launchctl bootout` is
-        /// suffixed with `|| true` because it errors when the target
-        /// isn't loaded — also fine.
-        fn build_uninstall_script() -> String {
-            let mut parts: Vec<String> = vec![
-                "launchctl bootout system/com.gitopolis.screentimed 2>/dev/null || true".into(),
-                "rm -f /Library/LaunchDaemons/com.gitopolis.screentimed.plist".into(),
-                // Legacy system-level location from pre-phase-7 installs.
-                "rm -f /Library/LaunchAgents/com.gitopolis.konstantin-tray.plist".into(),
-                "rm -f /usr/local/libexec/screentimed".into(),
-                "rm -f /usr/local/bin/konstantin-status".into(),
-                "rm -f /usr/local/bin/konstantin-tray".into(),
-                "rm -f /var/run/screentimed.sock".into(),
-                // Bundle-watcher marker. Always removed so a reinstall
-                // from a different location starts clean.
-                "rm -f /etc/screentimed/bundle_path".into(),
-                // Counter state. A reinstall starts users at zero
-                // accumulated time rather than picking up where they
-                // left off — matches the user's expectation that
-                // uninstalling actually removes their data.
-                "rm -rf /var/db/screentimed".into(),
-            ];
-
-            // Per-user tray plist cleanup. Iterate every real local
-            // account so a multi-user install (operator + others via
-            // the Configure UI) is fully cleaned. If enumeration fails,
-            // fall back to operator's `$HOME` only.
-            let me_uid = super::config_ui::current_uid();
-            let users = konstantin_tray::users::enumerate().unwrap_or_default();
-            if users.is_empty() {
-                if let Ok(home) = std::env::var("HOME") {
-                    let plist = std::path::PathBuf::from(home)
-                        .join("Library/LaunchAgents/com.gitopolis.konstantin-tray.plist");
-                    parts.push(format!(
-                        "rm -f {}",
-                        super::config_ui::shell_quote(&plist)
-                    ));
-                }
-            } else {
-                for u in &users {
-                    let plist = u
-                        .home
-                        .join("Library/LaunchAgents/com.gitopolis.konstantin-tray.plist");
-                    parts.push(format!(
-                        "rm -f {}",
-                        super::config_ui::shell_quote(&plist)
-                    ));
-                    // Don't bootout our own GUI domain — we *are* that
-                    // agent, and bootout would kill us before the
-                    // success alert renders. Other users' running trays
-                    // can safely be torn down.
-                    if u.uid != me_uid {
-                        parts.push(format!(
-                            "launchctl bootout gui/{uid}/com.gitopolis.konstantin-tray \
-                             2>/dev/null || true",
-                            uid = u.uid,
-                        ));
-                    }
-                }
-            }
-
-            parts.join("; ")
         }
     }
 
@@ -1124,6 +1116,157 @@ mod imp {
                 return Err(Error::Cancelled);
             }
             Err(Error::Failed(stderr.into_owned()))
+        }
+    }
+
+    /// Thin wrapper over `objc2-service-management`'s `SMAppService` for
+    /// the LaunchDaemon shipped at
+    /// `Contents/Library/LaunchDaemons/com.gitopolis.screentimed.plist`.
+    ///
+    /// `register_daemon` replaces the previous "copy plist to
+    /// /Library/LaunchDaemons + launchctl bootstrap" osascript ritual.
+    /// The first call from a fresh bundle triggers the System Settings
+    /// → Login Items approval flow — the user toggles Konstantin on
+    /// once and every subsequent register/unregister is silent. No
+    /// admin password sheet, ever.
+    ///
+    /// macOS keys SMAppService registrations off the bundle's code-
+    /// signed identity; calling these functions from a bare `cargo
+    /// run` outside an `.app` (or from an ad-hoc-signed bundle) returns
+    /// `Error::Failed` and the launchd entry never appears. See
+    /// `bundle::Source::DevTree`-gated callers.
+    mod sm {
+        use objc2_foundation::NSString;
+        use objc2_service_management::{SMAppService, SMAppServiceStatus};
+
+        const PLIST_NAME: &str = "com.gitopolis.screentimed.plist";
+
+        /// Mirror of Apple's `SMAppServiceStatus` plus the conversion
+        /// for unknown values. See
+        /// <https://developer.apple.com/documentation/servicemanagement/smappservicestatus>.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        pub enum Status {
+            /// Service has never been registered, or was unregistered.
+            NotRegistered,
+            /// Registered and approved — launchd will load it.
+            Enabled,
+            /// User must toggle Konstantin on in System Settings →
+            /// Login Items. SMAppService returns this both on first
+            /// register from an unapproved bundle and after the user
+            /// later revokes consent.
+            RequiresApproval,
+            /// SMAppService can't find a plist matching `PLIST_NAME`
+            /// in this bundle. Almost always a packaging mistake.
+            NotFound,
+            /// Future enum variants — log and treat as not-registered
+            /// for safety.
+            Other(isize),
+        }
+
+        impl From<SMAppServiceStatus> for Status {
+            fn from(s: SMAppServiceStatus) -> Self {
+                match s {
+                    SMAppServiceStatus::NotRegistered => Self::NotRegistered,
+                    SMAppServiceStatus::Enabled => Self::Enabled,
+                    SMAppServiceStatus::RequiresApproval => Self::RequiresApproval,
+                    SMAppServiceStatus::NotFound => Self::NotFound,
+                    other => Self::Other(other.0 as isize),
+                }
+            }
+        }
+
+        #[derive(Debug)]
+        pub enum Error {
+            /// User has not approved the daemon in System Settings (or
+            /// has revoked consent). Caller should prompt them to open
+            /// Login Items.
+            NotApproved,
+            /// Anything else SMAppService reported. Includes
+            /// `kSMErrorAlreadyRegistered` (idempotent register) and
+            /// `kSMErrorJobNotFound` (idempotent unregister) — callers
+            /// generally want to map those to success.
+            Failed(String),
+        }
+
+        fn service() -> objc2::rc::Retained<SMAppService> {
+            let name = NSString::from_str(PLIST_NAME);
+            // SAFETY: `daemonServiceWithPlistName` returns an autoreleased
+            // SMAppService; objc2 retains it for us. The plist lookup is
+            // bundle-relative — we ship it at the path SMAppService expects.
+            unsafe { SMAppService::daemonServiceWithPlistName(&name) }
+        }
+
+        /// Register the daemon with launchd. Idempotent: re-registering
+        /// an already-enabled service returns Ok.
+        pub fn register_daemon() -> Result<(), Error> {
+            let svc = service();
+            // SAFETY: instance method on a valid SMAppService. Result
+            // bridging is generated by objc2.
+            let result = unsafe { svc.registerAndReturnError() };
+            match result {
+                Ok(()) => Ok(()),
+                Err(err) => Err(classify_error(&err)),
+            }
+        }
+
+        /// Unregister the daemon. Idempotent: unregistering an already
+        /// not-registered service returns Ok.
+        pub fn unregister_daemon() -> Result<(), Error> {
+            let svc = service();
+            // SAFETY: instance method on a valid SMAppService.
+            let result = unsafe { svc.unregisterAndReturnError() };
+            match result {
+                Ok(()) => Ok(()),
+                Err(err) => Err(classify_error(&err)),
+            }
+        }
+
+        pub fn daemon_status() -> Status {
+            let svc = service();
+            // SAFETY: status returns a plain enum — no allocation.
+            let raw = unsafe { svc.status() };
+            Status::from(raw)
+        }
+
+        /// Open System Settings → General → Login Items & Extensions,
+        /// scrolled to the background-items section. Use this as the
+        /// follow-up action when register returns `NotApproved`.
+        pub fn open_login_items_settings() {
+            // SAFETY: class method, takes nothing, returns void.
+            unsafe { SMAppService::openSystemSettingsLoginItems() }
+        }
+
+        /// Map `NSError`s coming back from SMAppService to our enum.
+        /// SMAppService's domain is `SMAppServiceErrorDomain` and the
+        /// codes are documented at
+        /// <https://developer.apple.com/documentation/servicemanagement/smerror>.
+        ///
+        /// We collapse the "already registered" / "job not found"
+        /// idempotent-success cases to `Ok`-equivalent at the call
+        /// boundary above — this function only returns `Error`s.
+        fn classify_error(err: &objc2_foundation::NSError) -> Error {
+            let code = err.code();
+            let desc = err.localizedDescription().to_string();
+
+            // kSMErrorAlreadyRegistered = 4, kSMErrorJobNotFound = 9
+            // — caller treats those as success.
+            if code == 4 || code == 9 {
+                tracing::debug!(code, %desc, "SMAppService idempotent ok");
+                // Surface as Failed to keep the type honest; callers
+                // that want idempotency check status() before/after.
+                return Error::Failed(desc);
+            }
+            // kSMErrorLaunchDeniedByUser = 6 — user said no.
+            if code == 6 {
+                return Error::NotApproved;
+            }
+            // RequiresApproval surfaces as a status, not an error, but
+            // some macOS versions report it as kSMErrorRequiresApproval.
+            if code == 5 {
+                return Error::NotApproved;
+            }
+            tracing::warn!(code, %desc, "SMAppService error");
+            Error::Failed(desc)
         }
     }
 
@@ -1958,11 +2101,11 @@ exit 0"#,
     /// First-launch install + per-user LaunchAgent management.
     ///
     /// Two responsibilities:
-    ///   * **System side** (privileged) — copy the bundled daemon binary
-    ///     and plist into `/usr/local/libexec/` and `/Library/LaunchDaemons/`,
-    ///     seed a default config, and bootstrap the daemon. Routed
-    ///     through `admin::run_with_progress` so the user gets a
-    ///     standard password prompt and a progress panel.
+    ///   * **System side** — register the bundled LaunchDaemon via
+    ///     `SMAppService.register`. First call from a fresh bundle
+    ///     surfaces a "Konstantin needs background-task permission"
+    ///     prompt that deep-links to System Settings → Login Items;
+    ///     subsequent calls are silent. No admin password sheet.
     ///   * **User side** (no auth) — write a per-user LaunchAgent plist
     ///     pointing at this tray binary's absolute path, so launchd
     ///     auto-starts us at next login.
@@ -1970,9 +2113,8 @@ exit 0"#,
         use super::*;
         use std::path::{Path, PathBuf};
 
-        /// macOS LaunchDaemon plist destination (system).
-        const SYSTEM_PLIST: &str = "/Library/LaunchDaemons/com.gitopolis.screentimed.plist";
-        /// IPC socket — used purely as a liveness probe.
+        /// IPC socket — used purely as a liveness probe in dev-tree
+        /// mode (where SMAppService can't speak for the daemon's state).
         const SOCKET_PATH: &str = "/var/run/screentimed.sock";
 
         /// Returns true iff the daemon is currently accepting connections.
@@ -1982,63 +2124,82 @@ exit 0"#,
             std::os::unix::net::UnixStream::connect(SOCKET_PATH).is_ok()
         }
 
-        /// Returns true iff the system-side LaunchDaemon plist already
-        /// exists. If yes, the daemon is "installed" and any "not
-        /// reachable" condition is treated as transient — the subscribe
-        /// loop will retry silently.
-        pub fn system_plist_present() -> bool {
-            Path::new(SYSTEM_PLIST).exists()
-        }
-
-        /// Show a Set-up dialog. If the user proceeds, run the
-        /// privileged install via `admin::run_with_progress`. Returns
-        /// `true` on success, `false` on cancel / failure (alerts the
-        /// user before returning false).
+        /// Show a Set-up dialog. On confirm, register the daemon via
+        /// SMAppService. Returns `true` on success or when the user
+        /// declines (the tray quits in both cases via the call-site
+        /// branching). `false` from the failure branch is reserved for
+        /// the unrecoverable "couldn't initiate registration" case so
+        /// the tray exits with a logged error.
         pub fn run_first_launch_install(mtm: MainThreadMarker) -> bool {
             if !alerts::confirm(
                 mtm,
                 "Set up Konstantin",
-                "Konstantin needs to install its background service. \
-                 You'll be prompted for your administrator password.",
-                "Set Up…",
+                "Konstantin needs to enable its background service.\n\n\
+                 macOS will ask you to allow Konstantin in System \
+                 Settings → Login Items & Extensions.",
+                "Continue",
                 "Quit",
             ) {
                 return false;
             }
-            let paths = match bundle::Paths::resolve() {
-                Ok(p) => p,
-                Err(e) => {
-                    tracing::error!(error = %e, "could not resolve bundle paths");
+
+            match sm::register_daemon() {
+                Ok(()) => {
+                    tracing::info!("SMAppService: daemon registered");
+                    // After a successful register the status flips to
+                    // either Enabled (auto-approved on first install
+                    // for some bundle/keychain combinations) or to
+                    // RequiresApproval. We re-check and surface the
+                    // approval alert in the latter case.
+                    match sm::daemon_status() {
+                        sm::Status::Enabled => true,
+                        sm::Status::RequiresApproval => {
+                            show_requires_approval_alert(mtm);
+                            false
+                        }
+                        other => {
+                            tracing::warn!(
+                                status = ?other,
+                                "register succeeded but status is unexpected"
+                            );
+                            true
+                        }
+                    }
+                }
+                Err(sm::Error::NotApproved) => {
+                    show_requires_approval_alert(mtm);
+                    false
+                }
+                Err(sm::Error::Failed(msg)) => {
+                    tracing::error!(error = %msg, "SMAppService.register failed");
                     alerts::message(
                         mtm,
-                        "Could not locate bundled resources.",
-                        &format!("{e}"),
+                        "Couldn't enable Konstantin's background service.",
+                        &format!("{msg}\n\nThis usually means the app \
+                                  isn't signed and notarized correctly. \
+                                  Try reinstalling Konstantin."),
                     );
-                    return false;
+                    false
                 }
-            };
-            let script = build_install_script(&paths);
+            }
+        }
 
-            match admin::run_with_progress(
+        /// Surface the "we need your toggle in System Settings" UX. Two
+        /// buttons: **Open Settings** deep-links to the Login Items
+        /// pane via SMAppService; **Quit** drops the user back so they
+        /// can come back to it later. The tray exits in both cases —
+        /// the daemon is not running yet.
+        pub fn show_requires_approval_alert(mtm: MainThreadMarker) {
+            if alerts::confirm(
                 mtm,
-                "Setting Up Konstantin",
-                "Installing Konstantin's background service.\n\
-                 You may be prompted for your administrator password.",
-                &script,
+                "Konstantin needs background-task permission",
+                "Open System Settings → Login Items & Extensions and \
+                 turn Konstantin on. The tray will reconnect \
+                 automatically once the daemon starts.",
+                "Open Settings",
+                "Quit",
             ) {
-                Ok(()) => {
-                    tracing::info!("first-launch install complete");
-                    true
-                }
-                Err(admin::Error::Cancelled) => {
-                    tracing::info!("user cancelled the password prompt");
-                    false
-                }
-                Err(admin::Error::Failed(msg)) => {
-                    tracing::error!(error = %msg, "install command failed");
-                    alerts::message(mtm, "Konstantin install failed.", &msg);
-                    false
-                }
+                sm::open_login_items_settings();
             }
         }
 
@@ -2064,49 +2225,6 @@ exit 0"#,
             std::fs::write(&dst, want)?;
             tracing::info!(path = %dst.display(), "wrote user LaunchAgent plist");
             Ok(())
-        }
-
-        fn build_install_script(p: &bundle::Paths) -> String {
-            // Single bash command via `&&` chains. `install -d` creates
-            // missing dirs idempotently. Re-running is safe — `cp`
-            // overwrites the daemon binary (handles upgrades), and the
-            // config copy is guarded by a `[ -f ... ] ||` so an existing
-            // `/etc/screentimed/config.toml` is never trampled.
-            //
-            // `launchctl bootstrap` is ORed with `true` because it fails
-            // if the service is already loaded — kickstart -k afterwards
-            // forces a restart either way.
-            //
-            // When installed from a real `.app` bundle, also drop the
-            // bundle's absolute path into `/etc/screentimed/bundle_path`
-            // so the daemon's bundle-watcher can self-uninstall if the
-            // operator drag-to-Trashes the app. In dev-tree mode
-            // (`bundle_root = None`) the marker is removed so the
-            // watcher stays disabled.
-            let mut s = format!(
-                "install -d -m 0755 /usr/local/libexec && \
-                 install -d -m 0755 /etc/screentimed && \
-                 install -d -m 0700 /var/db/screentimed && \
-                 install -m 0755 '{daemon}' /usr/local/libexec/screentimed && \
-                 install -m 0644 '{plist}' /Library/LaunchDaemons/com.gitopolis.screentimed.plist && \
-                 ([ -f /etc/screentimed/config.toml ] || install -m 0600 '{config}' /etc/screentimed/config.toml)",
-                daemon = p.daemon_binary.display(),
-                plist = p.daemon_plist.display(),
-                config = p.config_example.display(),
-            );
-            match &p.bundle_root {
-                Some(root) => s.push_str(&format!(
-                    " && printf '%s\\n' {root_q} > /etc/screentimed/bundle_path",
-                    root_q = super::config_ui::shell_quote(root),
-                )),
-                None => s.push_str(" && rm -f /etc/screentimed/bundle_path"),
-            }
-            s.push_str(
-                " && (launchctl bootstrap system /Library/LaunchDaemons/com.gitopolis.screentimed.plist || true) && \
-                 launchctl enable system/com.gitopolis.screentimed && \
-                 launchctl kickstart -k system/com.gitopolis.screentimed",
-            );
-            s
         }
 
         pub(super) fn build_user_launchagent_plist(tray_exe: &Path) -> String {
@@ -2307,51 +2425,28 @@ exit 0"#,
                 return;
             }
 
-            // /etc/screentimed/config.toml is 0600 root-owned, so the
-            // unprivileged tray can't read it directly. Single admin
-            // elevation: copy the file out (chowned to the operator)
-            // and, in the same script, dump a manifest of which users
-            // currently have a tray LaunchAgent plist on disk —
-            // hardened macOS denies an unprivileged tray `stat` access
-            // to other users' homes, but root can see them all.
+            // /etc/screentimed/config.toml is 0600 root-owned. The
+            // daemon (running as root) reads it for us via IPC; no
+            // admin password sheet needed. Same call returns the
+            // per-user tray-autostart plist presence manifest, which
+            // a non-root tray can't stat across hardened user homes
+            // on its own.
             let operator = current_username();
-            let staged_config = tmp_path("konstantin-config-staging", "toml");
-            let staged_manifest = tmp_path("konstantin-autostart-staging", "txt");
-            let script =
-                build_open_admin_script(&operator, &users_list, &staged_config, &staged_manifest);
 
-            match super::admin::run_with_progress(
-                mtm,
-                "Open Configuration",
-                "Reading /etc/screentimed/config.toml…",
-                &script,
-            ) {
-                Ok(()) => {}
-                Err(super::admin::Error::Cancelled) => {
-                    let _ = std::fs::remove_file(&staged_config);
-                    let _ = std::fs::remove_file(&staged_manifest);
-                    return;
-                }
-                Err(super::admin::Error::Failed(msg)) => {
-                    super::alerts::message(mtm, "Couldn't read configuration.", &msg);
-                    let _ = std::fs::remove_file(&staged_config);
-                    let _ = std::fs::remove_file(&staged_manifest);
-                    return;
-                }
-            }
-
-            let config_text = match std::fs::read_to_string(&staged_config) {
-                Ok(t) => t,
+            let config_text = match konstantin_tray::read_config_sync() {
+                Ok(c) => c,
                 Err(e) => {
                     super::alerts::message(mtm, "Couldn't read configuration.", &e.to_string());
-                    let _ = std::fs::remove_file(&staged_config);
-                    let _ = std::fs::remove_file(&staged_manifest);
                     return;
                 }
             };
-            let manifest_text = std::fs::read_to_string(&staged_manifest).unwrap_or_default();
-            let _ = std::fs::remove_file(&staged_config);
-            let _ = std::fs::remove_file(&staged_manifest);
+            let manifest_entries = match konstantin_tray::read_autostart_manifest_sync() {
+                Ok(m) => m,
+                Err(e) => {
+                    super::alerts::message(mtm, "Couldn't read autostart state.", &e.to_string());
+                    return;
+                }
+            };
 
             let config_value: toml::Value = match toml::from_str(&config_text) {
                 Ok(v) => v,
@@ -2361,7 +2456,10 @@ exit 0"#,
                 }
             };
 
-            let manifest = parse_autostart_manifest(&manifest_text);
+            let manifest: std::collections::HashMap<String, bool> = manifest_entries
+                .into_iter()
+                .map(|e| (e.username, e.enabled))
+                .collect();
             let initial_thresholds = current_thresholds(&config_value);
             let user_initials =
                 collect_user_settings(&users_list, &config_value, &operator, &manifest);
@@ -2508,65 +2606,6 @@ exit 0"#,
                 .and_then(|o| String::from_utf8(o.stdout).ok())
                 .map(|s| s.trim().to_string())
                 .unwrap_or_default()
-        }
-
-        /// Parse the per-user autostart manifest dumped by the
-        /// open-flow admin script. Format: one `<username> 0|1` line
-        /// per user. Empty / malformed input yields an empty map.
-        fn parse_autostart_manifest(text: &str) -> std::collections::HashMap<String, bool> {
-            text.lines()
-                .filter_map(|line| {
-                    let mut it = line.splitn(2, ' ');
-                    let user = it.next()?.trim();
-                    let flag = it.next()?.trim();
-                    if user.is_empty() {
-                        return None;
-                    }
-                    Some((user.to_string(), flag == "1"))
-                })
-                .collect()
-        }
-
-        /// Build the open-flow admin script: copy the 0600 root-owned
-        /// config out to a user-owned temp, and dump a manifest of
-        /// per-user tray-LaunchAgent plist presence to a sibling temp.
-        /// One elevation, both side effects.
-        fn build_open_admin_script(
-            operator: &str,
-            users: &[LocalUser],
-            staged_config: &Path,
-            staged_manifest: &Path,
-        ) -> String {
-            let mut parts: Vec<String> = vec![format!(
-                "install -m 0600 -o {user} -g staff /etc/screentimed/config.toml {dst}",
-                user = shell_quote_arg(operator),
-                dst = shell_quote(staged_config),
-            )];
-
-            let mut probe = String::from("(");
-            for u in users {
-                let p = u.home.join("Library/LaunchAgents").join(TRAY_AGENT_FILENAME);
-                probe.push_str(&format!(
-                    "if test -f {path}; then echo {name} 1; else echo {name} 0; fi; ",
-                    path = shell_quote(&p),
-                    name = shell_quote_arg(&u.username),
-                ));
-            }
-            probe.push_str(") > ");
-            probe.push_str(&shell_quote(staged_manifest));
-            parts.push(probe);
-
-            parts.push(format!(
-                "chown {user}:staff {dst}",
-                user = shell_quote_arg(operator),
-                dst = shell_quote(staged_manifest),
-            ));
-            parts.push(format!(
-                "chmod 0600 {dst}",
-                dst = shell_quote(staged_manifest),
-            ));
-
-            parts.join(" && ")
         }
 
         // ─── Window construction ──────────────────────────────────────
@@ -2930,7 +2969,6 @@ exit 0"#,
         #[derive(Clone)]
         struct RowSnapshot {
             username: String,
-            uid: u32,
             home: PathBuf,
             limited: bool,
             minutes: u32,
@@ -2959,15 +2997,12 @@ exit 0"#,
                 }
             };
 
-            let config_temp = tmp_path("konstantin-config", "toml");
-            if let Err(e) = std::fs::write(&config_temp, &new_config_text) {
-                super::alerts::message(mtm, "Couldn't write temp config.", &e.to_string());
-                return;
-            }
-
-            // Apply self-changes unprivileged so the password prompt
-            // covers only things that genuinely need root.
-            let mut other_user_changes: Vec<(PathBuf, RowSnapshot, bool)> = Vec::new();
+            // Apply autostart changes first; the operator's own toggle
+            // stays user-side (no IPC, just `~/Library/LaunchAgents/`),
+            // every other user goes through the daemon's `WriteAutostart`
+            // (admin-gated). Doing autostart before WriteConfig matters
+            // because WriteConfig triggers a daemon respawn — we want
+            // those side effects to land while the daemon is up.
             for row in &snapshot.rows {
                 if row.autostart_target == row.autostart_initial {
                     continue;
@@ -2982,48 +3017,30 @@ exit 0"#,
                     }
                     continue;
                 }
-                if row.autostart_target {
-                    let plist_temp =
-                        tmp_path(&format!("konstantin-agent-{}", row.username), "plist");
-                    let plist_body =
-                        super::install::build_user_launchagent_plist(&tray_exe());
-                    if let Err(e) = std::fs::write(&plist_temp, plist_body) {
-                        super::alerts::message(
-                            mtm,
-                            "Couldn't write temp plist.",
-                            &e.to_string(),
-                        );
-                        let _ = std::fs::remove_file(&config_temp);
-                        return;
-                    }
-                    other_user_changes.push((plist_temp, row.clone(), true));
-                } else {
-                    other_user_changes.push((PathBuf::new(), row.clone(), false));
+                let req = konstantin_proto::Request::WriteAutostart {
+                    username: row.username.clone(),
+                    enable: row.autostart_target,
+                };
+                if let Err(e) = konstantin_tray::one_shot_sync(req) {
+                    super::alerts::message(
+                        mtm,
+                        "Couldn't update autostart",
+                        &format!("{}: {e}", row.username),
+                    );
+                    return;
                 }
             }
 
-            let script = build_admin_script(&config_temp, &other_user_changes);
-
-            let outcome = super::admin::run_with_progress(
-                mtm,
-                "Saving Settings",
-                "Saving and reloading Konstantin…",
-                &script,
-            );
-
-            // Cleanup all temp files regardless of outcome.
-            let _ = std::fs::remove_file(&config_temp);
-            for (path, _, _) in &other_user_changes {
-                if !path.as_os_str().is_empty() {
-                    let _ = std::fs::remove_file(path);
-                }
-            }
-
-            match outcome {
-                Ok(()) => close_and_clear(),
-                Err(super::admin::Error::Cancelled) => {}
-                Err(super::admin::Error::Failed(msg)) => {
-                    super::alerts::message(mtm, "Couldn't save settings.", &msg);
+            // Commit the new config last. The daemon validates, atomic-
+            // writes, ACKs, then exits to apply (KeepAlive / SMAppService
+            // brings it back up immediately).
+            let req = konstantin_proto::Request::WriteConfig {
+                contents: new_config_text,
+            };
+            match konstantin_tray::one_shot_sync(req) {
+                Ok(_) => close_and_clear(),
+                Err(e) => {
+                    super::alerts::message(mtm, "Couldn't save settings.", &e.to_string());
                 }
             }
         }
@@ -3049,7 +3066,6 @@ exit 0"#,
                             .unwrap_or(0);
                         RowSnapshot {
                             username: r.user.username.clone(),
-                            uid: r.user.uid,
                             home: r.user.home.clone(),
                             limited,
                             minutes,
@@ -3133,49 +3149,6 @@ exit 0"#,
             toml::to_string_pretty(&value).map_err(|e| format!("serializing TOML: {e}"))
         }
 
-        fn build_admin_script(
-            config_temp: &Path,
-            other_user_changes: &[(PathBuf, RowSnapshot, bool)],
-        ) -> String {
-            let mut parts: Vec<String> = Vec::new();
-            parts.push(format!(
-                "install -m 0600 {src} /etc/screentimed/config.toml",
-                src = shell_quote(config_temp),
-            ));
-            for (plist_temp, row, enable) in other_user_changes {
-                let dest_dir = row.home.join("Library/LaunchAgents");
-                let dest_plist = dest_dir.join(TRAY_AGENT_FILENAME);
-                if *enable {
-                    parts.push(format!(
-                        "install -d -o {user} -g staff -m 0755 {dir}",
-                        user = shell_quote_arg(&row.username),
-                        dir = shell_quote(&dest_dir),
-                    ));
-                    parts.push(format!(
-                        "install -m 0644 -o {user} -g staff {src} {dst}",
-                        user = shell_quote_arg(&row.username),
-                        src = shell_quote(plist_temp),
-                        dst = shell_quote(&dest_plist),
-                    ));
-                    parts.push(format!(
-                        "(launchctl print gui/{uid} >/dev/null 2>&1 && \
-                          launchctl bootstrap gui/{uid} {dst} || true)",
-                        uid = row.uid,
-                        dst = shell_quote(&dest_plist),
-                    ));
-                } else {
-                    parts.push(format!(
-                        "(rm -f {dst}; launchctl bootout gui/{uid}/{label} 2>/dev/null || true)",
-                        dst = shell_quote(&dest_plist),
-                        uid = row.uid,
-                        label = TRAY_AGENT_LABEL,
-                    ));
-                }
-            }
-            parts.push("launchctl kickstart -k system/com.gitopolis.screentimed".to_string());
-            parts.join(" && ")
-        }
-
         fn enable_autostart_self(home: &Path) -> std::io::Result<()> {
             let agents = home.join("Library/LaunchAgents");
             std::fs::create_dir_all(&agents)?;
@@ -3204,11 +3177,6 @@ exit 0"#,
         fn tray_exe() -> PathBuf {
             std::env::current_exe()
                 .unwrap_or_else(|_| PathBuf::from("/usr/local/bin/konstantin-tray"))
-        }
-
-        fn tmp_path(stem: &str, ext: &str) -> PathBuf {
-            let dir = std::env::var("TMPDIR").unwrap_or_else(|_| "/tmp/".to_string());
-            PathBuf::from(format!("{dir}{stem}-{}.{ext}", std::process::id()))
         }
 
         pub(super) fn shell_quote(p: &Path) -> String {
@@ -3267,7 +3235,6 @@ daily_limit_minutes = 30
                     thresholds: vec![15, 5, 1],
                     rows: vec![RowSnapshot {
                         username: "bob".to_string(),
-                        uid: 502,
                         home: PathBuf::from("/Users/bob"),
                         limited: true,
                         minutes: 90,
@@ -3303,7 +3270,6 @@ daily_limit_minutes = 30
                     thresholds: vec![],
                     rows: vec![RowSnapshot {
                         username: "alice".into(),
-                        uid: 501,
                         home: PathBuf::from("/Users/alice"),
                         limited: true,
                         minutes: 0,

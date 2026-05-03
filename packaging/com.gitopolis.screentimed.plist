@@ -6,10 +6,11 @@
     <key>Label</key>
     <string>com.gitopolis.screentimed</string>
 
-    <key>ProgramArguments</key>
-    <array>
-        <string>/usr/local/libexec/screentimed</string>
-    </array>
+    <!-- SMAppService-aware key: a path relative to the registering app
+         bundle. Lets the user move Konstantin.app from /Applications
+         to ~/Applications without breaking the daemon launch. -->
+    <key>BundleProgram</key>
+    <string>Contents/Resources/screentimed</string>
 
     <key>EnvironmentVariables</key>
     <dict>

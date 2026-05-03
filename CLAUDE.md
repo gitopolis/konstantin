@@ -62,9 +62,10 @@ Konstantin.app/Contents/
   Info.plist                                — LSUIElement=true (no Dock icon)
   MacOS/konstantin-tray                     — main bundle executable
   Library/LaunchDaemons/com.gitopolis.screentimed.plist
+                                            (BundleProgram → Contents/Resources/screentimed)
   Resources/
-    screentimed                             — daemon binary (copied to
-                                              /usr/local/libexec/ at install)
+    screentimed                             — daemon binary; runs in place
+                                              from the bundle at this path
     konstantin-status                       — diagnostic CLI
     config.example.toml
     AppIcon.icns
@@ -72,21 +73,26 @@ Konstantin.app/Contents/
 
 First-launch flow:
 
-1. Tray attempts `UnixStream::connect("/var/run/screentimed.sock")`.
-   If it succeeds, the daemon is already running — proceed with normal
-   subscribe.
-2. If the connect fails AND `/Library/LaunchDaemons/com.gitopolis.screentimed.plist`
-   is missing, the tray puts up a "Set up Konstantin" alert that runs
-   the install steps (copy daemon binary into `/usr/local/libexec/`,
-   plist into `/Library/LaunchDaemons/`, `launchctl bootstrap`).
+1. Tray resolves `bundle::Paths`. Outside a bundle (dev tree),
+   SMAppService is skipped — operator runs `packaging/install.sh`.
+2. `sm::daemon_status()` is queried. `Enabled` → daemon is registered
+   and launchd will load it; we just subscribe. `NotRegistered` →
+   show a "Set up Konstantin" alert and call `sm::register_daemon()`
+   (`SMAppService.register`). `RequiresApproval` → deep-link to
+   System Settings → Login Items via
+   `SMAppService.openSystemSettingsLoginItems`.
 3. The per-user LaunchAgent is dropped into `~/Library/LaunchAgents/`
    (no auth needed for that one).
 
-Privileged menu actions (Start / Stop / Restart / Configure /
-Uninstall) all funnel through one `run_as_root` helper that wraps
-`osascript -e 'do shell script "..." with administrator privileges'`.
-macOS shows the standard password sheet; the command then runs as
-root. Each invocation is one-shot — no persistent privilege handle.
+Privileged menu actions (Start / Stop / Restart) call SMAppService
+directly: register / unregister / unregister+register. Configure
+edits the daemon's config via `Request::WriteConfig` IPC; Uninstall
+goes through `Request::SelfUninstall` + `sm::unregister_daemon()`.
+None of these prompt for an admin password — the user's one-time
+SMAppService approval covers them all. The in-app updater is the
+sole remaining `osascript … with administrator privileges` call site
+(deferred rework — its bundle-swap path needs careful re-design to
+keep its rollback semantics).
 
 Daemon-running detection: try to connect to the socket. Cheap, no
 privileges, no `launchctl print` parsing. The worker thread's existing
@@ -157,17 +163,31 @@ These were Nikita's choices; revisit explicitly before changing them.
    Bare `cargo run` (no NSBundle context) still no-ops with a
    tracing warning instead of crashing.
 
-7. **`.app` bundle is the canonical install path.** The bundle ships
-   the daemon binary at `Contents/Resources/screentimed`. On
-   "Set up Konstantin", the binary is **copied** (not symlinked) into
-   `/usr/local/libexec/`. Re-running setup re-copies, fixing version
-   skew when the user upgrades the bundle.
+7. **`.app` bundle is the canonical install path.** The daemon's
+   LaunchDaemon plist uses `BundleProgram` so launchd resolves the
+   daemon binary inside the running app's bundle (no copy into
+   `/usr/local/libexec/`, no system-side files). `SMAppService.
+   register` records the registration; `unregister` retires it.
+   Drag-the-bundle relocations follow because `BundleProgram` is
+   bundle-relative, and the daemon's own `bundle_watcher` self-
+   uninstalls when the bundle disappears.
 
-8. **Privilege model: `osascript` admin auth.** All privileged actions
-   funnel through one `run_as_root` helper; no persistent privilege
-   handle, no `SMJobBless` helper, no `SMAppService`. SMAppService is
-   the right Mac path long-term but requires Developer ID signing,
-   which we don't have yet.
+8. **Privilege model: SMAppService + IPC, with one carve-out.**
+   Privileged actions split two ways:
+   * Daemon lifecycle (install / start / stop / restart / uninstall)
+     goes through `SMAppService` (`mod sm`). The user's one-time
+     System Settings → Login Items approval covers all subsequent
+     calls; no password sheet.
+   * Privileged daemon-side ops (config read/write, per-user
+     autostart manage, self-uninstall) ride the existing IPC socket.
+     The daemon authenticates the peer via `getpeereid` and gates
+     the admin-only requests on macOS `admin`-group membership
+     (`peer_is_admin`). Reads (`ReadConfig`,
+     `ReadAutostartManifest`) are open to all peers.
+   * The sole remaining `osascript … with administrator privileges`
+     call site is the in-app updater (`update::run_install_flow`).
+     Its rollback-safe bundle-swap pattern is hard to reproduce
+     under SMAppService cleanly, so the rework is deferred.
 
 9. **Menu actions are system-wide** (like Docker Desktop). Start / Stop
    / Restart affect the one shared daemon; Configure edits
@@ -245,18 +265,22 @@ These were Nikita's choices; revisit explicitly before changing them.
   `LimitReached` (user is being kicked, not warned).
 * **A1** — `packaging/build-app.sh` produces `target/Konstantin.app/`
   from release binaries. `LSUIElement=true`, ad-hoc codesigned.
-* **A2** — first-launch install: socket-probe → optional NSAlert →
-  privileged install via `osascript` on a background thread, with
-  the main thread pumping the run loop and showing a progress panel
-  so the cursor stays normal.
+* **A2** — first-launch install: bundle source → SMAppService status
+  probe → "Set up Konstantin" NSAlert → `sm::register_daemon()`. On
+  `RequiresApproval` we deep-link the user to System Settings →
+  Login Items via `SMAppService.openSystemSettingsLoginItems`. (The
+  original A2 design ran a privileged `osascript` install; that was
+  replaced under A10 — see below.)
 * **A3** — `admin::run_with_progress` primitive lifted out;
   reusable shape `Result<(), admin::Error::{Cancelled, Failed}>`.
   `alerts::confirm` / `alerts::message` siblings.
 * **A4** — `actions::Controller` (NSObject subclass via
   `define_class!`) routes `startDaemon: / stopDaemon: / restartDaemon:
   / configure: / openLog: / uninstall:` selectors. Lifecycle commands
-  use `|| true`-tolerant launchctl chains so already-loaded /
-  already-stopped states are idempotent.
+  call SMAppService (register / unregister / unregister+register)
+  via `mod sm`; idempotent already-registered / not-found error
+  codes are filtered in `is_idempotent_noise` so the user only sees
+  alerts for genuinely unexpected failures. **Silent — no password.**
 * **A5** — state-driven UI: muted `clock` SF Symbol when
   `disconnected` (gray baked into the image via an
   `NSImageSymbolConfiguration` with `secondaryLabelColor`), the same
@@ -276,28 +300,23 @@ These were Nikita's choices; revisit explicitly before changing them.
   for non-interactive `brew uninstall --zap`; the release workflow
   auto-bumps version + sha256 there on each tag.
 * **A8** — security/UX hardening on top of A1–A7:
-  * `/etc/screentimed/config.toml` is now mode 0600 root-owned at
-    every write site (`packaging/install.sh`, the tray's first-launch
-    `install::build_install_script`, and the Save flow's
-    `config_ui::build_admin_script`). Other users on the machine
-    can't see whose limits are configured.
-  * `Configure…` therefore prompts for an admin password to *open*
-    the window: a single `admin::run_with_progress` invocation
-    (`config_ui::build_open_admin_script`) copies the config out to
-    a user-owned temp *and* dumps a manifest of per-user
-    LaunchAgent-plist presence (`<username> 0|1` lines) in the same
-    elevation. Drops the old operator-owned `UiCache` (the
-    `~/Library/Application Support/com.gitopolis.konstantin/ui-state.json`
-    file) — root can stat hardened homes directly, no cache needed.
-  * `Uninstall…` and `packaging/uninstall.sh` now `rm -rf
-    /var/db/screentimed/` (counter state). `/etc/screentimed/`
-    (config) is still preserved on uninstall; `--zap` still removes
-    both. Cask `uninstall` stanza updated to match.
-  * Post-password window-show uses
+  * `/etc/screentimed/config.toml` is mode 0600 root-owned at every
+    write site. Originally enforced via the privileged install /
+    Configure-save scripts; under A10 it's enforced by the daemon's
+    `WriteConfig` IPC handler (atomic-write at 0600).
+  * `Configure…` no longer prompts for admin auth on either open or
+    save — see A10. (The original A8 implementation copied the
+    config out to a user-owned temp under one `osascript` elevation;
+    that flow was retired wholesale by the IPC migration.)
+  * `Uninstall…` removes `/var/db/screentimed/` (counter state) via
+    the daemon's `SelfUninstall` IPC. `/etc/screentimed/` (config)
+    is still preserved on uninstall; `--zap` still removes both.
+    Cask `uninstall` stanza updated to match.
+  * Post-prompt window-show uses
     `activateIgnoringOtherApps(true)` + `orderFrontRegardless()` so
-    the Configure window actually steals focus from the previously
-    frontmost app. `NSApplication::activate()` is cooperative on
-    macOS 14+ and isn't sufficient for accessory apps.
+    the Configure window steals focus from the previously frontmost
+    app. `NSApplication::activate()` is cooperative on macOS 14+
+    and isn't sufficient for accessory apps.
 * **A9** — in-app updater (`mod update` + `Check for Updates…` menu
   item). Driven by `env!("CARGO_PKG_VERSION")` (CI runs `cargo
   set-version --workspace "$VERSION"` before each release build, so
@@ -311,6 +330,36 @@ These were Nikita's choices; revisit explicitly before changing them.
   comparison). Asset SHA-256 is read straight from the GitHub API's
   per-asset `digest` field — no sidecar files in the release. See
   decision #11 for the full design.
+* **A10** — SMAppService migration + IPC expansion. See decision
+  #8 for the privilege model. Concretely:
+  * `mod sm` wraps `objc2-service-management`'s
+    `SMAppService.daemonServiceWithPlistName` /
+    `register` / `unregister` / `status` /
+    `openSystemSettingsLoginItems`.
+  * `mod install`'s privileged install script is gone —
+    `run_first_launch_install` calls `sm::register_daemon()` and
+    routes `RequiresApproval` to a deep-link alert.
+  * `actions::Controller`'s Start / Stop / Restart selectors call
+    SMAppService; `run_admin` is replaced by the silent-by-default
+    `sm_action` helper.
+  * Proto gains `ReadConfig` / `WriteConfig{contents}` /
+    `ReadAutostartManifest` / `WriteAutostart{username, enable}` /
+    `SelfUninstall` requests, plus `Config{contents}` and
+    `AutostartManifest{entries}` responses. The daemon-side
+    handlers gate the writes on `peer_is_admin` (macOS `admin`
+    group, gid 80) using a `getgrnam`-walk of `gr_mem`.
+  * `WriteConfig` validates via `Config::parse`, atomic-writes to
+    `/etc/screentimed/config.toml`, ACKs, then exits — KeepAlive
+    (or SMAppService) respawns the daemon with the new config.
+  * `config_ui::open` / `save_flow` use the new IPC reads and
+    writes; the old `osascript` open and save scripts are deleted.
+  * `uninstall_flow` becomes IPC + `sm::unregister_daemon()` + own-
+    plist removal. The daemon's `self_uninstall` was extended to
+    also `rm -rf /var/db/screentimed/` and `bootout gui/<uid>` per-
+    user trays.
+  * Bundle plist switched from `ProgramArguments` →
+    `BundleProgram = Contents/Resources/screentimed`, so the daemon
+    runs in place from the bundle (no `/usr/local/libexec/`).
 
 Tests, unsafe-block count: both will drift. The CI signal is
 `cargo test --workspace` clean. Don't pin counts here — they
@@ -321,12 +370,20 @@ incentivize the wrong thing.
 The roadmap is **complete**. Phase 8 (lock/idle) was dropped — see
 decision #3.
 
-Open items that aren't on the roadmap but are worth doing before any
-wider distribution:
-* **Developer ID + notarization** so the `.app` bundle can ship signed,
-  and so we can move to `SMAppService` and `UNUserNotificationCenter`.
+Open items that aren't on the roadmap but are worth doing:
+* **Updater rework.** The in-app updater is the last `osascript`
+  admin-password site; replace its bundle-swap script with a flow
+  built around `sm::unregister_daemon` + bundle-replace +
+  `sm::register_daemon`. Needs a careful rollback story.
 * **Real `AppIcon.iconset/`** in `packaging/`. Currently the bundle
   ships with macOS's generic application icon.
+* **Trim `/etc/screentimed/bundle_path`.** With SMAppService running
+  the daemon in-bundle, the daemon could derive its bundle path
+  from `current_exe()` and the marker becomes redundant.
+* **Dev-tree `packaging/install.sh` parity.** The shell scripts
+  still install a hand-rolled plist with `ProgramArguments`, which
+  no longer matches the bundle plist's `BundleProgram` shape; the
+  dev workflow effectively requires building the bundle now.
 
 The Homebrew tap is live at `github.com/gitopolis/homebrew-konstantin`
 (cask at `Casks/konstantin.rb`); the release workflow zips, uploads,
@@ -427,14 +484,17 @@ konstantin/
 
 ## macOS Tahoe gotchas
 
-* **Code signing.** Distribution via Homebrew cask without Developer
-  ID is acceptable — cask handles `com.apple.quarantine` removal.
-  SMAppService and `UNUserNotificationCenter` both require Developer
-  ID; they're deferred until signing is in place.
-* **Modern install path.** For real distribution prefer
-  `SMAppService.daemon(plistName:)` over hand-placed
-  `/Library/LaunchDaemons/` files. We use the hand-placed approach
-  via `run_as_root` because it works without code signing.
+* **Code signing.** Distribution requires Developer ID; SMAppService
+  and `UNUserNotificationCenter` both refuse to operate without it.
+  The release workflow signs the bundle, hardens the runtime, and
+  notarizes + staples — see `.github/workflows/release.yml`.
+* **Modern install path.** `SMAppService.daemonServiceWithPlistName`
+  installs the daemon registration. The plist must live at
+  `Contents/Library/LaunchDaemons/<plist-name>` inside the bundle
+  and use the `BundleProgram` key (bundle-relative). Calling
+  `register` from a non-bundle context (bare `cargo run`) returns
+  an error; first-launch flow gates SMAppService on
+  `bundle::Source::Bundle`.
 * **Fast user switching.** `SCDynamicStoreCopyConsoleUser` reports
   only the foreground user, so backgrounded FUS users have their
   counters paused while another account is at the keyboard. State

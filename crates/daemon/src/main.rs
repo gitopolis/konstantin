@@ -81,9 +81,14 @@ async fn main() -> Result<()> {
     // ones per connection.
     let (tick_tx, _) = broadcast::channel::<()>(TICK_BROADCAST_CAPACITY);
 
-    let server = ipc::Server::bind(cfg.clone(), state.clone(), tick_tx.clone())
-        .await
-        .context("binding IPC socket")?;
+    let server = ipc::Server::bind(
+        cfg.clone(),
+        config_path.clone(),
+        state.clone(),
+        tick_tx.clone(),
+    )
+    .await
+    .context("binding IPC socket")?;
 
     let ticker_state = state.clone();
     let ticker_cfg = cfg.clone();
