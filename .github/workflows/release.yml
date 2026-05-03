@@ -54,8 +54,66 @@ jobs:
             cp "target/${{ matrix.target }}/release/$bin" "target/release/$bin"
           done
 
+      # Set up an ephemeral keychain holding the Developer ID identity
+      # so `codesign` (invoked by build-app.sh) can find it. The keychain
+      # is local to $RUNNER_TEMP and gets discarded with the runner —
+      # nothing leaks across jobs. We also pull Apple's G2 intermediate
+      # because the .p12 export sometimes ships only the leaf.
+      - name: Import Developer ID certificate
+        env:
+          CERT_P12_BASE64: ${{ secrets.MAC_CERT_P12_BASE64 }}
+          CERT_P12_PASSWORD: ${{ secrets.MAC_CERT_P12_PASSWORD }}
+        run: |
+          set -euo pipefail
+          KEYCHAIN="$RUNNER_TEMP/build.keychain-db"
+          KEYCHAIN_PASSWORD=$(uuidgen)
+          echo "$CERT_P12_BASE64" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          curl -fsSL -o "$RUNNER_TEMP/DeveloperIDG2CA.cer" \
+            https://www.apple.com/certificateauthority/DeveloperIDG2CA.cer
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security import "$RUNNER_TEMP/DeveloperIDG2CA.cer" -k "$KEYCHAIN" \
+            -T /usr/bin/codesign
+          security import "$RUNNER_TEMP/cert.p12" -k "$KEYCHAIN" \
+            -P "$CERT_P12_PASSWORD" \
+            -T /usr/bin/codesign
+          security set-key-partition-list \
+            -S apple-tool:,apple:,codesign: \
+            -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          # Make our keychain the default search path so codesign finds
+          # the identity by name. Preserve existing entries so other
+          # tools keep working.
+          security list-keychains -d user -s "$KEYCHAIN" \
+            $(security list-keychains -d user | sed -e 's/^[[:space:]]*//' -e 's/"//g')
+          rm "$RUNNER_TEMP/cert.p12"
+
       - name: Build .app bundle
+        env:
+          CODESIGN_IDENTITY: ${{ secrets.CODESIGN_IDENTITY }}
         run: bash packaging/build-app.sh
+
+      # Notarize and staple before zipping for distribution. The notary
+      # service blocks for ~30 s – a few minutes; --wait keeps the step
+      # honest. Stapling embeds the ticket so first-launch on a fresh
+      # Mac doesn't need internet.
+      - name: Notarize and staple
+        env:
+          NOTARY_KEY_BASE64: ${{ secrets.MAC_NOTARY_API_KEY_BASE64 }}
+          NOTARY_KEY_ID: ${{ secrets.MAC_NOTARY_API_KEY_ID }}
+          NOTARY_ISSUER: ${{ secrets.MAC_NOTARY_API_ISSUER }}
+        run: |
+          set -euo pipefail
+          echo "$NOTARY_KEY_BASE64" | base64 --decode > "$RUNNER_TEMP/notary.p8"
+          ditto -c -k --keepParent target/Konstantin.app "$RUNNER_TEMP/notarize.zip"
+          xcrun notarytool submit "$RUNNER_TEMP/notarize.zip" \
+            --key "$RUNNER_TEMP/notary.p8" \
+            --key-id "$NOTARY_KEY_ID" \
+            --issuer "$NOTARY_ISSUER" \
+            --wait
+          xcrun stapler staple target/Konstantin.app
+          xcrun stapler validate target/Konstantin.app
+          rm "$RUNNER_TEMP/notary.p8" "$RUNNER_TEMP/notarize.zip"
 
       - name: Zip bundle
         run: |
