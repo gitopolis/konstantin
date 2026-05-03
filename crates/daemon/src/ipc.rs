@@ -323,6 +323,7 @@ fn handle_write_autostart(username: &str, enable: bool) -> Response {
     let user = match User::from_name(username) {
         Ok(Some(u)) => u,
         _ => {
+            warn!(%username, "unknown user");
             return Response::Error {
                 message: format!("unknown user '{username}'"),
             };
@@ -330,55 +331,107 @@ fn handle_write_autostart(username: &str, enable: bool) -> Response {
     };
     let plist_dir = user.dir.join("Library/LaunchAgents");
     let plist = plist_dir.join("com.gitopolis.konstantin-tray.plist");
+    info!(%username, uid = user.uid.as_raw(), enable, plist = %plist.display(), "WriteAutostart");
+
     if !enable {
-        // Bootout best-effort, then remove the plist file.
-        let _ = std::process::Command::new("/bin/launchctl")
+        let bootout = std::process::Command::new("/bin/launchctl")
             .args([
                 "bootout",
                 &format!("gui/{}/com.gitopolis.konstantin-tray", user.uid),
             ])
-            .status();
+            .output();
+        log_launchctl("bootout", &bootout);
         match std::fs::remove_file(&plist) {
-            Ok(()) | Err(_) => {}
+            Ok(()) => info!(plist = %plist.display(), "removed autostart plist"),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => warn!(plist = %plist.display(), error = %e, "remove failed"),
         }
         return Response::Ack;
     }
+
+    // mkdir -p Library/LaunchAgents/. Make sure the parent chain
+    // ends up owned by the target user — we may have just created
+    // `Library/` itself if alice has never opened anything that
+    // populates it, and a root-owned subdirectory of alice's home
+    // confuses launchd at login.
     if let Err(e) = std::fs::create_dir_all(&plist_dir) {
+        warn!(dir = %plist_dir.display(), error = %e, "mkdir failed");
         return Response::Error {
             message: format!("creating {}: {e}", plist_dir.display()),
         };
     }
+    chown_path(&plist_dir, user.uid.as_raw(), user.gid.as_raw());
+    if let Some(parent) = plist_dir.parent() {
+        // `Library/` itself; no-op if alice already owned it.
+        chown_path(parent, user.uid.as_raw(), user.gid.as_raw());
+    }
+
     let exe = autostart_tray_exe();
+    info!(exe = %exe.display(), "autostart plist will reference");
     let body = build_user_launchagent_plist(&exe);
     if let Err(e) = std::fs::write(&plist, body) {
+        warn!(plist = %plist.display(), error = %e, "write failed");
         return Response::Error {
             message: format!("writing {}: {e}", plist.display()),
         };
     }
-    // chown to the target user so they can read/edit it themselves.
-    use std::os::unix::ffi::OsStrExt;
-    let path_c = match CString::new(plist.as_os_str().as_bytes()) {
-        Ok(s) => s,
-        Err(_) => {
-            return Response::Error {
-                message: "plist path contained NUL".into(),
-            };
-        }
-    };
-    // SAFETY: chown of an existing path; uid/gid are valid u32s.
-    unsafe {
-        libc::chown(path_c.as_ptr(), user.uid.as_raw(), user.gid.as_raw());
-    }
-    // Best-effort GUI-domain bootstrap. Ignored if the user isn't
-    // logged in; a future login picks the plist up automatically.
-    let _ = std::process::Command::new("/bin/launchctl")
+    chown_path(&plist, user.uid.as_raw(), user.gid.as_raw());
+
+    // GUI-domain bootstrap. Only succeeds if the target user is
+    // currently logged in — for a freshly-created alice who hasn't
+    // logged in yet this fails with launchctl error 125 ("Domain does
+    // not support specified action"). That's fine: the plist is on
+    // disk, and alice's launchd loads it on her first Aqua login.
+    let bootstrap = std::process::Command::new("/bin/launchctl")
         .args([
             "bootstrap",
             &format!("gui/{}", user.uid),
             &plist.display().to_string(),
         ])
-        .status();
+        .output();
+    log_launchctl("bootstrap", &bootstrap);
+
     Response::Ack
+}
+
+/// chown a path; log on failure but don't propagate. Used for best-
+/// effort ownership fixups on directories the daemon may have just
+/// created inside a user's home.
+fn chown_path(path: &Path, uid: u32, gid: u32) {
+    use std::os::unix::ffi::OsStrExt;
+    let Ok(c) = CString::new(path.as_os_str().as_bytes()) else {
+        return;
+    };
+    // SAFETY: chown of an existing path; uid/gid are valid.
+    let rc = unsafe { libc::chown(c.as_ptr(), uid, gid) };
+    if rc != 0 {
+        let err = std::io::Error::last_os_error();
+        warn!(path = %path.display(), uid, gid, error = %err, "chown failed");
+    }
+}
+
+/// Log `launchctl` exit + stderr at info/warn so we can tell from the
+/// daemon log whether bootstrap/bootout actually took.
+fn log_launchctl(verb: &str, result: &std::io::Result<std::process::Output>) {
+    match result {
+        Ok(o) if o.status.success() => {
+            info!(verb, "launchctl ok");
+        }
+        Ok(o) => {
+            let stderr = String::from_utf8_lossy(&o.stderr);
+            let stdout = String::from_utf8_lossy(&o.stdout);
+            warn!(
+                verb,
+                code = o.status.code().unwrap_or(-1),
+                %stderr,
+                %stdout,
+                "launchctl non-zero exit"
+            );
+        }
+        Err(e) => {
+            warn!(verb, error = %e, "launchctl spawn failed");
+        }
+    }
 }
 
 /// Resolve the tray binary path the daemon should bake into freshly
