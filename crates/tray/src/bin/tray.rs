@@ -180,7 +180,14 @@ mod imp {
                 sm::Status::Enabled => {
                     tracing::info!("SMAppService: daemon already registered");
                 }
-                sm::Status::NotRegistered => {
+                // `NotFound` is what `smd` returns when the
+                // BackgroundTaskManagement DB has no record of the
+                // service — i.e. it's never been registered. Apple
+                // doesn't map that to `NotRegistered`; the system log
+                // shows `BTMManager.getEffectiveDisposition: error
+                // "record not found" Code=-95` getting translated to
+                // status 3 (NotFound). Treat both as "needs install".
+                sm::Status::NotRegistered | sm::Status::NotFound => {
                     if !install::run_first_launch_install(mtm) {
                         tracing::info!("first-launch setup not completed; quitting");
                         return Ok(());
@@ -190,15 +197,15 @@ mod imp {
                     install::show_requires_approval_alert(mtm);
                     return Ok(());
                 }
-                other => {
+                sm::Status::Other(code) => {
                     tracing::error!(
-                        status = ?other,
-                        "SMAppService returned unexpected status — packaging issue?"
+                        status_code = code,
+                        "SMAppService returned unexpected status code"
                     );
                     alerts::message(
                         mtm,
                         "Konstantin",
-                        "Couldn't locate the bundled daemon plist.\n\n\
+                        "macOS reported an unexpected service-management state.\n\n\
                          Reinstalling Konstantin should fix this.",
                     );
                     return Ok(());
