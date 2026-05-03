@@ -365,10 +365,20 @@ fn handle_write_autostart(username: &str, enable: bool) -> Response {
         // `Library/` itself; no-op if alice already owned it.
         chown_path(parent, user.uid.as_raw(), user.gid.as_raw());
     }
+    // Also ensure ~/Library/Logs/ exists and is alice-owned so the
+    // tray's stdout/stderr redirect targets are writable. If we
+    // skip this and the dir doesn't exist, launchd swallows the
+    // launch silently. (Hardcoded `/tmp/konstantin-tray.{out,err}.log`
+    // would have been worse: `/tmp/` is shared across users so a
+    // pre-existing file owned by a previous test user makes alice's
+    // launchd unable to redirect at all.)
+    let logs_dir = user.dir.join("Library/Logs");
+    let _ = std::fs::create_dir_all(&logs_dir);
+    chown_path(&logs_dir, user.uid.as_raw(), user.gid.as_raw());
 
     let exe = autostart_tray_exe();
     info!(exe = %exe.display(), "autostart plist will reference");
-    let body = build_user_launchagent_plist(&exe);
+    let body = build_user_launchagent_plist(&exe, &user.dir);
     if let Err(e) = std::fs::write(&plist, body) {
         warn!(plist = %plist.display(), error = %e, "write failed");
         return Response::Error {
@@ -452,8 +462,20 @@ fn autostart_tray_exe() -> PathBuf {
     PathBuf::from("/Applications/Konstantin.app/Contents/MacOS/konstantin-tray")
 }
 
-fn build_user_launchagent_plist(tray_exe: &Path) -> String {
+fn build_user_launchagent_plist(tray_exe: &Path, home: &Path) -> String {
     let exe = xml_escape(&tray_exe.display().to_string());
+    let stdout = xml_escape(
+        &home
+            .join("Library/Logs/konstantin-tray.out.log")
+            .display()
+            .to_string(),
+    );
+    let stderr = xml_escape(
+        &home
+            .join("Library/Logs/konstantin-tray.err.log")
+            .display()
+            .to_string(),
+    );
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -472,9 +494,9 @@ fn build_user_launchagent_plist(tray_exe: &Path) -> String {
     <key>LimitLoadToSessionType</key>
     <string>Aqua</string>
     <key>StandardOutPath</key>
-    <string>/tmp/konstantin-tray.out.log</string>
+    <string>{stdout}</string>
     <key>StandardErrorPath</key>
-    <string>/tmp/konstantin-tray.err.log</string>
+    <string>{stderr}</string>
 </dict>
 </plist>
 "#

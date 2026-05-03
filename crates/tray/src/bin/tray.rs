@@ -2206,10 +2206,17 @@ exit 0"#,
             let exe = std::env::current_exe()?;
             let home = std::env::var("HOME")
                 .map_err(|_| anyhow::anyhow!("HOME not set"))?;
-            let agents_dir = PathBuf::from(home).join("Library/LaunchAgents");
+            let home = PathBuf::from(home);
+            let agents_dir = home.join("Library/LaunchAgents");
             std::fs::create_dir_all(&agents_dir)?;
+            // Make sure the per-user log directory exists. macOS only
+            // creates `~/Library/Logs/` lazily; if launchd's stdout/
+            // stderr redirect targets don't exist we get silent
+            // launches.
+            let logs_dir = home.join("Library/Logs");
+            let _ = std::fs::create_dir_all(&logs_dir);
             let dst = agents_dir.join("com.gitopolis.konstantin-tray.plist");
-            let want = build_user_launchagent_plist(&exe);
+            let want = build_user_launchagent_plist(&exe, &home);
 
             if let Ok(have) = std::fs::read_to_string(&dst) {
                 if have == want {
@@ -2221,8 +2228,27 @@ exit 0"#,
             Ok(())
         }
 
-        pub(super) fn build_user_launchagent_plist(tray_exe: &Path) -> String {
+        /// Build a per-user `LaunchAgent` plist. `home` is the target
+        /// user's home directory — used to derive `Library/Logs/...`
+        /// paths so two users on the same machine don't fight over
+        /// `/tmp/konstantin-tray.{out,err}.log` ownership (the older
+        /// shared paths broke any second user: their launchd couldn't
+        /// open the first user's `0644`-owned log file for writing
+        /// and silently dropped the redirect — or skipped the launch).
+        pub(super) fn build_user_launchagent_plist(tray_exe: &Path, home: &Path) -> String {
             let exe = xml_escape(&tray_exe.display().to_string());
+            let stdout = xml_escape(
+                &home
+                    .join("Library/Logs/konstantin-tray.out.log")
+                    .display()
+                    .to_string(),
+            );
+            let stderr = xml_escape(
+                &home
+                    .join("Library/Logs/konstantin-tray.err.log")
+                    .display()
+                    .to_string(),
+            );
             format!(
                 r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -2241,9 +2267,9 @@ exit 0"#,
     <key>LimitLoadToSessionType</key>
     <string>Aqua</string>
     <key>StandardOutPath</key>
-    <string>/tmp/konstantin-tray.out.log</string>
+    <string>{stdout}</string>
     <key>StandardErrorPath</key>
-    <string>/tmp/konstantin-tray.err.log</string>
+    <string>{stderr}</string>
 </dict>
 </plist>
 "#
@@ -3146,8 +3172,9 @@ exit 0"#,
         fn enable_autostart_self(home: &Path) -> std::io::Result<()> {
             let agents = home.join("Library/LaunchAgents");
             std::fs::create_dir_all(&agents)?;
+            let _ = std::fs::create_dir_all(home.join("Library/Logs"));
             let dst = agents.join(TRAY_AGENT_FILENAME);
-            let body = super::install::build_user_launchagent_plist(&tray_exe());
+            let body = super::install::build_user_launchagent_plist(&tray_exe(), home);
             std::fs::write(&dst, body)?;
             // Best-effort bootstrap into our own GUI domain.
             let uid = current_uid();
