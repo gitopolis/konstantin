@@ -178,6 +178,13 @@ mod imp {
             return Ok(());
         }
 
+        // Ask for notification permission once at startup. macOS
+        // remembers the answer per-bundle, so subsequent launches
+        // don't re-prompt. Doing it here means the TCC sheet appears
+        // immediately rather than at the moment a threshold actually
+        // fires (which would be jarring).
+        notifications::request_authorization();
+
         spawn_subscriber(latest.clone());
         install_drain_timer(tray, latest);
 

@@ -52,4 +52,5 @@ semver = { version = "1", features = ["serde"] }
 objc2 = { workspace = true }
 objc2-foundation = { workspace = true }
 objc2-app-kit = { workspace = true }
+objc2-user-notifications = { workspace = true }
 block2 = { workspace = true }

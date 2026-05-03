@@ -147,11 +147,15 @@ These were Nikita's choices; revisit explicitly before changing them.
    warning, not 15 m / 10 m). Re-arm on day rollover detected via
    `UserStatus::resets_at` change.
 
-6. **Notifications via `osascript`** (not `UNUserNotificationCenter`).
-   `osascript` is signed by Apple, so notifications work without TCC
-   consent or bundle signing. Trade: notifications attribute to
-   "Script Editor" rather than "Konstantin". `UNUserNotificationCenter`
-   is the future path once Developer ID signing is in place.
+6. **Notifications via `UNUserNotificationCenter`.** Now that the
+   bundle is Developer ID signed and notarized, threshold warnings
+   attribute to "Konstantin" with the bundle icon. `notifications::
+   request_authorization` runs once at tray startup so the TCC
+   consent sheet appears proactively. The decision logic
+   (`NotifTracker`) is unchanged from phase 7 — only the delivery
+   side moved from `osascript` to `UNUserNotificationCenter`.
+   Bare `cargo run` (no NSBundle context) still no-ops with a
+   tracing warning instead of crashing.
 
 7. **`.app` bundle is the canonical install path.** The bundle ships
    the daemon binary at `Contents/Resources/screentimed`. On

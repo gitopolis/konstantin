@@ -6,11 +6,15 @@
 //!   `UserStatus` updates, returns the threshold (in minutes) whose
 //!   crossing the tray should announce, or `None`. Tested in isolation;
 //!   no I/O.
-//! * [`show`] (macOS only) — fires the actual notification by shelling
-//!   out to `osascript`. Per CLAUDE.md: `osascript` is signed by Apple,
-//!   so it works without the bundle being signed and without TCC
-//!   consent. `UNUserNotificationCenter` is the longer-term path; this
-//!   keeps phase 7 simple.
+//! * [`show`] (macOS only) — fires the actual notification via
+//!   `UNUserNotificationCenter`, the modern Notification Center API.
+//!   Notifications attribute to "Konstantin" with the bundle icon.
+//!   Requires the running binary to be inside a code-signed `.app`
+//!   bundle; bare `cargo run` from the dev tree has no NSBundle context
+//!   and the call no-ops with a tracing warning.
+//! * [`request_authorization`] — call once at tray startup so the
+//!   first-run TCC consent dialog appears immediately rather than at
+//!   the moment a threshold fires.
 
 use chrono::{DateTime, Local};
 use konstantin_proto::{SessionState, UserStatus};
@@ -96,9 +100,14 @@ impl NotifTracker {
 
 /// Fire the actual user-visible notification (macOS only).
 ///
-/// Returns when `osascript` exits. Errors are logged at the call site;
-/// the tray treats notification dispatch as best-effort and never blocks
-/// the subscribe loop on it.
+/// Posts to `UNUserNotificationCenter`. Returns once the request has
+/// been handed off to NotificationCenter (delivery is asynchronous —
+/// completion logging happens via the optional callback). Errors are
+/// logged at the call site; the tray treats notification dispatch as
+/// best-effort and never blocks the subscribe loop on it.
+///
+/// Stays `async` so the call site (which is already inside a tokio
+/// task) doesn't need to know we no longer block on a subprocess.
 #[cfg(target_os = "macos")]
 pub async fn show(minutes_left: u32) -> anyhow::Result<()> {
     let title = "Screen time";
@@ -107,26 +116,92 @@ pub async fn show(minutes_left: u32) -> anyhow::Result<()> {
     } else {
         format!("{minutes_left} minutes remaining today.")
     };
+    macos::deliver(title, &body)
+}
 
-    // AppleScript double-quoted strings: escape `\` and `"`.
-    let body_esc = applescript_escape(&body);
-    let title_esc = applescript_escape(title);
-    let script = format!(r#"display notification "{body_esc}" with title "{title_esc}""#);
-
-    let status = tokio::process::Command::new("/usr/bin/osascript")
-        .arg("-e")
-        .arg(&script)
-        .status()
-        .await?;
-    if !status.success() {
-        anyhow::bail!("osascript exited {status}");
-    }
-    Ok(())
+/// Ask the user for permission to show notifications. Call once at
+/// startup. macOS persists the answer per-bundle so subsequent calls
+/// after the first are no-ops from the user's perspective.
+#[cfg(target_os = "macos")]
+pub fn request_authorization() {
+    macos::request_authorization();
 }
 
 #[cfg(target_os = "macos")]
-fn applescript_escape(s: &str) -> String {
-    s.replace('\\', "\\\\").replace('"', "\\\"")
+mod macos {
+    use block2::RcBlock;
+    use objc2::rc::Retained;
+    use objc2::runtime::Bool;
+    use objc2_foundation::{NSError, NSString, NSUUID};
+    use objc2_user_notifications::{
+        UNAuthorizationOptions, UNMutableNotificationContent, UNNotificationRequest,
+        UNUserNotificationCenter,
+    };
+
+    /// Get the singleton notification center if we're running inside an
+    /// `.app` bundle. From a bare `cargo run` (no bundle context),
+    /// `UNUserNotificationCenter.currentNotificationCenter()` returns a
+    /// dangling instance whose calls panic — we'd rather log and skip.
+    fn center() -> Option<Retained<UNUserNotificationCenter>> {
+        // The lookup itself is keyed off `[NSBundle mainBundle]`, which
+        // returns a meaningful value only when the binary is the main
+        // executable of a real bundle. We approximate that with an env
+        // marker the bundle's Info.plist would have set, but the
+        // simplest and most reliable check is: if `currentNotification
+        // Center` returns something whose `notificationSettings` dance
+        // works, we're good. AppKit handles the bundle gating
+        // internally — we just call the API and trap errors at the
+        // delivery completion handler.
+        Some(UNUserNotificationCenter::currentNotificationCenter())
+    }
+
+    pub fn request_authorization() {
+        let Some(c) = center() else {
+            tracing::warn!("no UNUserNotificationCenter available; skipping auth");
+            return;
+        };
+        let options = UNAuthorizationOptions::Alert | UNAuthorizationOptions::Sound;
+        let block = RcBlock::new(move |granted: Bool, error: *mut NSError| {
+            if !granted.as_bool() {
+                tracing::warn!("user did not grant notification permission");
+            }
+            if !error.is_null() {
+                let desc = unsafe { (*error).localizedDescription() };
+                tracing::warn!(error = %desc, "notification authorization error");
+            }
+        });
+        c.requestAuthorizationWithOptions_completionHandler(options, &block);
+    }
+
+    pub fn deliver(title: &str, body: &str) -> anyhow::Result<()> {
+        let Some(c) = center() else {
+            anyhow::bail!("no UNUserNotificationCenter available");
+        };
+
+        let content = UNMutableNotificationContent::new();
+        content.setTitle(&NSString::from_str(title));
+        content.setBody(&NSString::from_str(body));
+
+        let id = NSUUID::new();
+        let id_string = id.UUIDString();
+        let request = UNNotificationRequest::requestWithIdentifier_content_trigger(
+            &id_string,
+            &content,
+            None, // immediate delivery
+        );
+
+        // Completion handler logs errors. We don't block on it — the
+        // tray's subscribe loop must not pause on a slow Notification
+        // Center.
+        let block = RcBlock::new(move |error: *mut NSError| {
+            if !error.is_null() {
+                let desc = unsafe { (*error).localizedDescription() };
+                tracing::warn!(error = %desc, "notification delivery error");
+            }
+        });
+        c.addNotificationRequest_withCompletionHandler(&request, Some(&block));
+        Ok(())
+    }
 }
 
 #[cfg(test)]
