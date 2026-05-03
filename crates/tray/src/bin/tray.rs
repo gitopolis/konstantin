@@ -587,13 +587,9 @@ mod imp {
 
         pub struct Paths {
             pub daemon_binary: PathBuf,
-            pub daemon_plist: PathBuf,
-            pub config_example: PathBuf,
             pub source: Source,
             /// `.app` bundle root (`/Applications/Konstantin.app`-ish)
             /// when running from a real bundle. `None` in dev-tree mode.
-            /// Recorded at install time so the daemon can self-uninstall
-            /// if the operator drag-to-Trashes the app.
             pub bundle_root: Option<PathBuf>,
         }
 
@@ -619,9 +615,6 @@ mod imp {
                         let bundle_root = contents.parent().map(PathBuf::from);
                         return Ok(Self {
                             daemon_binary: bundled_daemon,
-                            daemon_plist: contents
-                                .join("Library/LaunchDaemons/com.gitopolis.screentimed.plist"),
-                            config_example: resources.join("config.example.toml"),
                             source: Source::Bundle,
                             bundle_root,
                         });
@@ -630,24 +623,11 @@ mod imp {
 
                 // Dev-tree fallback. `exe_dir` is `target/<profile>/`
                 // (`release` or `debug`); the daemon binary lives next
-                // to the tray, and `packaging/` lives at the workspace
-                // root.
+                // to the tray.
                 let profile_dir = exe_dir;
-                let workspace = profile_dir
-                    .parent()
-                    .and_then(|p| p.parent())
-                    .ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "can't infer workspace root from {}",
-                            exe.display()
-                        )
-                    })?;
 
                 Ok(Self {
                     daemon_binary: profile_dir.join("screentimed"),
-                    daemon_plist: workspace
-                        .join("packaging/com.gitopolis.screentimed.plist"),
-                    config_example: workspace.join("packaging/config.example.toml"),
                     source: Source::DevTree,
                     bundle_root: None,
                 })
@@ -1244,33 +1224,36 @@ mod imp {
         }
 
         /// Map `NSError`s coming back from SMAppService to our enum.
-        /// SMAppService's domain is `SMAppServiceErrorDomain` and the
-        /// codes are documented at
-        /// <https://developer.apple.com/documentation/servicemanagement/smerror>.
         ///
-        /// We collapse the "already registered" / "job not found"
-        /// idempotent-success cases to `Ok`-equivalent at the call
-        /// boundary above — this function only returns `Error`s.
+        /// Important caveat: SMAppService doesn't always emit errors
+        /// in its own domain. On Tahoe, the first `register()` from
+        /// an unapproved bundle returns an `NSPOSIXErrorDomain` /
+        /// `EPERM` ("Operation not permitted") because BTM created
+        /// the registration record but launchd refused to start the
+        /// unapproved helper. That isn't a real failure — the
+        /// service IS registered — so callers should always re-check
+        /// `status()` after register/unregister and trust the status,
+        /// not the error.
+        ///
+        /// SMError codes are documented at
+        /// <https://developer.apple.com/documentation/servicemanagement/smerror>.
         fn classify_error(err: &objc2_foundation::NSError) -> Error {
             let code = err.code();
             let desc = err.localizedDescription().to_string();
 
-            // kSMErrorAlreadyRegistered = 4, kSMErrorJobNotFound = 9
-            // — caller treats those as success.
-            if code == 4 || code == 9 {
+            // kSMErrorAuthorizationFailure (4) and
+            // kSMErrorLaunchDeniedByUser (11) both mean "user must
+            // approve in System Settings".
+            if code == 4 || code == 11 {
+                return Error::NotApproved;
+            }
+            // kSMErrorAlreadyRegistered (12) and kSMErrorJobNotFound
+            // (6) are the idempotent-success cases. We surface them
+            // as Failed to keep the type honest; callers that need
+            // idempotency consult `status()` before/after.
+            if code == 6 || code == 12 {
                 tracing::debug!(code, %desc, "SMAppService idempotent ok");
-                // Surface as Failed to keep the type honest; callers
-                // that want idempotency check status() before/after.
                 return Error::Failed(desc);
-            }
-            // kSMErrorLaunchDeniedByUser = 6 — user said no.
-            if code == 6 {
-                return Error::NotApproved;
-            }
-            // RequiresApproval surfaces as a status, not an error, but
-            // some macOS versions report it as kSMErrorRequiresApproval.
-            if code == 5 {
-                return Error::NotApproved;
             }
             tracing::warn!(code, %desc, "SMAppService error");
             Error::Failed(desc)
@@ -2132,11 +2115,16 @@ exit 0"#,
         }
 
         /// Show a Set-up dialog. On confirm, register the daemon via
-        /// SMAppService. Returns `true` on success or when the user
-        /// declines (the tray quits in both cases via the call-site
-        /// branching). `false` from the failure branch is reserved for
-        /// the unrecoverable "couldn't initiate registration" case so
-        /// the tray exits with a logged error.
+        /// SMAppService and use the post-register **status** as the
+        /// source of truth.
+        ///
+        /// On Tahoe the very first `register()` from an unapproved
+        /// bundle creates the BTM record and *also* returns an
+        /// `NSPOSIXErrorDomain` "Operation not permitted" — because
+        /// launchd refused to start the not-yet-approved daemon.
+        /// That isn't a failure; the service IS registered, the user
+        /// just hasn't toggled it on. So we ignore the register error
+        /// when `status()` shows progress was made.
         pub fn run_first_launch_install(mtm: MainThreadMarker) -> bool {
             if !alerts::confirm(
                 mtm,
@@ -2150,39 +2138,38 @@ exit 0"#,
                 return false;
             }
 
-            match sm::register_daemon() {
-                Ok(()) => {
-                    tracing::info!("SMAppService: daemon registered");
-                    // After a successful register the status flips to
-                    // either Enabled (auto-approved on first install
-                    // for some bundle/keychain combinations) or to
-                    // RequiresApproval. We re-check and surface the
-                    // approval alert in the latter case.
-                    match sm::daemon_status() {
-                        sm::Status::Enabled => true,
-                        sm::Status::RequiresApproval => {
-                            show_requires_approval_alert(mtm);
-                            false
-                        }
-                        other => {
-                            tracing::warn!(
-                                status = ?other,
-                                "register succeeded but status is unexpected"
-                            );
-                            true
-                        }
-                    }
+            let register_result = sm::register_daemon();
+            match sm::daemon_status() {
+                sm::Status::Enabled => {
+                    tracing::info!("SMAppService: daemon registered and enabled");
+                    true
                 }
-                Err(sm::Error::NotApproved) => {
+                sm::Status::RequiresApproval => {
+                    // Either register just created the BTM record, or
+                    // a previous install left it as needing approval.
+                    // Either way, point the user at System Settings.
                     show_requires_approval_alert(mtm);
                     false
                 }
-                Err(sm::Error::Failed(msg)) => {
-                    tracing::error!(error = %msg, "SMAppService.register failed");
+                other => {
+                    // Status didn't advance — surface the register
+                    // error if we got one, or a generic message.
+                    let detail = match register_result {
+                        Err(sm::Error::NotApproved) => {
+                            show_requires_approval_alert(mtm);
+                            return false;
+                        }
+                        Err(sm::Error::Failed(m)) => m,
+                        Ok(_) => format!(
+                            "registration completed but the service is \
+                             still in state {other:?}"
+                        ),
+                    };
+                    tracing::error!(error = %detail, "SMAppService.register failed");
                     alerts::message(
                         mtm,
                         "Couldn't enable Konstantin's background service.",
-                        &format!("{msg}\n\nThis usually means the app \
+                        &format!("{detail}\n\nThis usually means the app \
                                   isn't signed and notarized correctly. \
                                   Try reinstalling Konstantin."),
                     );
