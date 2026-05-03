@@ -1812,8 +1812,8 @@ exit 0"#,
                 Err(admin::Error::Failed(stderr)) => {
                     // Full stderr is what diagnoses a failed update —
                     // log it before classifying down to a one-line
-                    // alert so the operator can find the cause in
-                    // `/tmp/konstantin-tray.err.log`.
+                    // alert so the operator can find the cause in the
+                    // tray's `~/Library/Logs/konstantin-tray.err.log`.
                     tracing::error!(stderr = %stderr, "update install script failed");
                     let (title, body) = classify_failure(&stderr);
                     alerts::message(mtm, title, &body);
@@ -2051,10 +2051,12 @@ exit 0"#,
             let exe = std::env::current_exe()?;
             let home = std::env::var("HOME")
                 .map_err(|_| anyhow::anyhow!("HOME not set"))?;
-            let agents_dir = PathBuf::from(home).join("Library/LaunchAgents");
+            let home = PathBuf::from(home);
+            let agents_dir = home.join("Library/LaunchAgents");
             std::fs::create_dir_all(&agents_dir)?;
+            std::fs::create_dir_all(home.join("Library/Logs"))?;
             let dst = agents_dir.join("com.gitopolis.konstantin-tray.plist");
-            let want = build_user_launchagent_plist(&exe);
+            let want = build_user_launchagent_plist(&exe, &home);
 
             if let Ok(have) = std::fs::read_to_string(&dst) {
                 if have == want {
@@ -2109,8 +2111,20 @@ exit 0"#,
             s
         }
 
-        pub(super) fn build_user_launchagent_plist(tray_exe: &Path) -> String {
+        pub(super) fn build_user_launchagent_plist(tray_exe: &Path, home: &Path) -> String {
             let exe = xml_escape(&tray_exe.display().to_string());
+            let stdout = xml_escape(
+                &home
+                    .join("Library/Logs/konstantin-tray.out.log")
+                    .display()
+                    .to_string(),
+            );
+            let stderr = xml_escape(
+                &home
+                    .join("Library/Logs/konstantin-tray.err.log")
+                    .display()
+                    .to_string(),
+            );
             format!(
                 r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -2129,9 +2143,9 @@ exit 0"#,
     <key>LimitLoadToSessionType</key>
     <string>Aqua</string>
     <key>StandardOutPath</key>
-    <string>/tmp/konstantin-tray.out.log</string>
+    <string>{stdout}</string>
     <key>StandardErrorPath</key>
-    <string>/tmp/konstantin-tray.err.log</string>
+    <string>{stderr}</string>
 </dict>
 </plist>
 "#
@@ -2986,7 +3000,7 @@ exit 0"#,
                     let plist_temp =
                         tmp_path(&format!("konstantin-agent-{}", row.username), "plist");
                     let plist_body =
-                        super::install::build_user_launchagent_plist(&tray_exe());
+                        super::install::build_user_launchagent_plist(&tray_exe(), &row.home);
                     if let Err(e) = std::fs::write(&plist_temp, plist_body) {
                         super::alerts::message(
                             mtm,
@@ -3143,13 +3157,25 @@ exit 0"#,
                 src = shell_quote(config_temp),
             ));
             for (plist_temp, row, enable) in other_user_changes {
-                let dest_dir = row.home.join("Library/LaunchAgents");
+                let library_dir = row.home.join("Library");
+                let dest_dir = library_dir.join("LaunchAgents");
+                let logs_dir = library_dir.join("Logs");
                 let dest_plist = dest_dir.join(TRAY_AGENT_FILENAME);
                 if *enable {
+                    parts.push(format!(
+                        "install -d -o {user} -g staff -m 0700 {dir}",
+                        user = shell_quote_arg(&row.username),
+                        dir = shell_quote(&library_dir),
+                    ));
                     parts.push(format!(
                         "install -d -o {user} -g staff -m 0755 {dir}",
                         user = shell_quote_arg(&row.username),
                         dir = shell_quote(&dest_dir),
+                    ));
+                    parts.push(format!(
+                        "install -d -o {user} -g staff -m 0700 {dir}",
+                        user = shell_quote_arg(&row.username),
+                        dir = shell_quote(&logs_dir),
                     ));
                     parts.push(format!(
                         "install -m 0644 -o {user} -g staff {src} {dst}",
@@ -3179,8 +3205,9 @@ exit 0"#,
         fn enable_autostart_self(home: &Path) -> std::io::Result<()> {
             let agents = home.join("Library/LaunchAgents");
             std::fs::create_dir_all(&agents)?;
+            std::fs::create_dir_all(home.join("Library/Logs"))?;
             let dst = agents.join(TRAY_AGENT_FILENAME);
-            let body = super::install::build_user_launchagent_plist(&tray_exe());
+            let body = super::install::build_user_launchagent_plist(&tray_exe(), home);
             std::fs::write(&dst, body)?;
             // Best-effort bootstrap into our own GUI domain.
             let uid = current_uid();
@@ -3314,6 +3341,52 @@ daily_limit_minutes = 30
                     operator_username: "nikita".into(),
                 };
                 assert!(build_new_config_toml(&snap).is_err());
+            }
+
+            #[test]
+            fn launchagent_plist_uses_user_log_paths() {
+                let body = super::super::install::build_user_launchagent_plist(
+                    Path::new("/Applications/Konstantin.app/Contents/MacOS/konstantin-tray"),
+                    Path::new("/Users/alice & bob"),
+                );
+
+                assert!(
+                    body.contains("/Users/alice &amp; bob/Library/Logs/konstantin-tray.out.log")
+                );
+                assert!(
+                    body.contains("/Users/alice &amp; bob/Library/Logs/konstantin-tray.err.log")
+                );
+                assert!(!body.contains("/tmp/konstantin-tray"));
+            }
+
+            #[test]
+            fn admin_script_prepares_user_owned_launchagent_and_log_dirs() {
+                let row = RowSnapshot {
+                    username: "alice".to_string(),
+                    uid: 601,
+                    home: PathBuf::from("/Users/alice"),
+                    limited: false,
+                    minutes: 0,
+                    autostart_target: true,
+                    autostart_initial: false,
+                };
+                let script = build_admin_script(
+                    Path::new("/tmp/konstantin-config.toml"),
+                    &[(
+                        PathBuf::from("/tmp/konstantin-agent-alice.plist"),
+                        row,
+                        true,
+                    )],
+                );
+
+                assert!(script
+                    .contains("install -d -o 'alice' -g staff -m 0700 '/Users/alice/Library'"));
+                assert!(script.contains(
+                    "install -d -o 'alice' -g staff -m 0755 '/Users/alice/Library/LaunchAgents'"
+                ));
+                assert!(script.contains(
+                    "install -d -o 'alice' -g staff -m 0700 '/Users/alice/Library/Logs'"
+                ));
             }
         }
     }

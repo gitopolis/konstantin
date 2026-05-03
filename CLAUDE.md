@@ -277,10 +277,10 @@ These were Nikita's choices; revisit explicitly before changing them.
   auto-bumps version + sha256 there on each tag.
 * **A8** — security/UX hardening on top of A1–A7:
   * `/etc/screentimed/config.toml` is now mode 0600 root-owned at
-    every write site (`packaging/install.sh`, the tray's first-launch
-    `install::build_install_script`, and the Save flow's
-    `config_ui::build_admin_script`). Other users on the machine
-    can't see whose limits are configured.
+    every write site (the tray's first-launch
+    `install::build_install_script` and the Save flow's
+    `config_ui::build_admin_script`). Other users on the machine can't
+    see whose limits are configured.
   * `Configure…` therefore prompts for an admin password to *open*
     the window: a single `admin::run_with_progress` invocation
     (`config_ui::build_open_admin_script`) copies the config out to
@@ -360,33 +360,21 @@ machine.
 
 ## Build, smoke-test, install (development workflow)
 
-End users will install via Homebrew cask once A1 ships. For development,
-the existing scripts remain authoritative.
+End users install via Homebrew cask. For development, build/test the
+workspace and package the `.app`; the bundle's first-launch setup is
+the install path.
 
 ```sh
 cargo check --workspace
 cargo test  --workspace
 cargo build --release
+./packaging/build-app.sh
+open target/Konstantin.app
 ```
 
 Smoke-test without installing (no root). Use an ad-hoc config (e.g.
 at `/tmp/screentimed-smoketest.toml`, gitignored) — see
 `docs/concepts.md` for the full recipe.
-
-System install (requires root):
-
-```sh
-sudo packaging/create-test-users.sh        # makes alice + bob
-cargo build --release
-sudo packaging/install.sh                  # daemon + tray for $SUDO_USER
-sudo packaging/install.sh alice bob        # also/instead: tray for those users
-```
-
-Per-user-only tray install (no root):
-
-```sh
-./packaging/install-tray.sh
-```
 
 Uninstall:
 
@@ -395,9 +383,8 @@ sudo packaging/uninstall.sh                # daemon + binaries + tray for $SUDO_
 ./packaging/uninstall-tray.sh              # tray-only, no root
 ```
 
-`uninstall.sh` removes binaries / plists / socket but preserves
-`/etc/screentimed/` and `/var/db/screentimed/` so configs and counters
-survive reinstalls.
+`uninstall.sh` removes binaries / plists / socket / counter state but
+preserves `/etc/screentimed/` so configs survive reinstalls.
 
 ## Layout
 
@@ -418,10 +405,10 @@ konstantin/
 │                   src/bin/{status,tray}.rs            # konstantin-status + tray
 └── packaging/
     ├── com.gitopolis.screentimed.plist          # LaunchDaemon, runs as root
-    ├── com.gitopolis.konstantin-tray.plist      # LaunchAgent, Aqua-only
     ├── config.example.toml
-    ├── install.sh, uninstall.sh                 # system-side, requires sudo
-    ├── install-tray.sh, uninstall-tray.sh       # per-user, no sudo
+    ├── build-app.sh                             # app bundle builder
+    ├── uninstall.sh                             # system-side, requires sudo
+    ├── uninstall-tray.sh                        # tray-only, no sudo
     └── create-test-users.sh, delete-test-users.sh
 ```
 
