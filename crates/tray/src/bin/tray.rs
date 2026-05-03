@@ -68,6 +68,12 @@ mod imp {
         /// start in this state and the worker flips it to `false` once
         /// it actually reaches the daemon.
         disconnected: bool,
+        /// A release found by an earlier "Check for Updates…" click
+        /// that the user deferred via "Later". When `Some`, the
+        /// updates menu item is morphed to "Update to <version>" and
+        /// clicking it goes straight into install. Cleared once the
+        /// update is consumed.
+        pending_update: Option<update::Release>,
     }
 
     impl Default for Latest {
@@ -77,6 +83,7 @@ mod imp {
             Self {
                 pending: None,
                 disconnected: true,
+                pending_update: None,
             }
         }
     }
@@ -90,7 +97,15 @@ mod imp {
         start_item: Retained<NSMenuItem>,
         stop_item: Retained<NSMenuItem>,
         restart_item: Retained<NSMenuItem>,
+        updates_item: Retained<NSMenuItem>,
     }
+
+    /// Shared `Arc<Mutex<Latest>>` set during `main()` so action
+    /// handlers (which can't be parameterised through the
+    /// `define_class!` macro without ivars) can read pending updates.
+    /// `OnceLock` so it's a fail-loud configuration mistake to install
+    /// it twice.
+    static LATEST: std::sync::OnceLock<Arc<Mutex<Latest>>> = std::sync::OnceLock::new();
 
     pub fn main() -> Result<()> {
         install_tracing();
@@ -101,6 +116,8 @@ mod imp {
         // dev tree.
         match bundle::Paths::resolve() {
             Ok(p) => tracing::info!(
+                version = env!("CARGO_PKG_VERSION"),
+                arch = std::env::consts::ARCH,
                 source = p.source.label(),
                 daemon = %p.daemon_binary.display(),
                 "konstantin-tray starting"
@@ -121,6 +138,10 @@ mod imp {
         let controller = actions::Controller::new(mtm);
         let tray = build_status_item(mtm, &controller);
         let latest = Arc::new(Mutex::new(Latest::default()));
+        // Publish for action handlers. `set` returns Err if the slot
+        // was already filled — `main()` runs once, so this is fail-fast
+        // diagnostic for an accidental double-call.
+        let _ = LATEST.set(latest.clone());
 
         // Initial visuals before any update arrives — match the default
         // `disconnected: true` state (muted clock, no time label).
@@ -201,6 +222,17 @@ mod imp {
 
         menu.addItem(&NSMenuItem::separatorItem(mtm));
 
+        // Updater entry. Title morphs to "Update to <version>" once a
+        // check has surfaced a newer release that the user deferred
+        // via "Later" — drain timer drives the morph from
+        // `Latest::pending_update`.
+        let updates_item =
+            make_action_item(mtm, "Check for Updates…", sel!(checkForUpdates:), controller);
+        updates_item.setEnabled(true);
+        menu.addItem(&updates_item);
+
+        menu.addItem(&NSMenuItem::separatorItem(mtm));
+
         let uninstall = make_action_item(mtm, "Uninstall…", sel!(uninstall:), controller);
         uninstall.setEnabled(true);
         menu.addItem(&uninstall);
@@ -225,6 +257,7 @@ mod imp {
             start_item,
             stop_item,
             restart_item,
+            updates_item,
         }
     }
 
@@ -320,9 +353,13 @@ mod imp {
             // scheduled), so we can re-derive the marker safely.
             let mtm = MainThreadMarker::new()
                 .expect("drain timer must fire on the main thread");
-            let (pending, disconnected) = {
+            let (pending, disconnected, pending_update_version) = {
                 let mut g = latest.lock().expect("latest mutex");
-                (g.pending.take(), g.disconnected)
+                (
+                    g.pending.take(),
+                    g.disconnected,
+                    g.pending_update.as_ref().map(|r| r.version.to_string()),
+                )
             };
 
             // Menu enable-state. Idempotent — `setEnabled` with the
@@ -331,6 +368,15 @@ mod imp {
             tray.start_item.setEnabled(disconnected);
             tray.stop_item.setEnabled(!disconnected);
             tray.restart_item.setEnabled(!disconnected);
+
+            // Updater menu item morph. AppKit's `setTitle` is also
+            // idempotent — comparing first would just be book-keeping.
+            let updates_title = match &pending_update_version {
+                Some(v) => format!("Update to {v}"),
+                None => "Check for Updates…".to_string(),
+            };
+            tray.updates_item
+                .setTitle(&NSString::from_str(&updates_title));
 
             // Visuals. The muted clock trumps any pending status if
             // we're currently disconnected — even if a stale `pending`
@@ -416,6 +462,47 @@ mod imp {
             .with_env_filter(filter)
             .with_target(true)
             .init();
+    }
+
+    /// Click handler for the updates menu item. If a previous check
+    /// has already surfaced a release that the user deferred, jump
+    /// straight into the install flow with that release. Otherwise
+    /// run the check.
+    fn check_for_updates_flow(mtm: MainThreadMarker) {
+        let paths = match bundle::Paths::resolve() {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::error!(error = %e, "could not resolve bundle paths for update");
+                alerts::message(
+                    mtm,
+                    "Couldn't Check for Updates",
+                    &format!("Couldn't locate the running bundle: {e}"),
+                );
+                return;
+            }
+        };
+
+        // Take any pending release out so a successful install doesn't
+        // leave it stale; if the user cancels the admin sheet it'll get
+        // restashed below.
+        let pending = LATEST
+            .get()
+            .and_then(|l| l.lock().ok().and_then(|mut g| g.pending_update.take()));
+
+        if let Some(release) = pending {
+            update::run_install_flow(mtm, &paths, &release);
+            return;
+        }
+
+        update::run_check_for_updates_flow(mtm, &paths, |release| {
+            // User picked "Later" — stash the release so the menu item
+            // morphs to "Update to <version>" on the next drain tick.
+            if let Some(latest) = LATEST.get() {
+                if let Ok(mut g) = latest.lock() {
+                    g.pending_update = Some(release);
+                }
+            }
+        });
     }
 
     /// Resolves paths to the daemon binary, daemon plist template, and
@@ -603,6 +690,12 @@ mod imp {
                 #[unsafe(method(openLog:))]
                 fn open_log_action(&self, _sender: Option<&AnyObject>) {
                     open_log();
+                }
+
+                #[unsafe(method(checkForUpdates:))]
+                fn check_for_updates_action(&self, _sender: Option<&AnyObject>) {
+                    let mtm = MainThreadMarker::from(self);
+                    super::check_for_updates_flow(mtm);
                 }
 
                 #[unsafe(method(uninstall:))]
@@ -818,22 +911,12 @@ mod imp {
         }
     }
 
-    /// Privileged-action primitive: run a bash command as root via
-    /// `osascript … with administrator privileges`, with a small
-    /// progress panel and a responsive main thread.
-    ///
-    /// One public function — `run_with_progress`. Used by the install
-    /// flow and (in phase A4) by the Start / Stop / Restart / Configure
-    /// menu actions. Each call:
-    ///   1. Shows a titled NSPanel with an indeterminate spinner and a
-    ///      one-liner status message.
-    ///   2. Spawns a background thread that invokes osascript (which
-    ///      itself shows the OS password sheet, then runs the script as
-    ///      root).
-    ///   3. Pumps the main run loop in 50 ms slices so the panel
-    ///      animates and the cursor stays normal.
-    ///   4. Returns when the worker sends its result.
-    mod admin {
+    /// Generic "show a spinner panel while a closure runs on a worker
+    /// thread" primitive. Used by both the privileged `mod admin` path
+    /// (osascript with admin privileges) and the unprivileged updater
+    /// download path. Decoupled from any specific kind of work — it
+    /// just owns the panel + run-loop pump.
+    mod progress {
         use super::*;
         use objc2::rc::Retained;
         use objc2::MainThreadOnly;
@@ -844,45 +927,67 @@ mod imp {
         use objc2_foundation::{NSDate, NSDefaultRunLoopMode, NSPoint, NSRect, NSRunLoop, NSSize};
         use std::sync::mpsc;
 
-        pub enum Error {
-            /// User dismissed the OS password prompt.
-            Cancelled,
-            /// osascript or the underlying command exited non-zero. The
-            /// string is the captured stderr.
-            Failed(String),
-        }
-
-        /// Run `bash_command` as root. Shows a progress panel titled
-        /// `panel_title` with the spinner-adjacent message
-        /// `panel_message` for the duration. Must be called from the
-        /// main thread.
-        pub fn run_with_progress(
+        /// Show a titled NSPanel with an indeterminate spinner and a
+        /// one-liner status message. Spawns `work` on a background
+        /// thread named `thread_name`, pumps the main run loop in 50 ms
+        /// slices so the panel animates and the cursor stays normal,
+        /// and returns the closure's value once it sends. Closes the
+        /// panel before returning. Must be called from the main thread.
+        pub fn run_with_panel<T: Send + 'static>(
             mtm: MainThreadMarker,
             panel_title: &str,
             panel_message: &str,
-            bash_command: &str,
-        ) -> Result<(), Error> {
-            let panel = build_progress_panel(mtm, panel_title, panel_message);
+            thread_name: &str,
+            work: impl FnOnce() -> T + Send + 'static,
+        ) -> T {
+            let panel = build_panel(mtm, panel_title, panel_message);
             // `orderFrontRegardless` brings the window forward even when
             // the app is `Accessory` (no Dock presence). Combined with
-            // `activate`, it puts the panel front-and-centre after the
-            // OS-level password prompt dismisses.
+            // `activate`, it puts the panel front-and-centre after any
+            // OS-level prompt dismisses.
             panel.orderFrontRegardless();
             NSApplication::sharedApplication(mtm).activate();
 
-            let cmd = bash_command.to_string();
-            let (tx, rx) = mpsc::channel::<Result<(), Error>>();
+            let (tx, rx) = mpsc::channel::<T>();
+            let thread_label = thread_name.to_string();
             std::thread::Builder::new()
-                .name("konstantin-tray-admin".into())
+                .name(thread_name.into())
                 .spawn(move || {
-                    let _ = tx.send(run_osascript_blocking(&cmd));
+                    // Catch panics so a crashed worker leaves a log
+                    // line instead of vanishing silently. The channel
+                    // still ends up disconnected (we don't have a `T`
+                    // to send), so `pump_run_loop_until` will still
+                    // notice — but at least the cause is in the log.
+                    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(work)) {
+                        Ok(value) => {
+                            let _ = tx.send(value);
+                        }
+                        Err(payload) => {
+                            let msg = panic_payload_message(&payload);
+                            tracing::error!(
+                                thread = %thread_label,
+                                panic = %msg,
+                                "worker thread panicked"
+                            );
+                        }
+                    }
                 })
-                .expect("spawn admin thread");
+                .expect("spawn worker thread");
 
             let result = pump_run_loop_until(&rx);
 
             panel.close();
             result
+        }
+
+        fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> String {
+            if let Some(s) = payload.downcast_ref::<&str>() {
+                (*s).to_string()
+            } else if let Some(s) = payload.downcast_ref::<String>() {
+                s.clone()
+            } else {
+                "non-string panic payload".to_string()
+            }
         }
 
         /// Pump the main run loop in 50 ms slices, draining whatever
@@ -899,13 +1004,13 @@ mod imp {
                     Ok(v) => return v,
                     Err(mpsc::TryRecvError::Empty) => continue,
                     Err(mpsc::TryRecvError::Disconnected) => {
-                        unreachable!("admin thread vanished without sending result")
+                        unreachable!("worker thread vanished without sending result")
                     }
                 }
             }
         }
 
-        fn build_progress_panel(
+        fn build_panel(
             mtm: MainThreadMarker,
             title: &str,
             message: &str,
@@ -949,6 +1054,43 @@ mod imp {
 
             panel
         }
+    }
+
+    /// Privileged-action primitive: run a bash command as root via
+    /// `osascript … with administrator privileges`, with a small
+    /// progress panel and a responsive main thread. Thin wrapper
+    /// around `mod progress` that knows how to invoke osascript and
+    /// classify cancel-vs-failure outcomes.
+    mod admin {
+        use super::*;
+
+        pub enum Error {
+            /// User dismissed the OS password prompt.
+            Cancelled,
+            /// osascript or the underlying command exited non-zero. The
+            /// string is the captured stderr.
+            Failed(String),
+        }
+
+        /// Run `bash_command` as root. Shows a progress panel titled
+        /// `panel_title` with the spinner-adjacent message
+        /// `panel_message` for the duration. Must be called from the
+        /// main thread.
+        pub fn run_with_progress(
+            mtm: MainThreadMarker,
+            panel_title: &str,
+            panel_message: &str,
+            bash_command: &str,
+        ) -> Result<(), Error> {
+            let cmd = bash_command.to_string();
+            super::progress::run_with_panel(
+                mtm,
+                panel_title,
+                panel_message,
+                "konstantin-tray-admin",
+                move || run_osascript_blocking(&cmd),
+            )
+        }
 
         fn run_osascript_blocking(bash_command: &str) -> Result<(), Error> {
             // AppleScript double-quoted strings escape `\` and `"`. We
@@ -975,6 +1117,834 @@ mod imp {
                 return Err(Error::Cancelled);
             }
             Err(Error::Failed(stderr.into_owned()))
+        }
+    }
+
+    /// In-app updater. Hits `api.github.com/repos/<repo>/releases/latest`,
+    /// finds the architecture-matched asset zip plus a `.sha256` sidecar,
+    /// downloads both with checksum verification, and re-installs the
+    /// `.app` bundle in place. The privileged install script self-rolls
+    /// back if the new daemon doesn't come up — see `build_install_script`.
+    ///
+    /// Source of truth for the version comparison is
+    /// `env!("CARGO_PKG_VERSION")`. CI runs `cargo set-version
+    /// --workspace "$VERSION"` before each release build, so the version
+    /// baked into a tagged-release binary is always the right one.
+    mod update {
+        use super::*;
+        use semver::Version;
+        use sha2::{Digest, Sha256};
+        use std::io::{Read, Write};
+        use std::path::{Path, PathBuf};
+        use std::sync::OnceLock;
+        use std::time::Duration;
+
+        const REPO: &str = "gitopolis/konstantin";
+        const RELEASES_API: &str =
+            "https://api.github.com/repos/gitopolis/konstantin/releases/latest";
+        const HTTP_TIMEOUT: Duration = Duration::from_secs(20);
+
+        /// `env!("CARGO_PKG_VERSION")` parsed once. Panics at first call
+        /// if the build's version is malformed — that's a bug worth
+        /// crashing on.
+        pub fn current_version() -> &'static Version {
+            static V: OnceLock<Version> = OnceLock::new();
+            V.get_or_init(|| {
+                Version::parse(env!("CARGO_PKG_VERSION"))
+                    .expect("CARGO_PKG_VERSION must be valid semver")
+            })
+        }
+
+        /// Map `std::env::consts::ARCH` to the `<arch>` token that the
+        /// release pipeline embeds in asset filenames. `aarch64` is the
+        /// Rust target arch for Apple Silicon; the release matrix labels
+        /// that build `arm64`. The eventual x86_64 matrix entry should
+        /// be labelled `x86_64` (matches `uname -m` and Homebrew's
+        /// bottle-arch convention) — if it lands as `amd64` instead, the
+        /// mapping below is the only thing that changes.
+        pub fn current_arch_label() -> Option<&'static str> {
+            match std::env::consts::ARCH {
+                "aarch64" => Some("arm64"),
+                "x86_64" => Some("x86_64"),
+                _ => None,
+            }
+        }
+
+        #[derive(Clone, Debug)]
+        pub struct Release {
+            pub version: Version,
+            pub asset_url: String,
+            pub asset_name: String,
+            /// Lowercase hex SHA-256 of the asset, taken from the
+            /// API's `digest` field (the same hash GitHub displays on
+            /// the release page). Format on the wire is `sha256:<hex>`;
+            /// we strip the prefix and lowercase here.
+            pub asset_sha256: String,
+        }
+
+        pub enum CheckOutcome {
+            UpToDate,
+            Newer(Release),
+        }
+
+        #[derive(Debug)]
+        pub enum Error {
+            /// HTTP, DNS, TLS, or transport errors.
+            Network(String),
+            /// JSON couldn't be parsed, or required fields were missing.
+            Parse(String),
+            /// No `Konstantin-<version>-<arch>.zip` asset for our arch.
+            NoAssetForArch,
+            /// `unzip` failed.
+            Unpack(String),
+            /// Staged bundle is missing required files.
+            BadStagedBundle(String),
+            /// Running from a dev tree, or running on an unsupported
+            /// architecture — refuse to update.
+            UnsupportedEnvironment,
+            /// Filesystem error during download / staging.
+            Io(String),
+        }
+
+        impl std::fmt::Display for Error {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                match self {
+                    Self::Network(s) => write!(f, "network error: {s}"),
+                    Self::Parse(s) => write!(f, "couldn't parse GitHub response: {s}"),
+                    Self::NoAssetForArch => write!(
+                        f,
+                        "no compatible release asset for this architecture"
+                    ),
+                    Self::Unpack(s) => write!(f, "couldn't unpack archive: {s}"),
+                    Self::BadStagedBundle(s) => write!(f, "downloaded bundle is malformed: {s}"),
+                    Self::UnsupportedEnvironment => write!(
+                        f,
+                        "updates are only available from an installed .app bundle on a supported architecture"
+                    ),
+                    Self::Io(s) => write!(f, "i/o error: {s}"),
+                }
+            }
+        }
+
+        // ─── Network ─────────────────────────────────────────────────
+
+        fn user_agent() -> String {
+            format!("konstantin-tray/{}", env!("CARGO_PKG_VERSION"))
+        }
+
+        /// One-shot agent for HTTP(S). `ureq`'s default agent is fine
+        /// for the half-dozen requests we make in a session, but we
+        /// build it once with consistent timeout + UA so all requests
+        /// look the same to the server.
+        fn agent() -> ureq::Agent {
+            ureq::Agent::config_builder()
+                .timeout_global(Some(HTTP_TIMEOUT))
+                .build()
+                .into()
+        }
+
+        fn fetch_json(url: &str) -> Result<serde_json::Value, Error> {
+            let mut resp = agent()
+                .get(url)
+                .header("Accept", "application/vnd.github+json")
+                .header("User-Agent", user_agent())
+                .call()
+                .map_err(|e| Error::Network(e.to_string()))?;
+            resp.body_mut()
+                .read_json::<serde_json::Value>()
+                .map_err(|e| Error::Parse(e.to_string()))
+        }
+
+        /// Stream `url` into `dest`, going via a `<dest>.partial` so a
+        /// dropped connection never leaves a half-formed file at the
+        /// final name. Renames atomically on success.
+        fn download_to(url: &str, dest: &Path) -> Result<(), Error> {
+            let partial = dest.with_extension(
+                dest.extension()
+                    .and_then(|e| e.to_str())
+                    .map(|e| format!("{e}.partial"))
+                    .unwrap_or_else(|| "partial".to_string()),
+            );
+            // Cleanup-on-drop guard for the partial file.
+            struct PartialGuard(PathBuf);
+            impl Drop for PartialGuard {
+                fn drop(&mut self) {
+                    let _ = std::fs::remove_file(&self.0);
+                }
+            }
+            let guard = PartialGuard(partial.clone());
+
+            let mut resp = agent()
+                .get(url)
+                .header("User-Agent", user_agent())
+                .call()
+                .map_err(|e| Error::Network(e.to_string()))?;
+            let mut reader = resp.body_mut().as_reader();
+            let mut file = std::fs::File::create(&partial)
+                .map_err(|e| Error::Io(format!("create {}: {e}", partial.display())))?;
+            std::io::copy(&mut reader, &mut file)
+                .map_err(|e| Error::Network(format!("body read: {e}")))?;
+            file.flush()
+                .map_err(|e| Error::Io(format!("flush {}: {e}", partial.display())))?;
+            std::fs::rename(&partial, dest)
+                .map_err(|e| Error::Io(format!("rename to {}: {e}", dest.display())))?;
+            // We renamed to `dest`, so the partial no longer exists.
+            // Disarm the guard.
+            std::mem::forget(guard);
+            Ok(())
+        }
+
+        // ─── Parsing the GitHub release ──────────────────────────────
+
+        fn canonical_url(tag: &str, filename: &str) -> String {
+            format!(
+                "https://github.com/{REPO}/releases/download/{tag}/{filename}",
+                REPO = REPO,
+            )
+        }
+
+        /// Cheap defense against a tampered API response — only trust
+        /// `browser_download_url` values that match the canonical
+        /// `releases/download/<tag>/<file>` shape on the expected repo.
+        fn is_canonical(url: &str, tag: &str, filename: &str) -> bool {
+            url == canonical_url(tag, filename)
+        }
+
+        /// Parse a `releases/latest` JSON payload into a `Release`,
+        /// looking for the asset that matches our arch and pulling its
+        /// SHA-256 from the `digest` field GitHub computes for every
+        /// release asset.
+        fn parse_release(json: &serde_json::Value) -> Result<Release, Error> {
+            let tag = json["tag_name"]
+                .as_str()
+                .ok_or_else(|| Error::Parse("missing tag_name".into()))?;
+            let version_str = tag.strip_prefix('v').unwrap_or(tag);
+            let version = Version::parse(version_str)
+                .map_err(|e| Error::Parse(format!("tag {tag}: {e}")))?;
+            let arch = current_arch_label().ok_or(Error::UnsupportedEnvironment)?;
+            let asset_name = format!("Konstantin-{version}-{arch}.zip");
+
+            let assets = json["assets"]
+                .as_array()
+                .ok_or_else(|| Error::Parse("missing assets array".into()))?;
+
+            for a in assets {
+                let name = a["name"].as_str().unwrap_or("");
+                if name != asset_name {
+                    continue;
+                }
+                let url = a["browser_download_url"].as_str().unwrap_or("");
+                if !is_canonical(url, tag, &asset_name) {
+                    return Err(Error::Parse(format!(
+                        "non-canonical asset URL for {asset_name}: {url}"
+                    )));
+                }
+                let digest = a["digest"]
+                    .as_str()
+                    .ok_or_else(|| Error::Parse(format!("missing digest for {asset_name}")))?;
+                let asset_sha256 = parse_digest(digest)?;
+                return Ok(Release {
+                    version,
+                    asset_url: url.to_string(),
+                    asset_name,
+                    asset_sha256,
+                });
+            }
+
+            Err(Error::NoAssetForArch)
+        }
+
+        /// Parse GitHub's `digest` field: `sha256:<64 hex chars>`.
+        /// Returns the lowercase hex without the prefix.
+        fn parse_digest(s: &str) -> Result<String, Error> {
+            let hex = s
+                .strip_prefix("sha256:")
+                .ok_or_else(|| Error::Parse(format!("digest is not sha256-prefixed: {s}")))?;
+            if hex.len() != 64 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+                return Err(Error::Parse(format!(
+                    "digest is not 64 hex chars: {hex}"
+                )));
+            }
+            Ok(hex.to_ascii_lowercase())
+        }
+
+        /// Fetch the latest release and decide whether it's newer than
+        /// the running build.
+        pub fn fetch_latest() -> Result<CheckOutcome, Error> {
+            let json = fetch_json(RELEASES_API)?;
+            let release = parse_release(&json)?;
+            Ok(if release.version > *current_version() {
+                CheckOutcome::Newer(release)
+            } else {
+                CheckOutcome::UpToDate
+            })
+        }
+
+        // ─── Verification + extraction ───────────────────────────────
+
+        fn sha256_of_file(path: &Path) -> Result<String, Error> {
+            let mut hasher = Sha256::new();
+            let mut file = std::fs::File::open(path)
+                .map_err(|e| Error::Io(format!("open {}: {e}", path.display())))?;
+            let mut buf = vec![0u8; 64 * 1024];
+            loop {
+                let n = file
+                    .read(&mut buf)
+                    .map_err(|e| Error::Io(format!("read {}: {e}", path.display())))?;
+                if n == 0 {
+                    break;
+                }
+                hasher.update(&buf[..n]);
+            }
+            let digest = hasher.finalize();
+            Ok(digest.iter().map(|b| format!("{b:02x}")).collect())
+        }
+
+        fn unzip(zip: &Path, into: &Path) -> Result<(), Error> {
+            let status = std::process::Command::new("/usr/bin/unzip")
+                .arg("-q")
+                .arg(zip)
+                .arg("-d")
+                .arg(into)
+                .status()
+                .map_err(|e| Error::Unpack(format!("spawn unzip: {e}")))?;
+            if !status.success() {
+                return Err(Error::Unpack(format!(
+                    "unzip exited with {status}"
+                )));
+            }
+            Ok(())
+        }
+
+        fn strip_quarantine(path: &Path) {
+            // Best-effort. The attribute may not be present, which is
+            // fine — `xattr` returns non-zero in that case but we don't
+            // care.
+            let _ = std::process::Command::new("/usr/bin/xattr")
+                .arg("-dr")
+                .arg("com.apple.quarantine")
+                .arg(path)
+                .status();
+        }
+
+        fn validate_staged_bundle(staged: &Path) -> Result<(), Error> {
+            let must_exist: [(&str, &str); 3] = [
+                ("Contents/MacOS/konstantin-tray", "tray binary"),
+                ("Contents/Resources/screentimed", "daemon binary"),
+                (
+                    "Contents/Library/LaunchDaemons/com.gitopolis.screentimed.plist",
+                    "LaunchDaemon plist",
+                ),
+            ];
+            for (rel, label) in must_exist {
+                let p = staged.join(rel);
+                let meta = std::fs::metadata(&p).map_err(|e| {
+                    Error::BadStagedBundle(format!("{label} missing at {}: {e}", p.display()))
+                })?;
+                if meta.len() == 0 {
+                    return Err(Error::BadStagedBundle(format!(
+                        "{label} at {} is empty",
+                        p.display()
+                    )));
+                }
+            }
+            Ok(())
+        }
+
+        // ─── Privileged install script ───────────────────────────────
+
+        /// Build the bash script that does the swap-with-rollback in
+        /// one elevation. Exit codes:
+        ///
+        ///   0   — success, new version live
+        ///  10/11 — bundle move failed before any state change of note
+        ///         (prior version still in place, no rollback needed)
+        ///  20–23 — install or daemon-bootstrap failed; rollback
+        ///         already ran inside this same elevation
+        ///  50    — catastrophic: rollback itself couldn't restore
+        ///         the bundle. Rare. The script writes the reason to
+        ///         stderr in every non-zero case.
+        fn build_install_script(staged: &Path, dest_bundle: &Path) -> String {
+            // Reuse the project's quote helper. `config_ui::shell_quote`
+            // wraps a path in `'…'` and escapes any embedded single
+            // quotes.
+            let bundle_q = super::config_ui::shell_quote(dest_bundle);
+            let staged_q = super::config_ui::shell_quote(staged);
+            format!(
+                r#"set -u
+BUNDLE={bundle}
+STAGED={staged}
+BACKUP="${{BUNDLE}}.update-backup-$$"
+PLIST=/Library/LaunchDaemons/com.gitopolis.screentimed.plist
+SOCK=/var/run/screentimed.sock
+
+wait_for_daemon_exit() {{
+  for _ in $(seq 1 40); do
+    if ! pgrep -x screentimed >/dev/null 2>&1; then return 0; fi
+    sleep 0.25
+  done
+  pkill -KILL -x screentimed 2>/dev/null || true
+  sleep 0.5
+}}
+
+restore_backup() {{
+  launchctl bootout system/com.gitopolis.screentimed 2>/dev/null || true
+  wait_for_daemon_exit
+  rm -rf "$BUNDLE"
+  mv "$BACKUP" "$BUNDLE" || exit 50
+  install -m 755 "$BUNDLE/Contents/Resources/screentimed" /usr/local/libexec/screentimed || true
+  install -m 644 "$BUNDLE/Contents/Library/LaunchDaemons/com.gitopolis.screentimed.plist" "$PLIST" || true
+  launchctl bootstrap system "$PLIST" || true
+}}
+
+mv "$BUNDLE" "$BACKUP" || {{ echo "couldn't move existing bundle aside" >&2; exit 10; }}
+if ! mv "$STAGED" "$BUNDLE"; then
+  echo "couldn't move new bundle into place" >&2
+  mv "$BACKUP" "$BUNDLE" || true
+  exit 11
+fi
+
+install -m 755 "$BUNDLE/Contents/Resources/screentimed" /usr/local/libexec/screentimed \
+  || {{ restore_backup; echo "could not install daemon binary" >&2; exit 20; }}
+install -m 644 "$BUNDLE/Contents/Library/LaunchDaemons/com.gitopolis.screentimed.plist" "$PLIST" \
+  || {{ restore_backup; echo "could not install LaunchDaemon plist" >&2; exit 21; }}
+printf '%s\n' "$BUNDLE" > /etc/screentimed/bundle_path
+
+launchctl bootout system/com.gitopolis.screentimed 2>/dev/null || true
+# `bootout` is async on macOS Tahoe — it returns 0 while the daemon
+# lingers for several seconds. We need it gone before `bootstrap`,
+# otherwise launchd treats the new instance as a duplicate and the
+# probe below would race against the old daemon's still-open socket.
+# Same pattern as `enforcement::force_logout` (decision #1).
+wait_for_daemon_exit
+
+if ! launchctl bootstrap system "$PLIST"; then
+  restore_backup
+  echo "launchctl bootstrap failed" >&2
+  exit 22
+fi
+
+# Probe the new daemon's socket. `nc -z -U` is broken for Unix-domain
+# sockets on macOS BSD netcat — it returns 1 even on a successful
+# connect (the `-z` flag is TCP-only despite the man page). Use plain
+# `nc -U "$SOCK" </dev/null`: connect, send EOF, exit 0 on success.
+READY=0
+for i in $(seq 1 80); do
+  if [ -S "$SOCK" ] && nc -U "$SOCK" </dev/null >/dev/null 2>&1; then
+    READY=1; break
+  fi
+  sleep 0.25
+done
+if [ "$READY" != "1" ]; then
+  restore_backup
+  echo "new daemon did not become reachable on $SOCK within 20s" >&2
+  exit 23
+fi
+
+rm -rf "$BACKUP"
+exit 0"#,
+                bundle = bundle_q,
+                staged = staged_q,
+            )
+        }
+
+        /// Map the script's exit code (extracted from osascript stderr)
+        /// to a user-facing message. osascript reports the bash exit
+        /// code in its error string as `Konstantin got an error: <msg>
+        /// (<code>)`. We grep for the trailing `(N)`.
+        fn exit_code_from_stderr(stderr: &str) -> Option<i32> {
+            let last_paren = stderr.rfind('(')?;
+            let close = stderr[last_paren..].find(')')?;
+            let inner = &stderr[last_paren + 1..last_paren + close];
+            inner.trim().parse().ok()
+        }
+
+        fn classify_failure(stderr: &str) -> (&'static str, String) {
+            // Pull a trailing `\n`-terminated line for "Details: …".
+            let detail = stderr.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("");
+            match exit_code_from_stderr(stderr) {
+                Some(10 | 11) => (
+                    "Update Failed",
+                    format!(
+                        "Could not install the update. The previous version is still active.\n\n\
+                         Details: {detail}"
+                    ),
+                ),
+                Some(20 | 21 | 22 | 23) => (
+                    "Update Failed",
+                    format!(
+                        "The new version did not start; rolled back to the previous version.\n\n\
+                         Details: {detail}"
+                    ),
+                ),
+                Some(50) => (
+                    "Update Failed",
+                    "Konstantin's bundle is missing — the rollback did not complete. \
+                     Reinstall via Homebrew (`brew reinstall --cask konstantin`) or \
+                     download the latest release from GitHub."
+                        .to_string(),
+                ),
+                _ => (
+                    "Update Failed",
+                    format!("Unexpected error during install.\n\nDetails: {detail}"),
+                ),
+            }
+        }
+
+        // ─── Top-level flows ─────────────────────────────────────────
+
+        /// Click handler for "Check for Updates…". Runs the GitHub
+        /// fetch on a worker thread under a progress panel; on result,
+        /// shows the appropriate alert and (on `Newer`) either kicks
+        /// off the install or stashes the release for later via
+        /// `morphed_for_later`.
+        ///
+        /// `morphed_for_later` is invoked on the main thread with the
+        /// release if the user clicked "Later" — that's where the
+        /// caller installs the morphed-menu-item title.
+        pub fn run_check_for_updates_flow(
+            mtm: MainThreadMarker,
+            paths: &bundle::Paths,
+            morphed_for_later: impl FnOnce(Release),
+        ) {
+            // Refuse to update from a dev tree or an unsupported arch.
+            if matches!(paths.source, bundle::Source::DevTree) {
+                alerts::message(
+                    mtm,
+                    "Updates Disabled",
+                    "Konstantin is running from a developer build. \
+                     Use `cargo build` and `packaging/build-app.sh` \
+                     to produce a fresh bundle.",
+                );
+                return;
+            }
+            if current_arch_label().is_none() {
+                alerts::message(
+                    mtm,
+                    "Updates Disabled",
+                    "This Mac's architecture isn't supported by the current release pipeline.",
+                );
+                return;
+            }
+
+            let result = progress::run_with_panel(
+                mtm,
+                "Checking for Updates",
+                "Looking for a newer version of Konstantin…",
+                "konstantin-tray-update-check",
+                fetch_latest,
+            );
+
+            match result {
+                Ok(CheckOutcome::UpToDate) => {
+                    alerts::message(
+                        mtm,
+                        "You're Up to Date",
+                        &format!("Konstantin {} is the latest.", current_version()),
+                    );
+                }
+                Ok(CheckOutcome::Newer(release)) => {
+                    let proceed = alerts::confirm(
+                        mtm,
+                        "Update Available",
+                        &format!("Konstantin {} is available.", release.version),
+                        &format!("Update to {}", release.version),
+                        "Later",
+                    );
+                    if proceed {
+                        run_install_flow(mtm, paths, &release);
+                    } else {
+                        morphed_for_later(release);
+                    }
+                }
+                Err(e) => {
+                    alerts::message(
+                        mtm,
+                        "Couldn't Check for Updates",
+                        &format!("{e}"),
+                    );
+                }
+            }
+        }
+
+        /// Download → verify → unpack → privileged re-install →
+        /// auto-relaunch. On failure the privileged script either keeps
+        /// the prior version in place (errors before the rollback path)
+        /// or self-rolls back (errors during install). We just translate
+        /// the exit code into a user message.
+        pub fn run_install_flow(
+            mtm: MainThreadMarker,
+            paths: &bundle::Paths,
+            release: &Release,
+        ) {
+            let Some(bundle_root) = paths.bundle_root.clone() else {
+                alerts::message(
+                    mtm,
+                    "Updates Disabled",
+                    "Couldn't determine the install location.",
+                );
+                return;
+            };
+
+            // 1. Working dir + RAII cleanup.
+            let work_dir = std::env::temp_dir()
+                .join(format!("konstantin-update-{}", std::process::id()));
+            let _wd_guard = WorkDirGuard(work_dir.clone());
+            if let Err(e) = std::fs::create_dir_all(&work_dir) {
+                alerts::message(
+                    mtm,
+                    "Update Failed",
+                    &format!("Couldn't create temporary directory: {e}"),
+                );
+                return;
+            }
+
+            let zip_path = work_dir.join(&release.asset_name);
+            let asset_url = release.asset_url.clone();
+            let zp = zip_path.clone();
+
+            // 2. Download under a progress panel.
+            let download_result = progress::run_with_panel(
+                mtm,
+                "Downloading Update",
+                &format!("Fetching Konstantin {}…", release.version),
+                "konstantin-tray-update-download",
+                move || -> Result<(), Error> { download_to(&asset_url, &zp) },
+            );
+            if let Err(e) = download_result {
+                alerts::message(mtm, "Download Failed", &format!("{e}"));
+                return;
+            }
+
+            // 3. Verify SHA-256 against the digest GitHub returned in
+            // the API response (same hash shown on the release page).
+            let actual = match sha256_of_file(&zip_path) {
+                Ok(h) => h,
+                Err(e) => {
+                    alerts::message(mtm, "Update Failed", &format!("{e}"));
+                    return;
+                }
+            };
+            if actual != release.asset_sha256 {
+                tracing::warn!(
+                    expected = %release.asset_sha256,
+                    actual = %actual,
+                    "sha256 mismatch"
+                );
+                alerts::message(
+                    mtm,
+                    "Update Failed",
+                    "Checksum mismatch — refusing to install.",
+                );
+                return;
+            }
+
+            // 4. Unpack.
+            let staged_root = work_dir.join("unpacked");
+            if let Err(e) = std::fs::create_dir_all(&staged_root) {
+                alerts::message(
+                    mtm,
+                    "Update Failed",
+                    &format!("Couldn't create unpack directory: {e}"),
+                );
+                return;
+            }
+            if let Err(e) = unzip(&zip_path, &staged_root) {
+                alerts::message(mtm, "Update Failed", &format!("{e}"));
+                return;
+            }
+
+            // 5. Strip quarantine + 6. sanity-check the staged bundle.
+            let staged_app = staged_root.join("Konstantin.app");
+            strip_quarantine(&staged_app);
+            if let Err(e) = validate_staged_bundle(&staged_app) {
+                alerts::message(mtm, "Update Failed", &format!("{e}"));
+                return;
+            }
+
+            // 7. Privileged install with self-rollback.
+            let script = build_install_script(&staged_app, &bundle_root);
+            match admin::run_with_progress(
+                mtm,
+                "Installing Update",
+                &format!("Installing Konstantin {}…", release.version),
+                &script,
+            ) {
+                Ok(()) => {
+                    // 8. Relaunch the freshly installed tray.
+                    let new_tray = bundle_root.join("Contents/MacOS/konstantin-tray");
+                    match std::process::Command::new(&new_tray).spawn() {
+                        Ok(_) => {
+                            tracing::info!(
+                                new = %new_tray.display(),
+                                "spawned new tray; terminating self"
+                            );
+                            // Drop the work dir before terminate so
+                            // cleanup actually happens.
+                            drop(_wd_guard);
+                            NSApplication::sharedApplication(mtm).terminate(None);
+                        }
+                        Err(e) => {
+                            // Install succeeded but we couldn't spawn —
+                            // tell the user to relaunch manually.
+                            alerts::message(
+                                mtm,
+                                "Update Installed",
+                                &format!(
+                                    "The update is installed but the tray couldn't relaunch \
+                                     automatically. Please reopen Konstantin from \
+                                     Applications.\n\nDetails: {e}"
+                                ),
+                            );
+                        }
+                    }
+                }
+                Err(admin::Error::Cancelled) => {
+                    // Silent — matches the rest of the codebase.
+                }
+                Err(admin::Error::Failed(stderr)) => {
+                    // Full stderr is what diagnoses a failed update —
+                    // log it before classifying down to a one-line
+                    // alert so the operator can find the cause in
+                    // `/tmp/konstantin-tray.err.log`.
+                    tracing::error!(stderr = %stderr, "update install script failed");
+                    let (title, body) = classify_failure(&stderr);
+                    alerts::message(mtm, title, &body);
+                }
+            }
+        }
+
+        // ─── RAII cleanup ────────────────────────────────────────────
+
+        struct WorkDirGuard(PathBuf);
+        impl Drop for WorkDirGuard {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        // ─── Tests ───────────────────────────────────────────────────
+
+        #[cfg(test)]
+        mod tests {
+            use super::*;
+
+            #[test]
+            fn arch_mapping() {
+                // We can't test all branches at runtime — but we can
+                // assert the live host maps to a known label or None.
+                let label = current_arch_label();
+                assert!(matches!(label, None | Some("arm64") | Some("x86_64")));
+            }
+
+            #[test]
+            fn canonical_url_shape() {
+                let url = canonical_url("v0.1.2", "Konstantin-0.1.2-arm64.zip");
+                assert_eq!(
+                    url,
+                    "https://github.com/gitopolis/konstantin/releases/download/v0.1.2/Konstantin-0.1.2-arm64.zip"
+                );
+            }
+
+            #[test]
+            fn rejects_non_canonical_url() {
+                assert!(!is_canonical(
+                    "https://evil.example/foo.zip",
+                    "v0.1.2",
+                    "Konstantin-0.1.2-arm64.zip"
+                ));
+                assert!(is_canonical(
+                    "https://github.com/gitopolis/konstantin/releases/download/v0.1.2/Konstantin-0.1.2-arm64.zip",
+                    "v0.1.2",
+                    "Konstantin-0.1.2-arm64.zip"
+                ));
+            }
+
+            #[test]
+            fn parses_release_payload() {
+                let json = serde_json::json!({
+                    "tag_name": "v0.1.2",
+                    "assets": [
+                        {
+                            "name": "Konstantin-0.1.2-arm64.zip",
+                            "browser_download_url":
+                                "https://github.com/gitopolis/konstantin/releases/download/v0.1.2/Konstantin-0.1.2-arm64.zip",
+                            "digest": "sha256:dbf5dc5e283847541da9d2222d40951109c59fd5eab277ab03138b226179b5ad"
+                        }
+                    ]
+                });
+                // Test under the assumption we're on arm64 — skip on
+                // hosts where we can't get an arch label.
+                let Some(arch) = current_arch_label() else {
+                    return;
+                };
+                if arch != "arm64" {
+                    return;
+                }
+                let r = parse_release(&json).unwrap();
+                assert_eq!(r.version, Version::new(0, 1, 2));
+                assert_eq!(r.asset_name, "Konstantin-0.1.2-arm64.zip");
+                assert!(r.asset_url.contains("Konstantin-0.1.2-arm64.zip"));
+                assert_eq!(
+                    r.asset_sha256,
+                    "dbf5dc5e283847541da9d2222d40951109c59fd5eab277ab03138b226179b5ad"
+                );
+            }
+
+            #[test]
+            fn rejects_payload_without_digest() {
+                let json = serde_json::json!({
+                    "tag_name": "v0.1.2",
+                    "assets": [
+                        {
+                            "name": "Konstantin-0.1.2-arm64.zip",
+                            "browser_download_url":
+                                "https://github.com/gitopolis/konstantin/releases/download/v0.1.2/Konstantin-0.1.2-arm64.zip"
+                        }
+                    ]
+                });
+                let Some(arch) = current_arch_label() else {
+                    return;
+                };
+                if arch != "arm64" {
+                    return;
+                }
+                assert!(matches!(parse_release(&json), Err(Error::Parse(_))));
+            }
+
+            #[test]
+            fn parses_digest() {
+                assert_eq!(
+                    parse_digest(
+                        "sha256:DBF5DC5E283847541DA9D2222D40951109C59FD5EAB277AB03138B226179B5AD"
+                    )
+                    .unwrap(),
+                    "dbf5dc5e283847541da9d2222d40951109c59fd5eab277ab03138b226179b5ad"
+                );
+                assert!(parse_digest("md5:abcd").is_err());
+                assert!(parse_digest("sha256:tooshort").is_err());
+                assert!(parse_digest("").is_err());
+            }
+
+            #[test]
+            fn exit_code_from_known_stderr() {
+                let s = "Konstantin got an error: bad bundle (22)";
+                assert_eq!(exit_code_from_stderr(s), Some(22));
+                let s = "couldn't move existing bundle aside\nKonstantin got an error: do shell script: ... (10)\n";
+                assert_eq!(exit_code_from_stderr(s), Some(10));
+                assert_eq!(exit_code_from_stderr(""), None);
+            }
+
+            #[test]
+            fn classify_picks_right_message() {
+                let (t, b) = classify_failure("...failed: bootstrap (22)\n");
+                assert_eq!(t, "Update Failed");
+                assert!(b.contains("rolled back"));
+                let (_, b) = classify_failure("...mv aside (10)\n");
+                assert!(b.contains("previous version is still active"));
+                let (_, b) = classify_failure("...catastrophe (50)\n");
+                assert!(b.contains("Reinstall"));
+            }
         }
     }
 

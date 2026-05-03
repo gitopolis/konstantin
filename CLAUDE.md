@@ -179,7 +179,34 @@ These were Nikita's choices; revisit explicitly before changing them.
     time; disconnected shows the gray glyph alone. Detection is the
     worker's `disconnected` flag, driven by socket-connect success.
 
-## What's already built (phases 1–7 + A1–A7)
+11. **Updates: GitHub Releases, sha256-verified, in-place.** The
+    `Check for Updates…` menu action calls
+    `api.github.com/repos/gitopolis/konstantin/releases/latest`,
+    looks up the asset matching the running architecture
+    (`Konstantin-<version>-<arch>.zip`), reads the SHA-256 from the
+    API's per-asset `digest` field (`"sha256:<hex>"` — the same hash
+    GitHub displays on the release page; we don't ship a separate
+    sidecar), streams the zip to a per-pid temp dir, verifies the
+    hash, unzips, strips the quarantine attribute, and runs one
+    privileged bash script via `admin::run_with_progress` that swaps
+    the bundle in place at `bundle::Paths::resolve()?.bundle_root`
+    (NOT a hardcoded `/Applications/...` — works for any install
+    location). The script self-rolls back if the new daemon doesn't
+    open `/var/run/screentimed.sock` within 20 seconds of `launchctl
+    bootstrap`, all inside the same elevation, so the user types
+    their admin password once even when something fails. Distinct
+    exit codes (10/11 → no state change, 20–23 → rollback already
+    ran, 50 → catastrophic) drive matching alert messages. After a
+    successful install the running tray spawns the new tray binary
+    out of the freshly installed bundle and `terminate:`s itself.
+    Architecture mapping (`aarch64`→`arm64`, `x86_64`→`x86_64`) is
+    kept in `update::current_arch_label` — a single point of agreement
+    with release.yml's matrix `arch:` field. Only canonical URLs
+    matching the expected `releases/download/<tag>/<filename>` shape
+    are trusted. Dev-tree runs (`bundle::Source::DevTree`) refuse to
+    update — the operator runs `cargo build` instead.
+
+## What's already built (phases 1–7 + A1–A9)
 
 * **Phase 1** — proto + framing + peer-creds auth, `GetStatus` returns
   real status from current state.
@@ -267,6 +294,19 @@ These were Nikita's choices; revisit explicitly before changing them.
     the Configure window actually steals focus from the previously
     frontmost app. `NSApplication::activate()` is cooperative on
     macOS 14+ and isn't sufficient for accessory apps.
+* **A9** — in-app updater (`mod update` + `Check for Updates…` menu
+  item). Driven by `env!("CARGO_PKG_VERSION")` (CI runs `cargo
+  set-version --workspace "$VERSION"` before each release build, so
+  the value baked into a tagged binary is always correct). The
+  privileged `admin::run_with_progress` core was extracted into a
+  reusable `progress::run_with_panel<T>` primitive that takes an
+  arbitrary closure — the updater uses it twice (the unprivileged
+  download phase and as the indirection underneath
+  `admin::run_with_progress`). New deps: `ureq` (rustls-backed,
+  blocking HTTP), `sha2` (digest verification), `semver` (version
+  comparison). Asset SHA-256 is read straight from the GitHub API's
+  per-asset `digest` field — no sidecar files in the release. See
+  decision #11 for the full design.
 
 Tests, unsafe-block count: both will drift. The CI signal is
 `cargo test --workspace` clean. Don't pin counts here — they
