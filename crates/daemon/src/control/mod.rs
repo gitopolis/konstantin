@@ -10,41 +10,8 @@ pub mod xpc;
 
 use crate::config::Config;
 use anyhow::{Context, Result};
-use serde::{Deserialize, Serialize};
+use konstantin_proto::admin::{AdminRequest, AdminResponse};
 use std::path::{Path, PathBuf};
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum AdminRequest {
-    GetConfig,
-    ValidateConfig { toml: String },
-    SetConfig { toml: String },
-    ReloadDaemon,
-    GetEnforcementState,
-    SetEnforcementPaused { paused: bool },
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum AdminResponse {
-    Config {
-        toml: String,
-        enforcement_paused: bool,
-        kill_switch_path: PathBuf,
-    },
-    ValidationOk,
-    EnforcementState {
-        paused: bool,
-        kill_switch_path: PathBuf,
-    },
-    Ok,
-    Unauthorized {
-        reason: String,
-    },
-    Error {
-        message: String,
-    },
-}
 
 pub struct Controller {
     config_path: PathBuf,

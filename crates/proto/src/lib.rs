@@ -13,6 +13,8 @@
 //! `Request::Subscribe` the daemon keeps the connection open and pushes
 //! `Response::StatusUpdate` frames whenever the user's status changes.
 
+pub mod admin;
+
 use chrono::{DateTime, Local};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;

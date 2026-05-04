@@ -6,75 +6,12 @@
 
 #![allow(dead_code)]
 
-use super::{auth, AdminRequest, AdminResponse, Controller};
+use super::{auth, Controller};
 use anyhow::{Context, Result};
-use serde::{Deserialize, Serialize};
-
-pub const MACH_SERVICE_NAME: &str = "com.gitopolis.screentimed.control";
-pub const TRAY_SIGNING_IDENTIFIER: &str = "com.gitopolis.konstantin";
-
-pub const KEY_VERSION: &str = "version";
-pub const KEY_REQUEST_ID: &str = "request_id";
-pub const KEY_OK: &str = "ok";
-pub const KEY_PAYLOAD_JSON: &str = "payload_json";
-pub const KEY_ERROR: &str = "error";
-
-pub const PROTOCOL_VERSION: u64 = 1;
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct RequestEnvelope {
-    pub version: u64,
-    pub request_id: String,
-    pub request: AdminRequest,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ResponseEnvelope {
-    pub version: u64,
-    pub request_id: String,
-    pub response: AdminResponse,
-}
-
-impl RequestEnvelope {
-    pub fn new(request_id: impl Into<String>, request: AdminRequest) -> Self {
-        Self {
-            version: PROTOCOL_VERSION,
-            request_id: request_id.into(),
-            request,
-        }
-    }
-
-    pub fn to_json(&self) -> Result<String> {
-        serde_json::to_string(self).context("serializing admin XPC request envelope")
-    }
-
-    pub fn from_json(json: &str) -> Result<Self> {
-        let env: Self = serde_json::from_str(json).context("parsing admin XPC request envelope")?;
-        ensure_protocol_version(env.version)?;
-        Ok(env)
-    }
-}
-
-impl ResponseEnvelope {
-    pub fn new(request_id: impl Into<String>, response: AdminResponse) -> Self {
-        Self {
-            version: PROTOCOL_VERSION,
-            request_id: request_id.into(),
-            response,
-        }
-    }
-
-    pub fn to_json(&self) -> Result<String> {
-        serde_json::to_string(self).context("serializing admin XPC response envelope")
-    }
-
-    pub fn from_json(json: &str) -> Result<Self> {
-        let env: Self =
-            serde_json::from_str(json).context("parsing admin XPC response envelope")?;
-        ensure_protocol_version(env.version)?;
-        Ok(env)
-    }
-}
+use konstantin_proto::admin::{
+    AdminResponse, RequestEnvelope, ResponseEnvelope, KEY_OK, KEY_PAYLOAD_JSON, MACH_SERVICE_NAME,
+    TRAY_SIGNING_IDENTIFIER,
+};
 
 pub fn handle_request_json(
     controller: &Controller,
@@ -108,13 +45,6 @@ pub fn handle_request_json(
             })
         }
     }
-}
-
-fn ensure_protocol_version(version: u64) -> Result<()> {
-    if version != PROTOCOL_VERSION {
-        anyhow::bail!("unsupported admin XPC protocol version {version}");
-    }
-    Ok(())
 }
 
 #[cfg(target_os = "macos")]
@@ -447,6 +377,7 @@ fn error_response_json(message: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use konstantin_proto::admin::{AdminRequest, KEY_REQUEST_ID};
     use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
 
