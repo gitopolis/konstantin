@@ -79,6 +79,7 @@ impl Controller {
             }
             AdminRequest::ReloadDaemon => {
                 Config::load(&self.config_path)?;
+                self.kickstart_daemon_after_reply();
                 Ok(AdminResponse::Ok)
             }
             AdminRequest::GetEnforcementState => {
@@ -553,6 +554,18 @@ daily_limit_minutes = 120
 
         assert!(matches!(resp, AdminResponse::Error { .. }));
         assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+    }
+
+    #[test]
+    fn reload_validates_current_config() {
+        let dir = tempdir("reload");
+        let path = dir.join("config.toml");
+        std::fs::write(&path, config_text(&dir)).unwrap();
+        let controller = Controller::new(path);
+
+        let resp = controller.handle(&allowed_operator(), AdminRequest::ReloadDaemon);
+
+        assert!(matches!(resp, AdminResponse::Ok));
     }
 
     #[test]

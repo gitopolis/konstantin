@@ -51,7 +51,7 @@ mod imp {
     use konstantin_tray::{default_socket_path, format_remaining, Subscription};
     use std::ptr::NonNull;
     use std::sync::{Arc, Mutex};
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
     use tracing_subscriber::EnvFilter;
 
     /// How often the main-thread drain timer reads from the worker. 5 Hz
@@ -82,6 +82,8 @@ mod imp {
         /// configured `kill_switch_path`). `None` until the operator
         /// uses the Pause/Unpause action in this process.
         enforcement_paused: Option<bool>,
+        enforcement_refreshing: bool,
+        enforcement_last_refresh: Option<Instant>,
     }
 
     impl Default for Latest {
@@ -93,6 +95,8 @@ mod imp {
                 disconnected: true,
                 pending_update: None,
                 enforcement_paused: None,
+                enforcement_refreshing: false,
+                enforcement_last_refresh: None,
             }
         }
     }
@@ -104,7 +108,7 @@ mod imp {
     struct Tray {
         status_item: Retained<NSStatusItem>,
         pause_enforcement_item: Retained<NSMenuItem>,
-        restart_item: Retained<NSMenuItem>,
+        reload_item: Retained<NSMenuItem>,
         updates_item: Retained<NSMenuItem>,
     }
 
@@ -212,16 +216,16 @@ mod imp {
 
         let pause_enforcement_item =
             make_action_item(mtm, "Pause Enforcement", sel!(toggleEnforcement:), controller);
-        let restart_item =
-            make_action_item(mtm, "Restart Daemon", sel!(restartDaemon:), controller);
+        let reload_item =
+            make_action_item(mtm, "Reload Configuration", sel!(reloadConfiguration:), controller);
 
         // Initial enable-state matches the default `disconnected: true`
         // — daemon-mediated controls wait until the worker reports back.
         pause_enforcement_item.setEnabled(false);
-        restart_item.setEnabled(false);
+        reload_item.setEnabled(false);
 
         menu.addItem(&pause_enforcement_item);
-        menu.addItem(&restart_item);
+        menu.addItem(&reload_item);
 
         menu.addItem(&NSMenuItem::separatorItem(mtm));
 
@@ -268,7 +272,7 @@ mod imp {
         Tray {
             status_item: item,
             pause_enforcement_item,
-            restart_item,
+            reload_item,
             updates_item,
         }
     }
@@ -318,7 +322,11 @@ mod imp {
             let mut sub = match Subscription::open(&socket).await {
                 Ok(s) => {
                     tracing::info!(path = %socket.display(), "subscribed to daemon");
-                    latest.lock().expect("latest").disconnected = false;
+                    let mut g = latest.lock().expect("latest");
+                    g.disconnected = false;
+                    g.enforcement_paused = None;
+                    g.enforcement_last_refresh = None;
+                    drop(g);
                     s
                 }
                 Err(e) => {
@@ -379,13 +387,14 @@ mod imp {
             // current value is a no-op in AppKit, so calling every
             // tick is fine.
             tray.pause_enforcement_item.setEnabled(!disconnected);
-            tray.restart_item.setEnabled(!disconnected);
+            tray.reload_item.setEnabled(!disconnected);
             let pause_title = match enforcement_paused {
                 Some(true) => "Unpause Enforcement",
                 _ => "Pause Enforcement",
             };
             tray.pause_enforcement_item
                 .setTitle(&NSString::from_str(pause_title));
+            maybe_refresh_enforcement_state(latest.clone(), disconnected);
 
             // Updater menu item morph. AppKit's `setTitle` is also
             // idempotent — comparing first would just be book-keeping.
@@ -414,6 +423,63 @@ mod imp {
         // by `RcBlock`, and the run loop retains the returned timer for us.
         unsafe {
             NSTimer::scheduledTimerWithTimeInterval_repeats_block(interval, true, &block);
+        }
+    }
+
+    const ENFORCEMENT_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
+
+    fn maybe_refresh_enforcement_state(latest: Arc<Mutex<Latest>>, disconnected: bool) {
+        if disconnected {
+            return;
+        }
+
+        let should_spawn = {
+            let mut g = latest.lock().expect("latest mutex");
+            if g.enforcement_refreshing {
+                false
+            } else {
+                let due = g
+                    .enforcement_last_refresh
+                    .map(|last| last.elapsed() >= ENFORCEMENT_REFRESH_INTERVAL)
+                    .unwrap_or(true);
+                if due {
+                    g.enforcement_refreshing = true;
+                    true
+                } else {
+                    false
+                }
+            }
+        };
+
+        if !should_spawn {
+            return;
+        }
+
+        std::thread::Builder::new()
+            .name("konstantin-enforcement-refresh".into())
+            .spawn(move || {
+                let refreshed = query_enforcement_paused();
+                let mut g = latest.lock().expect("latest mutex");
+                g.enforcement_refreshing = false;
+                g.enforcement_last_refresh = Some(Instant::now());
+                match refreshed {
+                    Ok(paused) => {
+                        g.enforcement_paused = Some(paused);
+                    }
+                    Err(e) => {
+                        tracing::debug!(error = %e, "enforcement state refresh failed");
+                    }
+                }
+            })
+            .expect("spawning enforcement refresh thread");
+    }
+
+    fn query_enforcement_paused() -> Result<bool> {
+        match AdminClient::send(AdminRequest::GetEnforcementState)? {
+            AdminResponse::EnforcementState { paused, .. } => Ok(paused),
+            AdminResponse::Unauthorized { reason } => anyhow::bail!("Not authorized: {reason}"),
+            AdminResponse::Error { message } => anyhow::bail!("{message}"),
+            other => anyhow::bail!("unexpected admin response: {other:?}"),
         }
     }
 
@@ -654,20 +720,10 @@ mod imp {
                     toggle_enforcement(mtm);
                 }
 
-                #[unsafe(method(restartDaemon:))]
-                fn restart_daemon_action(&self, _sender: Option<&AnyObject>) {
+                #[unsafe(method(reloadConfiguration:))]
+                fn reload_configuration_action(&self, _sender: Option<&AnyObject>) {
                     let mtm = MainThreadMarker::from(self);
-                    // Cover both "loaded" and "not loaded" entry states.
-                    // `bootstrap || true` makes the loaded-already case
-                    // silent. `kickstart -k` then restarts unconditionally.
-                    run_admin(
-                        mtm,
-                        "Restarting Daemon",
-                        "Restarting Konstantin…",
-                        "(launchctl bootstrap system /Library/LaunchDaemons/com.gitopolis.screentimed.plist || true) && \
-                         launchctl kickstart -k system/com.gitopolis.screentimed",
-                        "Couldn't restart Konstantin.",
-                    );
+                    reload_configuration(mtm);
                 }
 
                 #[unsafe(method(configure:))]
@@ -702,23 +758,6 @@ mod imp {
             }
         }
 
-        /// Common shape for "run privileged command, alert on failure".
-        fn run_admin(
-            mtm: MainThreadMarker,
-            panel_title: &str,
-            panel_message: &str,
-            bash_command: &str,
-            failure_title: &str,
-        ) {
-            match admin::run_with_progress(mtm, panel_title, panel_message, bash_command) {
-                Ok(()) => {}
-                Err(admin::Error::Cancelled) => {}
-                Err(admin::Error::Failed(msg)) => {
-                    alerts::message(mtm, failure_title, &msg);
-                }
-            }
-        }
-
         fn toggle_enforcement(mtm: MainThreadMarker) {
             let outcome = progress::run_with_panel(
                 mtm,
@@ -726,16 +765,7 @@ mod imp {
                 "Updating Konstantin enforcement…",
                 "konstantin-tray-admin-xpc",
                 || -> Result<bool> {
-                    let state = AdminClient::send(AdminRequest::GetEnforcementState)?;
-                    let paused = match state {
-                        AdminResponse::EnforcementState { paused, .. } => paused,
-                        AdminResponse::Unauthorized { reason } => {
-                            anyhow::bail!("Not authorized: {reason}");
-                        }
-                        AdminResponse::Error { message } => anyhow::bail!("{message}"),
-                        other => anyhow::bail!("unexpected admin response: {other:?}"),
-                    };
-
+                    let paused = query_enforcement_paused()?;
                     let target = !paused;
                     let changed = AdminClient::send(AdminRequest::SetEnforcementPaused {
                         paused: target,
@@ -759,6 +789,32 @@ mod imp {
                 }
                 Err(e) => {
                     alerts::message(mtm, "Couldn't update enforcement.", &e.to_string());
+                }
+            }
+        }
+
+        fn reload_configuration(mtm: MainThreadMarker) {
+            let outcome = progress::run_with_panel(
+                mtm,
+                "Reloading Configuration",
+                "Reloading Konstantin configuration…",
+                "konstantin-tray-admin-xpc",
+                || -> Result<()> {
+                    match AdminClient::send(AdminRequest::ReloadDaemon)? {
+                        AdminResponse::Ok => Ok(()),
+                        AdminResponse::Unauthorized { reason } => {
+                            anyhow::bail!("Not authorized: {reason}");
+                        }
+                        AdminResponse::Error { message } => anyhow::bail!("{message}"),
+                        other => anyhow::bail!("unexpected admin response: {other:?}"),
+                    }
+                },
+            );
+
+            match outcome {
+                Ok(()) => {}
+                Err(e) => {
+                    alerts::message(mtm, "Couldn't reload configuration.", &e.to_string());
                 }
             }
         }

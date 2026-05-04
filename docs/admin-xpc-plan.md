@@ -190,8 +190,9 @@ New flow:
    kill-switch file with root ownership and restrictive mode.
 6. Tray sends `SetEnforcementPaused { paused: false }`.
 7. Daemon removes only the exact configured kill-switch path.
-8. Daemon broadcasts a status/control update so all trays refresh their
-   menu state.
+8. Each connected tray periodically refreshes `GetEnforcementState` while
+   the daemon is reachable, so other admin trays converge on the new menu
+   state without a password prompt.
 
 This avoids fighting `KeepAlive`, keeps the privileged control plane
 available, and reuses the existing safety mechanism operators already
@@ -347,16 +348,16 @@ Add:
 AdminRequest::ReloadDaemon
 ```
 
-Implementation:
+Implemented shape:
 
 * reload `/etc/screentimed/config.toml`;
-* recompute next midnight if needed;
-* update config held by IPC/status/enforcement paths;
-* wake subscribers.
+* reply to the tray;
+* schedule a delayed `launchctl kickstart -k` from inside the root daemon.
 
 Reserve full process restart for upgrades or unrecoverable internal
-state. The menu can say "Reload Configuration" instead of "Restart
-Daemon" if we want the label to match behavior.
+state. The tray menu now says "Reload Configuration" so the label matches
+the operator intent even though the current daemon architecture still uses
+a launchd kickstart to apply the new immutable config clones.
 
 If a true process restart is still needed, use `execve` of the current
 daemon binary or ask launchd to kickstart from inside the root daemon.
@@ -527,16 +528,22 @@ Status: implemented; still needs signed-app manual verification.
 
 Status: partially complete.
 
-* [ ] Replace Restart with `ReloadDaemon` where possible.
+* [x] Replace Restart with `ReloadDaemon` where possible.
+  * The tray menu now calls admin XPC `ReloadDaemon` as `Reload
+    Configuration`. The daemon validates the config, replies, then
+    schedules a delayed launchd kickstart when running against the system
+    config path.
 * [x] Remove routine Start/Stop Daemon menu items.
 * [x] Add Pause Enforcement / Unpause Enforcement menu item backed by
   `GetEnforcementState` and `SetEnforcementPaused`.
-* [~] Reflect the kill-switch state in the menu so every admin tray shows
+* [x] Reflect the kill-switch state in the menu so every admin tray shows
   whether enforcement is currently paused.
-  * The acting tray updates immediately from the XPC response. Other
-    trays will need a control/status broadcast or periodic refresh.
+  * Connected trays poll `GetEnforcementState` every 30 seconds; the
+    acting tray still updates immediately from the XPC response.
 * [ ] Add a daemon status/control field if the tray needs to distinguish
   disconnected/running/enforcement-paused.
+  * Deferred for now because periodic admin-XPC refresh keeps the current
+    menu accurate without changing the public status socket.
 
 ### Phase 6: ServiceManagement first-launch setup
 
