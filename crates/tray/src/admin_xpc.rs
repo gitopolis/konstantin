@@ -5,6 +5,7 @@
 //! main thread.
 
 use anyhow::{Context, Result};
+use block2::{Block, RcBlock};
 use konstantin_proto::admin::{
     AdminRequest, AdminResponse, RequestEnvelope, ResponseEnvelope, KEY_PAYLOAD_JSON,
     MACH_SERVICE_NAME,
@@ -16,6 +17,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 type XpcObject = *mut c_void;
 type XpcConnection = XpcObject;
 type DispatchQueue = *mut c_void;
+type XpcHandlerBlock = Block<dyn Fn(XpcObject)>;
 
 extern "C" {
     fn xpc_connection_create_mach_service(
@@ -27,6 +29,10 @@ extern "C" {
         connection: XpcConnection,
         signing_identifier: *const c_char,
     ) -> i32;
+    fn xpc_connection_set_event_handler(
+        connection: XpcConnection,
+        handler: *mut XpcHandlerBlock,
+    );
     fn xpc_connection_activate(connection: XpcConnection);
     fn xpc_connection_cancel(connection: XpcConnection);
     fn xpc_connection_send_message_with_reply_sync(
@@ -73,6 +79,7 @@ impl AdminClient {
 
 struct Connection {
     raw: XpcConnection,
+    _handler: RcBlock<dyn Fn(XpcObject)>,
 }
 
 impl Connection {
@@ -98,10 +105,18 @@ impl Connection {
             anyhow::bail!("setting admin XPC peer Team ID requirement failed: {peer_req_status}");
         }
 
+        let handler = RcBlock::new(|event: XpcObject| {
+            let _ = event;
+        });
+
         unsafe {
+            xpc_connection_set_event_handler(raw, RcBlock::as_ptr(&handler));
             xpc_connection_activate(raw);
         }
-        Ok(Self { raw })
+        Ok(Self {
+            raw,
+            _handler: handler,
+        })
     }
 
     fn raw(&self) -> XpcConnection {
