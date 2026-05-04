@@ -6,6 +6,7 @@
 #![allow(dead_code)]
 
 pub mod auth;
+pub mod xpc;
 
 use crate::config::Config;
 use anyhow::{Context, Result};

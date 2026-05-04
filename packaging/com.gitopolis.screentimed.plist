@@ -24,6 +24,12 @@
     <key>KeepAlive</key>
     <true/>
 
+    <key>MachServices</key>
+    <dict>
+        <key>com.gitopolis.screentimed.control</key>
+        <true/>
+    </dict>
+
     <key>ProcessType</key>
     <string>Background</string>
 
