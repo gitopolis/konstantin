@@ -370,31 +370,80 @@ Keep the unprivileged parts unchanged:
 
 * check GitHub release;
 * download zip;
-* verify GitHub API `digest` SHA-256;
-* unpack to a per-pid temp dir.
+* verify GitHub API `digest` SHA-256 locally so bad downloads fail before
+  any privileged request.
 
 Replace the privileged `osascript` install script with:
 
 ```rust
 AdminRequest::InstallUpdate {
-    staged_bundle_path,
+    zip_path,
     expected_version,
     expected_sha256,
 }
+
+AdminResponse::UpdateInstallStarted {
+    result_path,
+}
 ```
 
-Daemon-side install script/logic:
+Investigation result: do not make the live daemon perform the whole
+swap. The operation must survive `launchctl bootout
+system/com.gitopolis.screentimed`, and launchd kills leftover processes
+with the same process-group ID as a job unless `AbandonProcessGroup` is
+set. Keep the LaunchDaemon plist strict and instead spawn a dedicated
+updater helper in its own process group.
 
-* validate staged path is under a Konstantin-owned temp parent;
-* validate bundle code signature/notarization before swap;
-* stop/re-register LaunchDaemon through the appropriate path;
-* swap bundle at `bundle::Paths::resolve()?.bundle_root`;
-* verify daemon comes back within the existing 20-second window;
-* rollback with the current distinct exit-code semantics mapped to
-  structured `AdminResponse` errors.
+Recommended shape:
 
-This is a later phase because it is the highest-risk action. Leave
-`osascript` for update install until config/reload/pause are proven.
+1. Add a hidden `konstantin-updater` binary, built from the daemon package
+   or a tiny sibling crate. It has no network/UI responsibilities; it only
+   performs a root-owned local bundle swap and rollback.
+2. Ship it at `Konstantin.app/Contents/Resources/konstantin-updater`.
+   Update `packaging/build-app.sh` and the release workflow so the helper
+   is copied, signed with the same Developer ID identity, notarized as
+   nested code, and included in the zip.
+3. Tray downloads the release zip to a per-pid temp dir and verifies the
+   GitHub `digest` as it does today. It then sends the zip path,
+   expected version, and expected SHA-256 to admin XPC.
+4. Daemon authorizes the operator, recomputes the zip SHA-256, extracts
+   the zip into a root-owned staging directory, validates the bundle
+   layout, validates the signed bundle, checks `Info.plist` version, and
+   resolves the destination bundle from the daemon's own bundle path or
+   `/etc/screentimed/bundle_path` rather than trusting a tray-supplied
+   destination.
+5. Daemon creates a root-owned update work directory plus a root-owned
+   result JSON path readable by the tray, copies or launches the updater
+   helper from a path that will not disappear during the bundle rename,
+   detaches it with `process_group(0)`, and returns
+   `UpdateInstallStarted`.
+6. Tray keeps the progress panel open and polls the result JSON. On
+   success it spawns the new tray from the installed bundle and terminates
+   itself. On failure it maps the structured code/message to the existing
+   user-facing rollback alerts.
+
+Updater helper logic:
+
+* run only as root and reject non-absolute or non-root-owned staging
+  paths;
+* move the current bundle to `<bundle>.update-backup-<pid>`;
+* move the staged `Konstantin.app` into the destination;
+* preserve the current implementation's legacy launchd semantics for the
+  first cut: copy `Contents/Resources/screentimed` to
+  `/usr/local/libexec/screentimed`, write the `/Library/LaunchDaemons`
+  plist with `ProgramArguments = /usr/local/libexec/screentimed`, and
+  write `/etc/screentimed/bundle_path`;
+* bootout `system/com.gitopolis.screentimed`, wait for the old daemon to
+  exit, bootstrap the plist, and verify `/var/run/screentimed.sock`
+  becomes reachable within the existing 20-second window;
+* rollback with the same distinct failure classes as today:
+  10/11 before meaningful state change, 20-23 after rollback, and 50
+  for catastrophic rollback failure.
+
+SMAppService-native update can come later. The first XPC updater should
+preserve the currently shipped update behavior so the only major change
+is "who performs the privileged operation," not the launchd registration
+model at the same time.
 
 ## Uninstall Flow
 
@@ -586,9 +635,11 @@ Status: in progress.
 
 * [ ] Move updater install to daemon-mediated XPC once lower-risk admin
   operations are stable.
-  * Still pending. The updater remains the last routine path that uses
-    `admin::run_with_progress` because it has the highest-risk
-    bundle-swap and rollback semantics.
+  * Investigation complete. Use a detached root `konstantin-updater`
+    helper spawned by the daemon in a new process group; have the tray
+    monitor a structured result file while the helper performs the
+    bundle swap, launchd restart, readiness probe, and rollback.
+    Implementation still pending.
 * [x] Decide whether uninstall remains one prompted `osascript` path or moves
   to XPC.
   * Moved to XPC. The tray confirms locally, then sends
