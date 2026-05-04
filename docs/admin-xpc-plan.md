@@ -513,9 +513,10 @@ com.gitopolis.screentimed.control
   * Tray requires same-Team daemon peer.
 * [x] Extract peer EUID from XPC and feed daemon authorization.
 * [x] Build tray `AdminClient` with request/reply.
-* [ ] Add timeout handling around tray requests.
-  * Current implementation uses `xpc_connection_send_message_with_reply_sync`
-    from a worker thread; it can block if the daemon stalls.
+* [x] Add timeout handling around tray requests.
+  * The synchronous `xpc_connection_send_message_with_reply_sync` call now
+    runs on a bounded request thread. The UI-facing progress worker returns
+    an error if the daemon does not reply within 15 seconds.
 * [ ] Add a signed-build manual test recipe.
 
 ### Phase 4: Configure over XPC
