@@ -22,12 +22,42 @@ pub const PROTOCOL_VERSION: u64 = 1;
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum AdminRequest {
-    GetConfig,
-    ValidateConfig { toml: String },
-    SetConfig { toml: String },
+    GetConfig {
+        autostart_probes: Vec<TrayAutostartProbe>,
+    },
+    ValidateConfig {
+        toml: String,
+    },
+    SetConfig {
+        toml: String,
+        tray_exe: PathBuf,
+        tray_autostart: Vec<TrayAutostartChange>,
+    },
     ReloadDaemon,
     GetEnforcementState,
-    SetEnforcementPaused { paused: bool },
+    SetEnforcementPaused {
+        paused: bool,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TrayAutostartProbe {
+    pub username: String,
+    pub home: PathBuf,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TrayAutostartChange {
+    pub username: String,
+    pub uid: u32,
+    pub home: PathBuf,
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TrayAutostartState {
+    pub username: String,
+    pub enabled: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -37,6 +67,7 @@ pub enum AdminResponse {
         toml: String,
         enforcement_paused: bool,
         kill_switch_path: PathBuf,
+        tray_autostart: Vec<TrayAutostartState>,
     },
     ValidationOk,
     EnforcementState {
@@ -146,7 +177,7 @@ mod tests {
 
     #[test]
     fn rejects_unknown_protocol_version() {
-        let json = r#"{"version":2,"request_id":"abc","request":{"kind":"get_config"}}"#;
+        let json = r#"{"version":2,"request_id":"abc","request":{"kind":"get_config","autostart_probes":[]}}"#;
 
         let err = RequestEnvelope::from_json(json).unwrap_err();
 

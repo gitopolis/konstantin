@@ -125,9 +125,13 @@ Suggested request/response model:
 
 ```rust
 enum AdminRequest {
-    GetConfig,
+    GetConfig { autostart_probes: Vec<TrayAutostartProbe> },
     ValidateConfig { toml: String },
-    SetConfig { toml: String, tray_autostart: Vec<TrayAutostartChange> },
+    SetConfig {
+        toml: String,
+        tray_exe: PathBuf,
+        tray_autostart: Vec<TrayAutostartChange>,
+    },
     ReloadDaemon,
     GetEnforcementState,
     SetEnforcementPaused { paused: bool },
@@ -139,9 +143,11 @@ enum AdminRequest {
 enum AdminResponse {
     Config {
         toml: String,
-        autostart: Vec<TrayAutostartState>,
+        enforcement_paused: bool,
+        kill_switch_path: PathBuf,
+        tray_autostart: Vec<TrayAutostartState>,
     },
-    EnforcementState { paused: bool, kill_switch_path: String },
+    EnforcementState { paused: bool, kill_switch_path: PathBuf },
     Ok,
     InstallState(InstallState),
     ValidationErrors(Vec<String>),
@@ -306,25 +312,27 @@ owned and the tray also needs cross-user LaunchAgent state.
 New flow:
 
 1. Tray opens Configure.
-2. Tray sends `GetConfig` over admin XPC.
+2. Tray enumerates local users for the UI and sends `GetConfig` over
+   admin XPC with `{ username, home }` autostart probes.
 3. Daemon checks authorization.
 4. Daemon reads `/etc/screentimed/config.toml`.
-5. Daemon enumerates autostart state for all local users. It can reuse
-   the current dscl/home-inspection logic, but running as root avoids
+5. Daemon stats the requested LaunchAgent paths as root, which avoids
    hardened-home permission problems.
 6. Tray renders the window from the response.
-7. On Save, tray sends full edited TOML plus autostart diffs.
+7. On Save, tray sends full edited TOML, the running tray executable
+   path, and autostart diffs.
 8. Daemon validates:
    * TOML parses as `Config`;
-   * `default_policy` remains safe unless explicitly allowed;
-   * all referenced users resolve;
+   * tray executable path exists and is absolute;
+   * autostart homes are absolute and do not target root;
    * limits are sane;
    * LaunchAgent paths are under the target user's home.
 9. Daemon writes config atomically with `0600 root`.
 10. Daemon applies LaunchAgent changes.
-11. Daemon reloads config in-process or restarts only the internal tasks
-    that need the new config.
-12. Daemon broadcasts a status update.
+11. Daemon schedules `launchctl kickstart -k` after replying so the
+    running XPC request can finish before launchd restarts it.
+12. Existing tray subscriptions reconnect and receive fresh status from
+    the restarted daemon.
 
 This removes both Open Configuration and Save Configuration password
 prompts.
@@ -423,6 +431,9 @@ Progress tracking:
 * `baca055 feat: add enforcement pause menu action` replaced routine
   Start/Stop Daemon menu items with Pause/Unpause Enforcement over admin
   XPC.
+* Phase 4 implementation replaced the Configure open/save `osascript`
+  paths with admin XPC, including daemon-owned config writes and
+  daemon-owned tray LaunchAgent autostart changes.
 
 ### Phase 0: Documentation and scaffolding
 
@@ -467,8 +478,9 @@ Status: complete for the initial scope.
 * [x] Add pure handlers for `GetEnforcementState` and
   `SetEnforcementPaused`.
 * [x] Exercise handlers directly in tests, without transport.
-* [x] Preserve current `osascript` configure/update/restart paths while
-  daemon handlers mature.
+* [x] Preserve current `osascript` update/restart paths while daemon
+  handlers mature.
+  * Configure open/save has now moved to admin XPC in Phase 4.
 
 ### Phase 3: XPC transport
 
@@ -494,13 +506,21 @@ com.gitopolis.screentimed.control
 
 ### Phase 4: Configure over XPC
 
-Status: next.
+Status: implemented; still needs signed-app manual verification.
 
-* Replace Configure Open admin script with `GetConfig`.
-* Replace Save admin script with `SetConfig`.
-* Keep UI behavior and validation messages as close as possible to the
+* [x] Replace Configure Open admin script with `GetConfig`.
+  * `GetConfig` now accepts tray-autostart probes so the root daemon can
+    stat other users' LaunchAgent plists without staging a manifest.
+* [x] Replace Save admin script with `SetConfig`.
+  * `SetConfig` now carries the tray executable path plus autostart
+    changes. The daemon writes `/etc/screentimed/config.toml`, applies
+    LaunchAgent changes, then schedules a delayed `launchctl kickstart`
+    so the XPC reply can return before the daemon restarts.
+* [x] Keep UI behavior and validation messages as close as possible to the
   current flow.
-* Remove staged temp config/manifest files from the tray path.
+* [x] Remove staged temp config/manifest files from the tray path.
+* [ ] Manual signed-app check: admin user opens Configure and saves with
+  no password prompt; standard user receives `Unauthorized`.
 
 ### Phase 5: Reload / pause controls
 

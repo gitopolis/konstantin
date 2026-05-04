@@ -459,7 +459,7 @@ daily_limit_minutes = 120
 
     #[test]
     fn rejects_unknown_protocol_version() {
-        let json = r#"{"version":2,"request_id":"abc","request":{"kind":"get_config"}}"#;
+        let json = r#"{"version":2,"request_id":"abc","request":{"kind":"get_config","autostart_probes":[]}}"#;
 
         let err = RequestEnvelope::from_json(json).unwrap_err();
 
@@ -495,9 +495,14 @@ daily_limit_minutes = 120
         let config_path = dir.join("config.toml");
         std::fs::write(&config_path, config_text(&dir)).unwrap();
         let controller = Controller::new(config_path);
-        let request = RequestEnvelope::new("abc", AdminRequest::GetConfig)
-            .to_json()
-            .unwrap();
+        let request = RequestEnvelope::new(
+            "abc",
+            AdminRequest::GetConfig {
+                autostart_probes: vec![],
+            },
+        )
+        .to_json()
+        .unwrap();
 
         let response_json = handle_request_json(&controller, &denied_operator(), &request);
         let response = ResponseEnvelope::from_json(&response_json).unwrap();

@@ -42,7 +42,9 @@ mod imp {
     // NSRunningApplication header, not NSApplication's.
     use objc2_app_kit::NSApplicationActivationPolicy;
     use objc2_foundation::{MainThreadMarker, NSString, NSTimer};
-    use konstantin_proto::admin::{AdminRequest, AdminResponse};
+    use konstantin_proto::admin::{
+        AdminRequest, AdminResponse, TrayAutostartChange, TrayAutostartProbe, TrayAutostartState,
+    };
     use konstantin_tray::admin_xpc::AdminClient;
     use konstantin_proto::{SessionState, UserStatus};
     use konstantin_tray::notifications::{self, NotifTracker};
@@ -2190,11 +2192,10 @@ exit 0"#,
     /// local user, with per-user daily-limit and tray-autostart
     /// controls plus an editable warn-thresholds field at the top.
     ///
-    /// One privileged step on Save covers everything: writing the
-    /// updated `/etc/screentimed/config.toml`, installing/removing
-    /// LaunchAgents for *other* users, and `launchctl kickstart -k`-ing
-    /// the daemon. The operator's *own* tray-autostart flips happen
-    /// unprivileged before the admin call.
+    /// Configure Open and Save use the daemon's signed admin XPC control
+    /// plane. The root daemon reads/writes `/etc/screentimed/config.toml`,
+    /// probes other users' LaunchAgent state, applies tray-autostart
+    /// changes, and reloads itself after a successful save.
     ///
     /// Other config keys (`enforcement`, `default_policy`,
     /// `kill_switch_path`, paths, `tick_seconds`) are round-tripped
@@ -2216,10 +2217,6 @@ exit 0"#,
         use std::cell::RefCell;
         use std::path::{Path, PathBuf};
 
-        const SYSTEM_CONFIG: &str = "/etc/screentimed/config.toml";
-        const TRAY_AGENT_LABEL: &str = "com.gitopolis.konstantin-tray";
-        const TRAY_AGENT_FILENAME: &str = "com.gitopolis.konstantin-tray.plist";
-
         thread_local! {
             /// At most one configure window at a time. Re-opening just
             /// fronts the existing window. Replaced wholesale on each
@@ -2237,10 +2234,6 @@ exit 0"#,
             config_value: toml::Value,
             rows: Vec<Row>,
             thresholds_field: Retained<NSTextField>,
-            /// Username running this tray instance — drives the
-            /// "no admin needed for own user" branch in the autostart
-            /// step.
-            operator_username: String,
         }
 
         struct Row {
@@ -2323,16 +2316,6 @@ exit 0"#,
                 return;
             }
 
-            let config_path = Path::new(SYSTEM_CONFIG);
-            if !config_path.exists() {
-                super::alerts::message(
-                    mtm,
-                    "No configuration found.",
-                    "Set up Konstantin first to create the configuration file.",
-                );
-                return;
-            }
-
             let users_list = match users::enumerate() {
                 Ok(u) => u,
                 Err(e) => {
@@ -2345,51 +2328,52 @@ exit 0"#,
                 return;
             }
 
-            // /etc/screentimed/config.toml is 0600 root-owned, so the
-            // unprivileged tray can't read it directly. Single admin
-            // elevation: copy the file out (chowned to the operator)
-            // and, in the same script, dump a manifest of which users
-            // currently have a tray LaunchAgent plist on disk —
-            // hardened macOS denies an unprivileged tray `stat` access
-            // to other users' homes, but root can see them all.
-            let operator = current_username();
-            let staged_config = tmp_path("konstantin-config-staging", "toml");
-            let staged_manifest = tmp_path("konstantin-autostart-staging", "txt");
-            let script =
-                build_open_admin_script(&operator, &users_list, &staged_config, &staged_manifest);
-
-            match super::admin::run_with_progress(
+            let probes: Vec<TrayAutostartProbe> = users_list
+                .iter()
+                .map(|u| TrayAutostartProbe {
+                    username: u.username.clone(),
+                    home: u.home.clone(),
+                })
+                .collect();
+            let open_response = super::progress::run_with_panel(
                 mtm,
                 "Open Configuration",
                 "Reading /etc/screentimed/config.toml…",
-                &script,
-            ) {
-                Ok(()) => {}
-                Err(super::admin::Error::Cancelled) => {
-                    let _ = std::fs::remove_file(&staged_config);
-                    let _ = std::fs::remove_file(&staged_manifest);
-                    return;
-                }
-                Err(super::admin::Error::Failed(msg)) => {
-                    super::alerts::message(mtm, "Couldn't read configuration.", &msg);
-                    let _ = std::fs::remove_file(&staged_config);
-                    let _ = std::fs::remove_file(&staged_manifest);
-                    return;
-                }
-            }
+                "konstantin-config-open",
+                move || {
+                    AdminClient::send(AdminRequest::GetConfig {
+                        autostart_probes: probes,
+                    })
+                },
+            );
 
-            let config_text = match std::fs::read_to_string(&staged_config) {
-                Ok(t) => t,
+            let (config_text, autostart_states) = match open_response {
+                Ok(AdminResponse::Config {
+                    toml,
+                    tray_autostart,
+                    ..
+                }) => (toml, tray_autostart),
+                Ok(AdminResponse::Unauthorized { reason }) => {
+                    super::alerts::message(mtm, "Administrator required.", &reason);
+                    return;
+                }
+                Ok(AdminResponse::Error { message }) => {
+                    super::alerts::message(mtm, "Couldn't read configuration.", &message);
+                    return;
+                }
+                Ok(other) => {
+                    super::alerts::message(
+                        mtm,
+                        "Couldn't read configuration.",
+                        &format!("Unexpected daemon response: {other:?}"),
+                    );
+                    return;
+                }
                 Err(e) => {
                     super::alerts::message(mtm, "Couldn't read configuration.", &e.to_string());
-                    let _ = std::fs::remove_file(&staged_config);
-                    let _ = std::fs::remove_file(&staged_manifest);
                     return;
                 }
             };
-            let manifest_text = std::fs::read_to_string(&staged_manifest).unwrap_or_default();
-            let _ = std::fs::remove_file(&staged_config);
-            let _ = std::fs::remove_file(&staged_manifest);
 
             let config_value: toml::Value = match toml::from_str(&config_text) {
                 Ok(v) => v,
@@ -2399,10 +2383,9 @@ exit 0"#,
                 }
             };
 
-            let manifest = parse_autostart_manifest(&manifest_text);
             let initial_thresholds = current_thresholds(&config_value);
             let user_initials =
-                collect_user_settings(&users_list, &config_value, &operator, &manifest);
+                collect_user_settings(&users_list, &config_value, &autostart_states);
 
             let controller = ConfigController::new(mtm);
             let built = build_window(
@@ -2421,7 +2404,6 @@ exit 0"#,
                     config_value,
                     rows: built.rows,
                     thresholds_field: built.thresholds_field,
-                    operator_username: operator,
                 });
             });
 
@@ -2477,9 +2459,12 @@ exit 0"#,
         fn collect_user_settings(
             users: &[LocalUser],
             cfg: &toml::Value,
-            operator: &str,
-            manifest: &std::collections::HashMap<String, bool>,
+            autostart_states: &[TrayAutostartState],
         ) -> Vec<InitialUserSetting> {
+            let autostart_by_user: std::collections::HashMap<&str, bool> = autostart_states
+                .iter()
+                .map(|s| (s.username.as_str(), s.enabled))
+                .collect();
             let users_table = cfg
                 .as_table()
                 .and_then(|t| t.get("users"))
@@ -2497,114 +2482,13 @@ exit 0"#,
                     InitialUserSetting {
                         limited: entry.is_some(),
                         minutes,
-                        autostart: autostart_state(u, operator, manifest),
+                        autostart: autostart_by_user
+                            .get(u.username.as_str())
+                            .copied()
+                            .unwrap_or(false),
                     }
                 })
                 .collect()
-        }
-
-        /// Initial autostart state for a row.
-        ///
-        /// For the operator's own user, `stat` is authoritative. For
-        /// other users, hardened macOS denies the unprivileged tray
-        /// `stat` access to `/Users/<other>/Library/LaunchAgents/` —
-        /// so the open-flow admin script (run as root) emits a
-        /// manifest of plist presence per user, and we look up the
-        /// answer there.
-        fn autostart_state(
-            user: &LocalUser,
-            operator: &str,
-            manifest: &std::collections::HashMap<String, bool>,
-        ) -> bool {
-            if user.username == operator {
-                return autostart_present(user);
-            }
-            manifest.get(&user.username).copied().unwrap_or(false)
-        }
-
-        fn autostart_present(user: &LocalUser) -> bool {
-            agent_path(user).is_file()
-        }
-
-        fn agent_path(user: &LocalUser) -> PathBuf {
-            user.home.join("Library/LaunchAgents").join(TRAY_AGENT_FILENAME)
-        }
-
-        fn current_username() -> String {
-            // `USER` env var works for tray launches via Dock / Finder /
-            // launchd, but `getpwuid(getuid())` is the authoritative
-            // source. Try the cheap path first.
-            if let Ok(name) = std::env::var("USER") {
-                if !name.is_empty() {
-                    return name;
-                }
-            }
-            std::process::Command::new("/usr/bin/id")
-                .arg("-un")
-                .output()
-                .ok()
-                .and_then(|o| String::from_utf8(o.stdout).ok())
-                .map(|s| s.trim().to_string())
-                .unwrap_or_default()
-        }
-
-        /// Parse the per-user autostart manifest dumped by the
-        /// open-flow admin script. Format: one `<username> 0|1` line
-        /// per user. Empty / malformed input yields an empty map.
-        fn parse_autostart_manifest(text: &str) -> std::collections::HashMap<String, bool> {
-            text.lines()
-                .filter_map(|line| {
-                    let mut it = line.splitn(2, ' ');
-                    let user = it.next()?.trim();
-                    let flag = it.next()?.trim();
-                    if user.is_empty() {
-                        return None;
-                    }
-                    Some((user.to_string(), flag == "1"))
-                })
-                .collect()
-        }
-
-        /// Build the open-flow admin script: copy the 0600 root-owned
-        /// config out to a user-owned temp, and dump a manifest of
-        /// per-user tray-LaunchAgent plist presence to a sibling temp.
-        /// One elevation, both side effects.
-        fn build_open_admin_script(
-            operator: &str,
-            users: &[LocalUser],
-            staged_config: &Path,
-            staged_manifest: &Path,
-        ) -> String {
-            let mut parts: Vec<String> = vec![format!(
-                "install -m 0600 -o {user} -g staff /etc/screentimed/config.toml {dst}",
-                user = shell_quote_arg(operator),
-                dst = shell_quote(staged_config),
-            )];
-
-            let mut probe = String::from("(");
-            for u in users {
-                let p = u.home.join("Library/LaunchAgents").join(TRAY_AGENT_FILENAME);
-                probe.push_str(&format!(
-                    "if test -f {path}; then echo {name} 1; else echo {name} 0; fi; ",
-                    path = shell_quote(&p),
-                    name = shell_quote_arg(&u.username),
-                ));
-            }
-            probe.push_str(") > ");
-            probe.push_str(&shell_quote(staged_manifest));
-            parts.push(probe);
-
-            parts.push(format!(
-                "chown {user}:staff {dst}",
-                user = shell_quote_arg(operator),
-                dst = shell_quote(staged_manifest),
-            ));
-            parts.push(format!(
-                "chmod 0600 {dst}",
-                dst = shell_quote(staged_manifest),
-            ));
-
-            parts.join(" && ")
         }
 
         // ─── Window construction ──────────────────────────────────────
@@ -2980,7 +2864,6 @@ exit 0"#,
             thresholds: Vec<u32>,
             rows: Vec<RowSnapshot>,
             config_value: toml::Value,
-            operator_username: String,
         }
 
         fn save_flow(mtm: MainThreadMarker) {
@@ -2997,71 +2880,52 @@ exit 0"#,
                 }
             };
 
-            let config_temp = tmp_path("konstantin-config", "toml");
-            if let Err(e) = std::fs::write(&config_temp, &new_config_text) {
-                super::alerts::message(mtm, "Couldn't write temp config.", &e.to_string());
-                return;
-            }
+            let tray_autostart: Vec<TrayAutostartChange> = snapshot
+                .rows
+                .iter()
+                .filter(|row| row.autostart_target != row.autostart_initial)
+                .map(|row| TrayAutostartChange {
+                    username: row.username.clone(),
+                    uid: row.uid,
+                    home: row.home.clone(),
+                    enabled: row.autostart_target,
+                })
+                .collect();
+            let tray_exe = tray_exe();
 
-            // Apply self-changes unprivileged so the password prompt
-            // covers only things that genuinely need root.
-            let mut other_user_changes: Vec<(PathBuf, RowSnapshot, bool)> = Vec::new();
-            for row in &snapshot.rows {
-                if row.autostart_target == row.autostart_initial {
-                    continue;
-                }
-                if row.username == snapshot.operator_username {
-                    if row.autostart_target {
-                        if let Err(e) = enable_autostart_self(&row.home) {
-                            tracing::warn!(error = %e, "self autostart enable failed");
-                        }
-                    } else if let Err(e) = disable_autostart_self(&row.home) {
-                        tracing::warn!(error = %e, "self autostart disable failed");
-                    }
-                    continue;
-                }
-                if row.autostart_target {
-                    let plist_temp =
-                        tmp_path(&format!("konstantin-agent-{}", row.username), "plist");
-                    let plist_body =
-                        super::install::build_user_launchagent_plist(&tray_exe(), &row.home);
-                    if let Err(e) = std::fs::write(&plist_temp, plist_body) {
-                        super::alerts::message(
-                            mtm,
-                            "Couldn't write temp plist.",
-                            &e.to_string(),
-                        );
-                        let _ = std::fs::remove_file(&config_temp);
-                        return;
-                    }
-                    other_user_changes.push((plist_temp, row.clone(), true));
-                } else {
-                    other_user_changes.push((PathBuf::new(), row.clone(), false));
-                }
-            }
-
-            let script = build_admin_script(&config_temp, &other_user_changes);
-
-            let outcome = super::admin::run_with_progress(
+            let outcome = super::progress::run_with_panel(
                 mtm,
                 "Saving Settings",
                 "Saving and reloading Konstantin…",
-                &script,
+                "konstantin-config-save",
+                move || {
+                    AdminClient::send(AdminRequest::SetConfig {
+                        toml: new_config_text,
+                        tray_exe,
+                        tray_autostart,
+                    })
+                },
             );
 
-            // Cleanup all temp files regardless of outcome.
-            let _ = std::fs::remove_file(&config_temp);
-            for (path, _, _) in &other_user_changes {
-                if !path.as_os_str().is_empty() {
-                    let _ = std::fs::remove_file(path);
-                }
-            }
-
             match outcome {
-                Ok(()) => close_and_clear(),
-                Err(super::admin::Error::Cancelled) => {}
-                Err(super::admin::Error::Failed(msg)) => {
-                    super::alerts::message(mtm, "Couldn't save settings.", &msg);
+                Ok(AdminResponse::EnforcementState { .. }) | Ok(AdminResponse::Ok) => {
+                    close_and_clear()
+                }
+                Ok(AdminResponse::Unauthorized { reason }) => {
+                    super::alerts::message(mtm, "Administrator required.", &reason);
+                }
+                Ok(AdminResponse::Error { message }) => {
+                    super::alerts::message(mtm, "Couldn't save settings.", &message);
+                }
+                Ok(other) => {
+                    super::alerts::message(
+                        mtm,
+                        "Couldn't save settings.",
+                        &format!("Unexpected daemon response: {other:?}"),
+                    );
+                }
+                Err(e) => {
+                    super::alerts::message(mtm, "Couldn't save settings.", &e.to_string());
                 }
             }
         }
@@ -3101,7 +2965,6 @@ exit 0"#,
                     thresholds,
                     rows,
                     config_value: h.config_value.clone(),
-                    operator_username: h.operator_username.clone(),
                 })
             })
         }
@@ -3171,95 +3034,9 @@ exit 0"#,
             toml::to_string_pretty(&value).map_err(|e| format!("serializing TOML: {e}"))
         }
 
-        fn build_admin_script(
-            config_temp: &Path,
-            other_user_changes: &[(PathBuf, RowSnapshot, bool)],
-        ) -> String {
-            let mut parts: Vec<String> = Vec::new();
-            parts.push(format!(
-                "install -m 0600 {src} /etc/screentimed/config.toml",
-                src = shell_quote(config_temp),
-            ));
-            for (plist_temp, row, enable) in other_user_changes {
-                let library_dir = row.home.join("Library");
-                let dest_dir = library_dir.join("LaunchAgents");
-                let logs_dir = library_dir.join("Logs");
-                let dest_plist = dest_dir.join(TRAY_AGENT_FILENAME);
-                if *enable {
-                    parts.push(format!(
-                        "install -d -o {user} -g staff -m 0700 {dir}",
-                        user = shell_quote_arg(&row.username),
-                        dir = shell_quote(&library_dir),
-                    ));
-                    parts.push(format!(
-                        "install -d -o {user} -g staff -m 0755 {dir}",
-                        user = shell_quote_arg(&row.username),
-                        dir = shell_quote(&dest_dir),
-                    ));
-                    parts.push(format!(
-                        "install -d -o {user} -g staff -m 0700 {dir}",
-                        user = shell_quote_arg(&row.username),
-                        dir = shell_quote(&logs_dir),
-                    ));
-                    parts.push(format!(
-                        "install -m 0644 -o {user} -g staff {src} {dst}",
-                        user = shell_quote_arg(&row.username),
-                        src = shell_quote(plist_temp),
-                        dst = shell_quote(&dest_plist),
-                    ));
-                    parts.push(format!(
-                        "(launchctl print gui/{uid} >/dev/null 2>&1 && \
-                          launchctl bootstrap gui/{uid} {dst} || true)",
-                        uid = row.uid,
-                        dst = shell_quote(&dest_plist),
-                    ));
-                } else {
-                    parts.push(format!(
-                        "(rm -f {dst}; launchctl bootout gui/{uid}/{label} 2>/dev/null || true)",
-                        dst = shell_quote(&dest_plist),
-                        uid = row.uid,
-                        label = TRAY_AGENT_LABEL,
-                    ));
-                }
-            }
-            parts.push("launchctl kickstart -k system/com.gitopolis.screentimed".to_string());
-            parts.join(" && ")
-        }
-
-        fn enable_autostart_self(home: &Path) -> std::io::Result<()> {
-            let agents = home.join("Library/LaunchAgents");
-            std::fs::create_dir_all(&agents)?;
-            std::fs::create_dir_all(home.join("Library/Logs"))?;
-            let dst = agents.join(TRAY_AGENT_FILENAME);
-            let body = super::install::build_user_launchagent_plist(&tray_exe(), home);
-            std::fs::write(&dst, body)?;
-            // Best-effort bootstrap into our own GUI domain.
-            let uid = current_uid();
-            let _ = std::process::Command::new("/bin/launchctl")
-                .args(["bootstrap", &format!("gui/{uid}")])
-                .arg(&dst)
-                .status();
-            Ok(())
-        }
-
-        fn disable_autostart_self(home: &Path) -> std::io::Result<()> {
-            let dst = home.join("Library/LaunchAgents").join(TRAY_AGENT_FILENAME);
-            let _ = std::fs::remove_file(&dst);
-            let uid = current_uid();
-            let _ = std::process::Command::new("/bin/launchctl")
-                .args(["bootout", &format!("gui/{uid}/{TRAY_AGENT_LABEL}")])
-                .status();
-            Ok(())
-        }
-
         fn tray_exe() -> PathBuf {
             std::env::current_exe()
                 .unwrap_or_else(|_| PathBuf::from("/usr/local/bin/konstantin-tray"))
-        }
-
-        fn tmp_path(stem: &str, ext: &str) -> PathBuf {
-            let dir = std::env::var("TMPDIR").unwrap_or_else(|_| "/tmp/".to_string());
-            PathBuf::from(format!("{dir}{stem}-{}.{ext}", std::process::id()))
         }
 
         pub(super) fn shell_quote(p: &Path) -> String {
@@ -3326,7 +3103,6 @@ daily_limit_minutes = 30
                         autostart_initial: false,
                     }],
                     config_value: cfg,
-                    operator_username: "nikita".to_string(),
                 };
                 let out = build_new_config_toml(&snap).unwrap();
                 let parsed: toml::Value = toml::from_str(&out).unwrap();
@@ -3362,7 +3138,6 @@ daily_limit_minutes = 30
                         autostart_initial: false,
                     }],
                     config_value: cfg,
-                    operator_username: "nikita".into(),
                 };
                 assert!(build_new_config_toml(&snap).is_err());
             }
@@ -3381,36 +3156,6 @@ daily_limit_minutes = 30
                     body.contains("/Users/alice &amp; bob/Library/Logs/konstantin-tray.err.log")
                 );
                 assert!(!body.contains("/tmp/konstantin-tray"));
-            }
-
-            #[test]
-            fn admin_script_prepares_user_owned_launchagent_and_log_dirs() {
-                let row = RowSnapshot {
-                    username: "alice".to_string(),
-                    uid: 601,
-                    home: PathBuf::from("/Users/alice"),
-                    limited: false,
-                    minutes: 0,
-                    autostart_target: true,
-                    autostart_initial: false,
-                };
-                let script = build_admin_script(
-                    Path::new("/tmp/konstantin-config.toml"),
-                    &[(
-                        PathBuf::from("/tmp/konstantin-agent-alice.plist"),
-                        row,
-                        true,
-                    )],
-                );
-
-                assert!(script
-                    .contains("install -d -o 'alice' -g staff -m 0700 '/Users/alice/Library'"));
-                assert!(script.contains(
-                    "install -d -o 'alice' -g staff -m 0755 '/Users/alice/Library/LaunchAgents'"
-                ));
-                assert!(script.contains(
-                    "install -d -o 'alice' -g staff -m 0700 '/Users/alice/Library/Logs'"
-                ));
             }
         }
     }
