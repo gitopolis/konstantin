@@ -42,13 +42,11 @@ directories and can be removed with one menu click.
 ```sh
 brew tap gitopolis/konstantin
 brew install --cask konstantin
-xattr -dr com.apple.quarantine "/Applications/Konstantin.app" # Remove the quarantine Apple tag
-open -a Konstantin
 ```
 
 ### Manual
 
-Download the latest `Konstantin-<version>.zip` from the
+Download the latest `Konstantin-<version>-<arch>.zip` from the
 [Releases](https://github.com/gitopolis/konstantin/releases) page,
 unzip it, drag `Konstantin.app` into `/Applications`, and double-click.
 
@@ -150,8 +148,9 @@ the daemon log while it's active.
 
 ## Uninstall
 
-Click `Uninstall…` in the menu and the authorized daemon removes its
-system files and counter state. Drag `Konstantin.app` to the Trash to
+1. Click `Uninstall…` in the menu and the authorized daemon removes its
+system files and counter state.
+1. Drag `Konstantin.app` to the Trash to
 remove the bundle.
 
 `/etc/screentimed/config.toml` is preserved by default, in case you
@@ -199,7 +198,7 @@ discover whose limits are configured).
 
 Source code, architecture notes, and developer build instructions:
 
-* [`CLAUDE.md`](CLAUDE.md) — design notes, architectural decisions,
+* [`AGENTS.md`](AGENTS.md) — design notes, architectural decisions,
   what's built and what isn't.
 * [`docs/concepts.md`](docs/concepts.md) — IPC, counters, enforcement,
   midnight reset, kill-switch.
