@@ -443,6 +443,11 @@ Progress tracking:
   `SMAppService.daemon(plistName:)` first-launch registration for signed
   bundles, converted the bundled daemon plist to `BundleProgram`, and kept
   the legacy installer as a dev/fallback path.
+* `feat: uninstall through admin xpc` moves the tray's Uninstall
+  action from an elevated `osascript` teardown script to an authorized
+  `AdminRequest::Uninstall` handled by the root daemon. The daemon removes
+  system files, counter state, and per-user tray LaunchAgents after
+  replying, then boots itself out through launchd.
 
 ### Phase 0: Documentation and scaffolding
 
@@ -576,12 +581,25 @@ needs manual validation.
 
 ### Phase 7: Updates and uninstall
 
-* Move updater install to daemon-mediated XPC once lower-risk admin
+Status: in progress.
+
+* [ ] Move updater install to daemon-mediated XPC once lower-risk admin
   operations are stable.
-* Decide whether uninstall remains one prompted `osascript` path or moves
+  * Still pending. The updater remains the last routine path that uses
+    `admin::run_with_progress` because it has the highest-risk
+    bundle-swap and rollback semantics.
+* [x] Decide whether uninstall remains one prompted `osascript` path or moves
   to XPC.
-* Remove `admin::run_with_progress` only when every retained action has a
+  * Moved to XPC. The tray confirms locally, then sends
+    `AdminRequest::Uninstall { preserve_config: true }`. The daemon only
+    accepts it from the system config path, schedules teardown after
+    replying, preserves `/etc/screentimed/`, removes
+    `/var/db/screentimed/`, removes per-user tray LaunchAgents under
+    `/Users`, skips booting out the operator's own tray, and bootouts the
+    system daemon last.
+* [ ] Remove `admin::run_with_progress` only when every retained action has a
   replacement or an explicit fallback reason.
+  * Not yet. It is still used for legacy setup fallback and update install.
 
 ## Testing Plan
 

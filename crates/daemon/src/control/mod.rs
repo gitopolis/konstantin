@@ -36,7 +36,7 @@ impl Controller {
             };
         }
 
-        match self.handle_authorized(req) {
+        match self.handle_authorized(operator, req) {
             Ok(resp) => resp,
             Err(e) => AdminResponse::Error {
                 message: e.to_string(),
@@ -44,7 +44,11 @@ impl Controller {
         }
     }
 
-    fn handle_authorized(&self, req: AdminRequest) -> Result<AdminResponse> {
+    fn handle_authorized(
+        &self,
+        operator: &auth::Operator,
+        req: AdminRequest,
+    ) -> Result<AdminResponse> {
         match req {
             AdminRequest::GetConfig { autostart_probes } => {
                 let toml = std::fs::read_to_string(&self.config_path).with_context(|| {
@@ -97,6 +101,13 @@ impl Controller {
                     kill_switch_path: cfg.kill_switch_path,
                 })
             }
+            AdminRequest::Uninstall { preserve_config } => {
+                if self.config_path != Path::new(SYSTEM_CONFIG_PATH) {
+                    anyhow::bail!("uninstall is only available for the system daemon");
+                }
+                schedule_uninstall_after_reply(operator.uid, preserve_config);
+                Ok(AdminResponse::Ok)
+            }
         }
     }
 
@@ -121,6 +132,116 @@ impl Controller {
         });
     }
 }
+
+#[cfg(not(test))]
+fn schedule_uninstall_after_reply(operator_uid: u32, preserve_config: bool) {
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        if let Err(e) = uninstall_system(operator_uid, preserve_config) {
+            tracing::error!(error = %e, "daemon-mediated uninstall failed");
+        }
+    });
+}
+
+#[cfg(test)]
+fn schedule_uninstall_after_reply(_operator_uid: u32, _preserve_config: bool) {}
+
+fn uninstall_system(operator_uid: u32, preserve_config: bool) -> Result<()> {
+    remove_file_if_exists(Path::new("/Library/LaunchDaemons/com.gitopolis.screentimed.plist"))?;
+    remove_file_if_exists(Path::new("/Library/LaunchAgents/com.gitopolis.konstantin-tray.plist"))?;
+    remove_file_if_exists(Path::new("/usr/local/libexec/screentimed"))?;
+    remove_file_if_exists(Path::new("/usr/local/bin/konstantin-status"))?;
+    remove_file_if_exists(Path::new("/usr/local/bin/konstantin-tray"))?;
+    remove_file_if_exists(Path::new("/var/run/screentimed.sock"))?;
+    remove_dir_if_exists(Path::new("/var/db/screentimed"))?;
+
+    if preserve_config {
+        remove_file_if_exists(Path::new("/etc/screentimed/bundle_path"))?;
+    } else {
+        remove_dir_if_exists(Path::new("/etc/screentimed"))?;
+    }
+
+    remove_user_tray_agents(operator_uid)?;
+    bootout_system_daemon();
+    Ok(())
+}
+
+fn remove_user_tray_agents(operator_uid: u32) -> Result<()> {
+    let users_root = Path::new("/Users");
+    let entries = match std::fs::read_dir(users_root) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", users_root.display())),
+    };
+
+    for entry in entries {
+        let entry = entry.with_context(|| format!("reading entry under {}", users_root.display()))?;
+        let home = entry.path();
+        if !home.is_dir() {
+            continue;
+        }
+        let plist = tray_agent_path(&home);
+        remove_file_if_exists(&plist)?;
+
+        if let Ok(Some(uid)) = owner_uid(&home) {
+            if uid != operator_uid {
+                let username = entry.file_name().to_string_lossy().to_string();
+                bootout_tray_agent(uid, &username);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn remove_file_if_exists(path: &Path) -> Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e).with_context(|| format!("removing {}", path.display())),
+    }
+}
+
+fn remove_dir_if_exists(path: &Path) -> Result<()> {
+    match std::fs::remove_dir_all(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e).with_context(|| format!("removing {}", path.display())),
+    }
+}
+
+#[cfg(unix)]
+fn owner_uid(path: &Path) -> Result<Option<u32>> {
+    use std::os::unix::fs::MetadataExt;
+    match std::fs::metadata(path) {
+        Ok(meta) => Ok(Some(meta.uid())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e).with_context(|| format!("stat {}", path.display())),
+    }
+}
+
+#[cfg(not(unix))]
+fn owner_uid(_path: &Path) -> Result<Option<u32>> {
+    Ok(None)
+}
+
+#[cfg(not(test))]
+fn bootout_system_daemon() {
+    match Command::new("/bin/launchctl")
+        .args(["bootout", "system/com.gitopolis.screentimed"])
+        .status()
+    {
+        Ok(status) if status.success() => {}
+        Ok(status) => {
+            tracing::debug!(%status, "screentimed bootout during uninstall was not successful");
+        }
+        Err(e) => {
+            tracing::debug!(error = %e, "failed to run launchctl bootout for screentimed");
+        }
+    }
+}
+
+#[cfg(test)]
+fn bootout_system_daemon() {}
 
 fn tray_autostart_states(probes: &[TrayAutostartProbe]) -> Vec<TrayAutostartState> {
     probes
@@ -564,6 +685,37 @@ daily_limit_minutes = 120
         let controller = Controller::new(path);
 
         let resp = controller.handle(&allowed_operator(), AdminRequest::ReloadDaemon);
+
+        assert!(matches!(resp, AdminResponse::Ok));
+    }
+
+    #[test]
+    fn uninstall_is_system_daemon_only() {
+        let dir = tempdir("uninstall-dev");
+        let path = dir.join("config.toml");
+        std::fs::write(&path, config_text(&dir)).unwrap();
+        let controller = Controller::new(path);
+
+        let resp = controller.handle(
+            &allowed_operator(),
+            AdminRequest::Uninstall {
+                preserve_config: true,
+            },
+        );
+
+        assert!(matches!(resp, AdminResponse::Error { .. }));
+    }
+
+    #[test]
+    fn system_uninstall_schedules_after_reply() {
+        let controller = Controller::new(PathBuf::from(SYSTEM_CONFIG_PATH));
+
+        let resp = controller.handle(
+            &allowed_operator(),
+            AdminRequest::Uninstall {
+                preserve_config: true,
+            },
+        );
 
         assert!(matches!(resp, AdminResponse::Ok));
     }

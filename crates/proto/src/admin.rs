@@ -38,6 +38,9 @@ pub enum AdminRequest {
     SetEnforcementPaused {
         paused: bool,
     },
+    Uninstall {
+        preserve_config: bool,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

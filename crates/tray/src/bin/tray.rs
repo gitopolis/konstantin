@@ -831,18 +831,13 @@ mod imp {
 
         /// Uninstall flow:
         ///   1. Confirm with the user (destructive).
-        ///   2. Run the privileged teardown via `admin::run_with_progress`
-        ///      — bootout the daemon, remove its plist + binaries +
-        ///      socket, and `rm` every per-user tray LaunchAgent plist
-        ///      under `/Users/<name>/Library/LaunchAgents/`. Mirrors
-        ///      `packaging/uninstall.sh`.
+        ///   2. Ask the root daemon over admin XPC to tear down the
+        ///      system install plus every per-user tray LaunchAgent plist.
         ///   3. Tell the user, then terminate.
         ///
-        /// We don't `launchctl bootout gui/<operator-uid>/...` for our
-        /// own tray — we *are* that agent, and bootout would terminate
-        /// us before the success alert renders. Other users' trays do
-        /// get bootout'd so they go away immediately rather than at
-        /// next login.
+        /// The daemon skips booting out the operator's own tray so this
+        /// process can render the success alert and quit itself. Other
+        /// users' trays are booted out immediately.
         ///
         /// `/etc/screentimed/` (config) is intentionally preserved so a
         /// reinstall resumes with the user's settings. `/var/db/screentimed/`
@@ -866,18 +861,36 @@ mod imp {
                 return;
             }
 
-            let script = build_uninstall_script();
-
-            match admin::run_with_progress(
+            let outcome = progress::run_with_panel(
                 mtm,
                 "Uninstalling Konstantin",
                 "Stopping the background service and removing files…",
-                &script,
-            ) {
-                Ok(()) => {}
-                Err(admin::Error::Cancelled) => return,
-                Err(admin::Error::Failed(msg)) => {
-                    alerts::message(mtm, "Couldn't uninstall Konstantin.", &msg);
+                "konstantin-tray-uninstall",
+                || AdminClient::send(AdminRequest::Uninstall {
+                    preserve_config: true,
+                }),
+            );
+
+            match outcome {
+                Ok(AdminResponse::Ok) => {}
+                Ok(AdminResponse::Unauthorized { reason }) => {
+                    alerts::message(mtm, "Administrator required.", &reason);
+                    return;
+                }
+                Ok(AdminResponse::Error { message }) => {
+                    alerts::message(mtm, "Couldn't uninstall Konstantin.", &message);
+                    return;
+                }
+                Ok(other) => {
+                    alerts::message(
+                        mtm,
+                        "Couldn't uninstall Konstantin.",
+                        &format!("Unexpected daemon response: {other:?}"),
+                    );
+                    return;
+                }
+                Err(e) => {
+                    alerts::message(mtm, "Couldn't uninstall Konstantin.", &e.to_string());
                     return;
                 }
             }
@@ -890,74 +903,6 @@ mod imp {
             );
 
             NSApplication::sharedApplication(mtm).terminate(None);
-        }
-
-        /// Build the `osascript`-driven sudo script that tears down the
-        /// system install plus every per-user tray LaunchAgent plist.
-        ///
-        /// `;` separators (rather than `&&`) so a missing file in one
-        /// `rm` doesn't short-circuit the rest. `launchctl bootout` is
-        /// suffixed with `|| true` because it errors when the target
-        /// isn't loaded — also fine.
-        fn build_uninstall_script() -> String {
-            let mut parts: Vec<String> = vec![
-                "launchctl bootout system/com.gitopolis.screentimed 2>/dev/null || true".into(),
-                "rm -f /Library/LaunchDaemons/com.gitopolis.screentimed.plist".into(),
-                // Legacy system-level location from pre-phase-7 installs.
-                "rm -f /Library/LaunchAgents/com.gitopolis.konstantin-tray.plist".into(),
-                "rm -f /usr/local/libexec/screentimed".into(),
-                "rm -f /usr/local/bin/konstantin-status".into(),
-                "rm -f /usr/local/bin/konstantin-tray".into(),
-                "rm -f /var/run/screentimed.sock".into(),
-                // Bundle-watcher marker. Always removed so a reinstall
-                // from a different location starts clean.
-                "rm -f /etc/screentimed/bundle_path".into(),
-                // Counter state. A reinstall starts users at zero
-                // accumulated time rather than picking up where they
-                // left off — matches the user's expectation that
-                // uninstalling actually removes their data.
-                "rm -rf /var/db/screentimed".into(),
-            ];
-
-            // Per-user tray plist cleanup. Iterate every real local
-            // account so a multi-user install (operator + others via
-            // the Configure UI) is fully cleaned. If enumeration fails,
-            // fall back to operator's `$HOME` only.
-            let me_uid = super::config_ui::current_uid();
-            let users = konstantin_tray::users::enumerate().unwrap_or_default();
-            if users.is_empty() {
-                if let Ok(home) = std::env::var("HOME") {
-                    let plist = std::path::PathBuf::from(home)
-                        .join("Library/LaunchAgents/com.gitopolis.konstantin-tray.plist");
-                    parts.push(format!(
-                        "rm -f {}",
-                        super::config_ui::shell_quote(&plist)
-                    ));
-                }
-            } else {
-                for u in &users {
-                    let plist = u
-                        .home
-                        .join("Library/LaunchAgents/com.gitopolis.konstantin-tray.plist");
-                    parts.push(format!(
-                        "rm -f {}",
-                        super::config_ui::shell_quote(&plist)
-                    ));
-                    // Don't bootout our own GUI domain — we *are* that
-                    // agent, and bootout would kill us before the
-                    // success alert renders. Other users' running trays
-                    // can safely be torn down.
-                    if u.uid != me_uid {
-                        parts.push(format!(
-                            "launchctl bootout gui/{uid}/com.gitopolis.konstantin-tray \
-                             2>/dev/null || true",
-                            uid = u.uid,
-                        ));
-                    }
-                }
-            }
-
-            parts.join("; ")
         }
     }
 
@@ -3286,13 +3231,6 @@ exit 0"#,
             // Wrap in single quotes, escape any embedded single quote as
             // `'\''` (close, escape, reopen).
             format!("'{}'", s.replace('\'', "'\\''"))
-        }
-
-        pub(super) fn current_uid() -> u32 {
-            extern "C" {
-                fn getuid() -> u32;
-            }
-            unsafe { getuid() }
         }
 
         #[cfg(test)]
