@@ -431,9 +431,10 @@ Progress tracking:
 * `baca055 feat: add enforcement pause menu action` replaced routine
   Start/Stop Daemon menu items with Pause/Unpause Enforcement over admin
   XPC.
-* Phase 4 implementation replaced the Configure open/save `osascript`
-  paths with admin XPC, including daemon-owned config writes and
-  daemon-owned tray LaunchAgent autostart changes.
+* `9447551 feat: configure settings over admin xpc` replaced the
+  Configure open/save `osascript` paths with admin XPC, including
+  daemon-owned config writes and daemon-owned tray LaunchAgent autostart
+  changes.
 
 ### Phase 0: Documentation and scaffolding
 
