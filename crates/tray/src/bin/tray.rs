@@ -42,6 +42,8 @@ mod imp {
     // NSRunningApplication header, not NSApplication's.
     use objc2_app_kit::NSApplicationActivationPolicy;
     use objc2_foundation::{MainThreadMarker, NSString, NSTimer};
+    use konstantin_proto::admin::{AdminRequest, AdminResponse};
+    use konstantin_tray::admin_xpc::AdminClient;
     use konstantin_proto::{SessionState, UserStatus};
     use konstantin_tray::notifications::{self, NotifTracker};
     use konstantin_tray::{default_socket_path, format_remaining, Subscription};
@@ -74,6 +76,10 @@ mod imp {
         /// clicking it goes straight into install. Cleared once the
         /// update is consumed.
         pending_update: Option<update::Release>,
+        /// Last admin-XPC view of `/etc/screentimed/disable` (or the
+        /// configured `kill_switch_path`). `None` until the operator
+        /// uses the Pause/Unpause action in this process.
+        enforcement_paused: Option<bool>,
     }
 
     impl Default for Latest {
@@ -84,6 +90,7 @@ mod imp {
                 pending: None,
                 disconnected: true,
                 pending_update: None,
+                enforcement_paused: None,
             }
         }
     }
@@ -94,8 +101,7 @@ mod imp {
     /// lifetime.
     struct Tray {
         status_item: Retained<NSStatusItem>,
-        start_item: Retained<NSMenuItem>,
-        stop_item: Retained<NSMenuItem>,
+        pause_enforcement_item: Retained<NSMenuItem>,
         restart_item: Retained<NSMenuItem>,
         updates_item: Retained<NSMenuItem>,
     }
@@ -202,19 +208,17 @@ mod imp {
         // calls in the drain timer are authoritative.
         menu.setAutoenablesItems(false);
 
-        let start_item = make_action_item(mtm, "Start Daemon", sel!(startDaemon:), controller);
-        let stop_item = make_action_item(mtm, "Stop Daemon", sel!(stopDaemon:), controller);
+        let pause_enforcement_item =
+            make_action_item(mtm, "Pause Enforcement", sel!(toggleEnforcement:), controller);
         let restart_item =
             make_action_item(mtm, "Restart Daemon", sel!(restartDaemon:), controller);
 
         // Initial enable-state matches the default `disconnected: true`
-        // — only Start is actionable until the worker reports back.
-        start_item.setEnabled(true);
-        stop_item.setEnabled(false);
+        // — daemon-mediated controls wait until the worker reports back.
+        pause_enforcement_item.setEnabled(false);
         restart_item.setEnabled(false);
 
-        menu.addItem(&start_item);
-        menu.addItem(&stop_item);
+        menu.addItem(&pause_enforcement_item);
         menu.addItem(&restart_item);
 
         menu.addItem(&NSMenuItem::separatorItem(mtm));
@@ -261,8 +265,7 @@ mod imp {
 
         Tray {
             status_item: item,
-            start_item,
-            stop_item,
+            pause_enforcement_item,
             restart_item,
             updates_item,
         }
@@ -360,21 +363,27 @@ mod imp {
             // scheduled), so we can re-derive the marker safely.
             let mtm = MainThreadMarker::new()
                 .expect("drain timer must fire on the main thread");
-            let (pending, disconnected, pending_update_version) = {
+            let (pending, disconnected, pending_update_version, enforcement_paused) = {
                 let mut g = latest.lock().expect("latest mutex");
                 (
                     g.pending.take(),
                     g.disconnected,
                     g.pending_update.as_ref().map(|r| r.version.to_string()),
+                    g.enforcement_paused,
                 )
             };
 
             // Menu enable-state. Idempotent — `setEnabled` with the
             // current value is a no-op in AppKit, so calling every
             // tick is fine.
-            tray.start_item.setEnabled(disconnected);
-            tray.stop_item.setEnabled(!disconnected);
+            tray.pause_enforcement_item.setEnabled(!disconnected);
             tray.restart_item.setEnabled(!disconnected);
+            let pause_title = match enforcement_paused {
+                Some(true) => "Unpause Enforcement",
+                _ => "Pause Enforcement",
+            };
+            tray.pause_enforcement_item
+                .setTitle(&NSString::from_str(pause_title));
 
             // Updater menu item morph. AppKit's `setTitle` is also
             // idempotent — comparing first would just be book-keeping.
@@ -637,39 +646,10 @@ mod imp {
             pub struct Controller;
 
             impl Controller {
-                #[unsafe(method(startDaemon:))]
-                fn start_daemon_action(&self, _sender: Option<&AnyObject>) {
+                #[unsafe(method(toggleEnforcement:))]
+                fn toggle_enforcement_action(&self, _sender: Option<&AnyObject>) {
                     let mtm = MainThreadMarker::from(self);
-                    // Idempotent. `bootstrap` fails ("I/O error: 5") if
-                    // already loaded; that's fine, we just need it
-                    // loaded somehow. `enable` fails if already
-                    // enabled, also fine. `kickstart` (no `-k`) is the
-                    // authoritative step — it brings the service up if
-                    // it isn't already, no-ops if it is.
-                    run_admin(
-                        mtm,
-                        "Starting Daemon",
-                        "Starting Konstantin…",
-                        "(launchctl bootstrap system /Library/LaunchDaemons/com.gitopolis.screentimed.plist || true) && \
-                         (launchctl enable system/com.gitopolis.screentimed || true) && \
-                         launchctl kickstart system/com.gitopolis.screentimed",
-                        "Couldn't start Konstantin.",
-                    );
-                }
-
-                #[unsafe(method(stopDaemon:))]
-                fn stop_daemon_action(&self, _sender: Option<&AnyObject>) {
-                    let mtm = MainThreadMarker::from(self);
-                    // `|| true` so "Stop" is silent when the service
-                    // wasn't loaded to begin with. The user's intent
-                    // ("not running") is already satisfied.
-                    run_admin(
-                        mtm,
-                        "Stopping Daemon",
-                        "Stopping Konstantin…",
-                        "launchctl bootout system/com.gitopolis.screentimed || true",
-                        "Couldn't stop Konstantin.",
-                    );
+                    toggle_enforcement(mtm);
                 }
 
                 #[unsafe(method(restartDaemon:))]
@@ -733,6 +713,50 @@ mod imp {
                 Err(admin::Error::Cancelled) => {}
                 Err(admin::Error::Failed(msg)) => {
                     alerts::message(mtm, failure_title, &msg);
+                }
+            }
+        }
+
+        fn toggle_enforcement(mtm: MainThreadMarker) {
+            let outcome = progress::run_with_panel(
+                mtm,
+                "Updating Enforcement",
+                "Updating Konstantin enforcement…",
+                "konstantin-tray-admin-xpc",
+                || -> Result<bool> {
+                    let state = AdminClient::send(AdminRequest::GetEnforcementState)?;
+                    let paused = match state {
+                        AdminResponse::EnforcementState { paused, .. } => paused,
+                        AdminResponse::Unauthorized { reason } => {
+                            anyhow::bail!("Not authorized: {reason}");
+                        }
+                        AdminResponse::Error { message } => anyhow::bail!("{message}"),
+                        other => anyhow::bail!("unexpected admin response: {other:?}"),
+                    };
+
+                    let target = !paused;
+                    let changed = AdminClient::send(AdminRequest::SetEnforcementPaused {
+                        paused: target,
+                    })?;
+                    match changed {
+                        AdminResponse::EnforcementState { paused, .. } => Ok(paused),
+                        AdminResponse::Unauthorized { reason } => {
+                            anyhow::bail!("Not authorized: {reason}");
+                        }
+                        AdminResponse::Error { message } => anyhow::bail!("{message}"),
+                        other => anyhow::bail!("unexpected admin response: {other:?}"),
+                    }
+                },
+            );
+
+            match outcome {
+                Ok(paused) => {
+                    if let Some(latest) = LATEST.get() {
+                        latest.lock().expect("latest").enforcement_paused = Some(paused);
+                    }
+                }
+                Err(e) => {
+                    alerts::message(mtm, "Couldn't update enforcement.", &e.to_string());
                 }
             }
         }
