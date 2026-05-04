@@ -26,7 +26,7 @@ fn next_local_midnight_after(now: DateTime<Local>) -> DateTime<Local> {
             LocalResult::Single(dt) => return dt,
             LocalResult::Ambiguous(earlier, _later) => return earlier,
             LocalResult::None => {
-                date = date + Duration::days(1);
+                date += Duration::days(1);
                 continue;
             }
         }

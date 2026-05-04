@@ -132,7 +132,9 @@ fn read_admin_members() -> Result<HashSet<String>> {
     if !output.status.success() {
         return Ok(HashSet::new());
     }
-    Ok(parse_admin_members(&String::from_utf8_lossy(&output.stdout)))
+    Ok(parse_admin_members(&String::from_utf8_lossy(
+        &output.stdout,
+    )))
 }
 
 fn parse_admin_members(stdout: &str) -> HashSet<String> {
@@ -189,8 +191,8 @@ fn read_user_attributes(username: &str) -> Result<UserAttributes> {
 
 fn parse_user_plist(bytes: &[u8]) -> Result<UserAttributes> {
     use plist::Value;
-    let value = Value::from_reader(std::io::Cursor::new(bytes))
-        .context("parsing dscl -plist output")?;
+    let value =
+        Value::from_reader(std::io::Cursor::new(bytes)).context("parsing dscl -plist output")?;
     let dict = value
         .as_dictionary()
         .context("dscl plist root is not a dict")?;

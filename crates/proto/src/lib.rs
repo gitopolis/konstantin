@@ -37,10 +37,7 @@ pub enum Request {
     Subscribe,
     /// v2: client reports its own session lock / idle state. Daemon may use
     /// this to pause counting. Ignored in v1.
-    ReportSessionState {
-        locked: bool,
-        idle_seconds: u32,
-    },
+    ReportSessionState { locked: bool, idle_seconds: u32 },
 }
 
 /// Responses from the daemon to a client.

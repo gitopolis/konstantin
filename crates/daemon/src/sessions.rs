@@ -37,12 +37,7 @@ extern "C" {
 
     fn CFStringGetLength(s: *const c_void) -> isize;
     fn CFStringGetMaximumSizeForEncoding(length: isize, encoding: u32) -> isize;
-    fn CFStringGetCString(
-        s: *const c_void,
-        buf: *mut c_char,
-        size: isize,
-        encoding: u32,
-    ) -> bool;
+    fn CFStringGetCString(s: *const c_void, buf: *mut c_char, size: isize, encoding: u32) -> bool;
     fn CFRelease(cf: *const c_void);
 }
 
@@ -78,11 +73,7 @@ fn copy_console_user_name() -> Option<String> {
     // store"). uid/gid out-params accept NULL too — we read the name
     // out of the CFString and don't need them.
     let cf = unsafe {
-        SCDynamicStoreCopyConsoleUser(
-            std::ptr::null(),
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-        )
+        SCDynamicStoreCopyConsoleUser(std::ptr::null(), std::ptr::null_mut(), std::ptr::null_mut())
     };
     if cf.is_null() {
         return None;

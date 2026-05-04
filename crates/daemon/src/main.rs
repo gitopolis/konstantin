@@ -24,6 +24,7 @@ mod sessions;
 mod state;
 mod time;
 mod uninstall;
+mod update;
 
 use anyhow::{Context, Result};
 use std::path::PathBuf;

@@ -17,7 +17,7 @@ use std::process::Command;
 use tracing::{info, warn};
 
 /// Default location of the install-time bundle-path marker. Written
-/// by `crates/tray/src/bin/tray.rs::install::build_install_script`.
+/// by first-launch setup, legacy install fallback, and the updater.
 pub const MARKER_PATH: &str = "/etc/screentimed/bundle_path";
 
 /// Consecutive missing-bundle ticks before we trip. At the default
