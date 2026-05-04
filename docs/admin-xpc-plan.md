@@ -439,6 +439,10 @@ Progress tracking:
 * `d9dba9f feat: reload configuration over admin xpc` replaced the
   routine Restart Daemon menu action with Reload Configuration over admin
   XPC and added periodic pause-state refreshes for all connected trays.
+* `7aacd3c feat: register daemon with service management` added
+  `SMAppService.daemon(plistName:)` first-launch registration for signed
+  bundles, converted the bundled daemon plist to `BundleProgram`, and kept
+  the legacy installer as a dev/fallback path.
 
 ### Phase 0: Documentation and scaffolding
 
