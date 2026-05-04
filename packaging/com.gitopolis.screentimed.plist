@@ -6,10 +6,8 @@
     <key>Label</key>
     <string>com.gitopolis.screentimed</string>
 
-    <key>ProgramArguments</key>
-    <array>
-        <string>/usr/local/libexec/screentimed</string>
-    </array>
+    <key>BundleProgram</key>
+    <string>Contents/Resources/screentimed</string>
 
     <key>EnvironmentVariables</key>
     <dict>
@@ -23,6 +21,12 @@
     <true/>
     <key>KeepAlive</key>
     <true/>
+
+    <key>MachServices</key>
+    <dict>
+        <key>com.gitopolis.screentimed.control</key>
+        <true/>
+    </dict>
 
     <key>ProcessType</key>
     <string>Background</string>

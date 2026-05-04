@@ -64,6 +64,7 @@ impl State {
             if !parent.as_os_str().is_empty() && !parent.exists() {
                 std::fs::create_dir_all(parent)
                     .with_context(|| format!("creating state dir {}", parent.display()))?;
+                set_dir_mode_0700(parent)?;
             }
         }
         let tmp = {
@@ -107,6 +108,13 @@ impl State {
     pub fn is_active(&self, username: &str) -> bool {
         self.active_now.contains(username)
     }
+}
+
+#[cfg(unix)]
+fn set_dir_mode_0700(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let perms = std::fs::Permissions::from_mode(0o700);
+    std::fs::set_permissions(path, perms).with_context(|| format!("chmod 0700 {}", path.display()))
 }
 
 #[cfg(test)]

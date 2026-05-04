@@ -32,7 +32,7 @@ enforcement = "logout"
 # re-enable. Default: /etc/screentimed/disable.
 # kill_switch_path = "/etc/screentimed/disable"
 
-# Test users (create them first — see packaging/install.sh).
+# Test users (create them first with packaging/create-test-users.sh).
 [users.alice]
 daily_limit_minutes = 30
 

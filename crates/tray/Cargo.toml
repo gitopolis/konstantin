@@ -34,6 +34,17 @@ tracing-subscriber = { workspace = true }
 # (NFSHomeDirectory, Picture, JPEGPhoto). Light dep, well-maintained.
 plist = "1"
 
+# In-app updater. `ureq` is synchronous, blocking, rustls-backed (no system
+# OpenSSL link). `sha2` verifies the SHA-256 GitHub returns for each
+# release asset. `semver` compares `tag_name` against the running version.
+#
+# `rustls` (not `_tls`) is the public feature that enables an actual TLS
+# backend — `_tls` on its own is an internal sentinel that pulls in PKI
+# types but no provider, and HTTPS calls panic at runtime.
+ureq = { version = "3.3.0", default-features = false, features = ["rustls", "json"] }
+sha2 = "0.11.0"
+semver = { version = "1", features = ["serde"] }
+
 # Cocoa bindings for `konstantin-tray`. macOS only — on other targets the
 # tray binary stubs out to a `compile_error!` shim and these crates aren't
 # resolved.
@@ -41,4 +52,5 @@ plist = "1"
 objc2 = { workspace = true }
 objc2-foundation = { workspace = true }
 objc2-app-kit = { workspace = true }
+objc2-user-notifications = { workspace = true }
 block2 = { workspace = true }

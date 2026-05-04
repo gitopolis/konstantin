@@ -42,6 +42,7 @@ directories and can be removed with one menu click.
 ```sh
 brew tap gitopolis/konstantin
 brew install --cask konstantin
+xattr -dr com.apple.quarantine "/Applications/Konstantin.app" # Remove the quarantine Apple tag
 open -a Konstantin
 ```
 
@@ -84,8 +85,9 @@ people you actually want to limit.
 
 Click the menu-bar icon to see:
 
-* The remaining-time display in the icon itself (e.g. `1h23m`,
-  `12m05s`, `0s`, or `🔴` when the daemon is down).
+* A clock glyph plus the remaining-time display (e.g. `🕒 1h23m`,
+  `🕒 12m05s`, `🕒 0s`). When the daemon is down, the clock goes
+  muted gray and the time disappears.
 * `Start Daemon` / `Stop Daemon` / `Restart Daemon` — controls the
   background service. Each prompts for an admin password.
 * `Configure…` — opens the settings window. Asks for an admin
@@ -99,6 +101,15 @@ Click the menu-bar icon to see:
   `10, 2, 1`) shared across all users. Save prompts a second time
   to commit the change and reload the daemon.
 * `Open Log` — opens `/var/log/screentimed.log` for spot-checking.
+* `Check for Updates…` — fetches the latest release from GitHub. If a
+  newer version exists you'll be offered an `Update to X.Y.Z` button;
+  the in-app updater verifies the download against the SHA-256 that
+  GitHub publishes alongside each release asset, replaces the bundle,
+  restarts the daemon, and relaunches the menu-bar app. If anything
+  fails after the swap the previous version is restored automatically
+  — same admin password prompt, no manual rollback. If you click
+  `Later`, the menu item morphs to `Update to X.Y.Z` so you can
+  install whenever you're ready.
 * `Uninstall…` — removes the app, the daemon, and the per-user
   counter state. Preserves your config so a reinstall picks up
   the same settings.

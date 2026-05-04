@@ -101,12 +101,27 @@ impl Config {
     pub fn load(path: &Path) -> Result<Self> {
         let text = std::fs::read_to_string(path)
             .with_context(|| format!("reading config file {}", path.display()))?;
-        let cfg: Self = toml::from_str(&text).context("parsing config TOML")?;
+        Self::parse_toml(&text)
+    }
+
+    pub fn load_or_seed(path: &Path) -> Result<Self> {
+        match Self::load(path) {
+            Ok(cfg) => Ok(cfg),
+            Err(e) if config_missing(path, &e) => {
+                seed_default_config(path)?;
+                Self::load(path)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    pub fn parse_toml(text: &str) -> Result<Self> {
+        let cfg: Self = toml::from_str(text).context("parsing config TOML")?;
         cfg.validate()?;
         Ok(cfg)
     }
 
-    fn validate(&self) -> Result<()> {
+    pub(crate) fn validate(&self) -> Result<()> {
         if self.tick_seconds == 0 {
             anyhow::bail!("tick_seconds must be > 0");
         }
@@ -120,5 +135,77 @@ impl Config {
 
     pub fn user_by_name(&self, name: &str) -> Option<&UserConfig> {
         self.users.get(name)
+    }
+}
+
+fn config_missing(path: &Path, err: &anyhow::Error) -> bool {
+    if path.exists() {
+        return false;
+    }
+    err.chain()
+        .filter_map(|e| e.downcast_ref::<std::io::Error>())
+        .any(|e| e.kind() == std::io::ErrorKind::NotFound)
+}
+
+fn seed_default_config(path: &Path) -> Result<()> {
+    let text = include_str!("../../../packaging/config.example.toml");
+    SelfCheck::parse(text)?;
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating config dir {}", parent.display()))?;
+        }
+    }
+    std::fs::write(path, text).with_context(|| format!("writing {}", path.display()))?;
+    set_mode_0600(path)?;
+    Ok(())
+}
+
+struct SelfCheck;
+
+impl SelfCheck {
+    fn parse(text: &str) -> Result<()> {
+        Config::parse_toml(text).map(|_| ())
+    }
+}
+
+#[cfg(unix)]
+fn set_mode_0600(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let perms = std::fs::Permissions::from_mode(0o600);
+    std::fs::set_permissions(path, perms).with_context(|| format!("chmod 0600 {}", path.display()))
+}
+
+#[cfg(test)]
+mod seed_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn tempdir(name: &str) -> PathBuf {
+        let n = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let p = std::env::temp_dir().join(format!(
+            "screentimed-config-test-{name}-{n}-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    #[test]
+    fn load_or_seed_creates_missing_config_0600() {
+        let path = tempdir("seed").join("config.toml");
+
+        let cfg = Config::load_or_seed(&path).unwrap();
+
+        assert_eq!(cfg.default_policy, DefaultPolicy::Unrestricted);
+        assert!(path.exists());
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
     }
 }

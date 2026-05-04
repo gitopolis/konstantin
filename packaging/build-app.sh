@@ -7,10 +7,20 @@
 #
 # Output: target/Konstantin.app/
 #
-# The bundle is ad-hoc codesigned (`codesign -s -`) so it loads on Apple
-# Silicon — the kernel rejects unsigned binaries since macOS 11. Ad-hoc
-# signing does NOT grant Gatekeeper trust; for distribution outside
-# Homebrew cask you'd still need Developer ID + notarization.
+# Signing:
+#   * If $CODESIGN_IDENTITY is set, sign each Mach-O with that Developer
+#     ID identity, hardened runtime (`--options runtime`), and an RFC
+#     3161 timestamp — the format Apple's notary service requires.
+#     Notarization itself is a separate step (the release workflow does
+#     it; local dev shouldn't pay the network round-trip on every build).
+#   * Otherwise, ad-hoc sign (`codesign -s -`) so the bundle still loads
+#     on Apple Silicon — the kernel rejects unsigned binaries since
+#     macOS 11. Ad-hoc does NOT grant Gatekeeper trust.
+#
+# Env vars:
+#   CODESIGN_IDENTITY      e.g. "Developer ID Application: Name (TEAMID)".
+#                          Find via `security find-identity -v -p codesigning`.
+#   CODESIGN_ENTITLEMENTS  defaults to packaging/Konstantin.entitlements.
 
 set -euo pipefail
 
@@ -54,16 +64,16 @@ install -d "${APP}/Contents/Library/LaunchDaemons"
 install -m 0755 "${TARGET}/konstantin-tray"   "${APP}/Contents/MacOS/konstantin-tray"
 
 # Resources: the daemon binary + diagnostic CLI + the example config.
-# At first-launch install (phase A2) the tray copies the daemon binary
-# from here into /usr/local/libexec/.
+# SMAppService runs the daemon in place via BundleProgram. The legacy
+# installer/update fallback still copies the daemon into /usr/local/libexec/.
 install -m 0755 "${TARGET}/screentimed"        "${APP}/Contents/Resources/screentimed"
 install -m 0755 "${TARGET}/konstantin-status"  "${APP}/Contents/Resources/konstantin-status"
 install -m 0644 "${ROOT}/packaging/config.example.toml" \
     "${APP}/Contents/Resources/config.example.toml"
 
-# LaunchDaemon plist. We hand-install (cp + bootstrap) at runtime, but
-# placing it in Contents/Library/LaunchDaemons/ matches SMAppService's
-# expected layout — easy migration if/when we have Developer ID.
+# LaunchDaemon plist for SMAppService. Legacy fallback rewrites the
+# bundled BundleProgram key into ProgramArguments after copying it to
+# /Library/LaunchDaemons/.
 install -m 0644 "${ROOT}/packaging/com.gitopolis.screentimed.plist" \
     "${APP}/Contents/Library/LaunchDaemons/com.gitopolis.screentimed.plist"
 
@@ -120,11 +130,38 @@ cat > "${APP}/Contents/Info.plist" <<EOF
 </plist>
 EOF
 
-# Ad-hoc codesign. `--deep` walks nested binaries (the daemon and CLI
-# under Resources/). `--force` overwrites any signature cargo's linker
-# left behind so the bundle has consistent signing.
-echo "→ ad-hoc codesigning"
-codesign --force --deep --sign - "${APP}" >/dev/null
+# Codesign. We sign each Mach-O explicitly, deepest-first — that's
+# the notarization-safe pattern (`--deep` is documented as legacy and
+# can leave nested binaries with weaker signatures than the wrapper).
+# `--force` overwrites any signature cargo's linker left behind so the
+# bundle has consistent signing.
+ENTITLEMENTS="${CODESIGN_ENTITLEMENTS:-${ROOT}/packaging/Konstantin.entitlements}"
+NESTED=(
+    "${APP}/Contents/Resources/screentimed"
+    "${APP}/Contents/Resources/konstantin-status"
+    "${APP}/Contents/MacOS/konstantin-tray"
+)
+
+if [[ -n "${CODESIGN_IDENTITY:-}" ]]; then
+    echo "→ codesigning with ${CODESIGN_IDENTITY}"
+    if [[ ! -f "${ENTITLEMENTS}" ]]; then
+        echo "  entitlements not found at ${ENTITLEMENTS}" >&2
+        exit 1
+    fi
+    for bin in "${NESTED[@]}"; do
+        codesign --force --options runtime --timestamp \
+                 --entitlements "${ENTITLEMENTS}" \
+                 --sign "${CODESIGN_IDENTITY}" "${bin}" >/dev/null
+    done
+    codesign --force --options runtime --timestamp \
+             --sign "${CODESIGN_IDENTITY}" "${APP}" >/dev/null
+else
+    echo "→ ad-hoc codesigning (set \$CODESIGN_IDENTITY for Developer ID)"
+    for bin in "${NESTED[@]}"; do
+        codesign --force --sign - "${bin}" >/dev/null
+    done
+    codesign --force --sign - "${APP}" >/dev/null
+fi
 
 # Validate. `codesign --verify` failing is a build-stop bug — without a
 # valid signature the bundle won't launch on Apple Silicon.

@@ -178,8 +178,9 @@ Notable consequences:
 
 ### Logs
 
-When run as a LaunchAgent, stdout/stderr go to `/tmp/konstantin-tray.out.log`
-and `/tmp/konstantin-tray.err.log` (configurable in the plist).
+When run as a LaunchAgent, stdout/stderr go to
+`~/Library/Logs/konstantin-tray.out.log` and
+`~/Library/Logs/konstantin-tray.err.log` for the target user.
 
 ## Building
 

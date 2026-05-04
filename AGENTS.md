@@ -1,9 +1,9 @@
-# Project context for Claude
+# Project context for Codex
 
 A macOS screen-time enforcer in Rust. This file is the design handoff —
 read it before making changes so decisions stay consistent.
 
-Owner: Nikita (qnicks@gmail.com). Target machine: macOS Tahoe on Apple
+Owner: Nikita Kutselev. Target machine: macOS Tahoe on Apple
 Silicon. Rust edition 2021, MSRV 1.78. Distribution intent: Homebrew
 cask shipping an unsigned `Konstantin.app` bundle. Developer ID
 notarization is out of scope for v1.
@@ -91,7 +91,7 @@ root. Each invocation is one-shot — no persistent privilege handle.
 Daemon-running detection: try to connect to the socket. Cheap, no
 privileges, no `launchctl print` parsing. The worker thread's existing
 `disconnected` flag drives both the menu-item enabled state and the
-red-dot status indicator.
+muted-glyph status indicator.
 
 ## Decisions locked in
 
@@ -147,11 +147,15 @@ These were Nikita's choices; revisit explicitly before changing them.
    warning, not 15 m / 10 m). Re-arm on day rollover detected via
    `UserStatus::resets_at` change.
 
-6. **Notifications via `osascript`** (not `UNUserNotificationCenter`).
-   `osascript` is signed by Apple, so notifications work without TCC
-   consent or bundle signing. Trade: notifications attribute to
-   "Script Editor" rather than "Konstantin". `UNUserNotificationCenter`
-   is the future path once Developer ID signing is in place.
+6. **Notifications via `UNUserNotificationCenter`.** Now that the
+   bundle is Developer ID signed and notarized, threshold warnings
+   attribute to "Konstantin" with the bundle icon. `notifications::
+   request_authorization` runs once at tray startup so the TCC
+   consent sheet appears proactively. The decision logic
+   (`NotifTracker`) is unchanged from phase 7 — only the delivery
+   side moved from `osascript` to `UNUserNotificationCenter`.
+   Bare `cargo run` (no NSBundle context) still no-ops with a
+   tracing warning instead of crashing.
 
 7. **`.app` bundle is the canonical install path.** The bundle ships
    the daemon binary at `Contents/Resources/screentimed`. On
@@ -169,11 +173,44 @@ These were Nikita's choices; revisit explicitly before changing them.
    / Restart affect the one shared daemon; Configure edits
    `/etc/screentimed/config.toml`. There is no per-user mode.
 
-10. **Status item: red dot when daemon is down**, formatted remaining
-    time when it's up. Detection is the worker's `disconnected` flag,
-    driven by socket-connect success.
+10. **Status item: `clock` SF Symbol always.** When connected the
+    image is a template (menu bar tints it for light/dark); when
+    disconnected we apply an `NSImageSymbolConfiguration` with
+    `secondaryLabelColor` and clear the template flag so the muted
+    gray sticks — `NSStatusBarButton` ignores `contentTintColor` for
+    template images, so the color has to be baked into the symbol.
+    Connected state shows the glyph followed by formatted remaining
+    time; disconnected shows the gray glyph alone. Detection is the
+    worker's `disconnected` flag, driven by socket-connect success.
 
-## What's already built (phases 1–7 + A1–A7)
+11. **Updates: GitHub Releases, sha256-verified, in-place.** The
+    `Check for Updates…` menu action calls
+    `api.github.com/repos/gitopolis/konstantin/releases/latest`,
+    looks up the asset matching the running architecture
+    (`Konstantin-<version>-<arch>.zip`), reads the SHA-256 from the
+    API's per-asset `digest` field (`"sha256:<hex>"` — the same hash
+    GitHub displays on the release page; we don't ship a separate
+    sidecar), streams the zip to a per-pid temp dir, verifies the
+    hash, unzips, strips the quarantine attribute, and runs one
+    privileged bash script via `admin::run_with_progress` that swaps
+    the bundle in place at `bundle::Paths::resolve()?.bundle_root`
+    (NOT a hardcoded `/Applications/...` — works for any install
+    location). The script self-rolls back if the new daemon doesn't
+    open `/var/run/screentimed.sock` within 20 seconds of `launchctl
+    bootstrap`, all inside the same elevation, so the user types
+    their admin password once even when something fails. Distinct
+    exit codes (10/11 → no state change, 20–23 → rollback already
+    ran, 50 → catastrophic) drive matching alert messages. After a
+    successful install the running tray spawns the new tray binary
+    out of the freshly installed bundle and `terminate:`s itself.
+    Architecture mapping (`aarch64`→`arm64`, `x86_64`→`x86_64`) is
+    kept in `update::current_arch_label` — a single point of agreement
+    with release.yml's matrix `arch:` field. Only canonical URLs
+    matching the expected `releases/download/<tag>/<filename>` shape
+    are trusted. Dev-tree runs (`bundle::Source::DevTree`) refuse to
+    update — the operator runs `cargo build` instead.
+
+## What's already built (phases 1–7 + A1–A9)
 
 * **Phase 1** — proto + framing + peer-creds auth, `GetStatus` returns
   real status from current state.
@@ -220,10 +257,12 @@ These were Nikita's choices; revisit explicitly before changing them.
   / configure: / openLog: / uninstall:` selectors. Lifecycle commands
   use `|| true`-tolerant launchctl chains so already-loaded /
   already-stopped states are idempotent.
-* **A5** — state-driven UI: 🔴 when `disconnected`, formatted time
-  otherwise. Menu items enable/disable from the same flag.
-  `Latest::default()` starts in `disconnected: true` so initial UI is
-  honest.
+* **A5** — state-driven UI: muted `clock` SF Symbol when
+  `disconnected` (gray baked into the image via an
+  `NSImageSymbolConfiguration` with `secondaryLabelColor`), the same
+  glyph as a template image plus formatted time when connected. Menu
+  items enable/disable from the same flag. `Latest::default()` starts
+  in `disconnected: true` so initial UI is honest.
 * **A6** — `bundle::Paths::resolve()` handles both real `.app` bundles
   and dev-tree (`target/<profile>/` + `packaging/`). Source labelled
   in startup log. User LaunchAgent rewrite is bundle-only — running
@@ -231,15 +270,17 @@ These were Nikita's choices; revisit explicitly before changing them.
   `~/Library/LaunchAgents/` with a dev path.
 * **A7** — `Uninstall…` menu item: confirm → privileged teardown
   (`launchctl bootout` + `rm` of system files) → user LaunchAgent
-  cleanup → `NSApplication::terminate`.
-  `packaging/konstantin.rb` cask formula has matching `uninstall` +
-  `zap` stanzas for non-interactive `brew uninstall --zap`.
+  cleanup → `NSApplication::terminate`. The cask formula in the
+  separate tap repo (`github.com/gitopolis/homebrew-konstantin`,
+  `Casks/konstantin.rb`) carries matching `uninstall` + `zap` stanzas
+  for non-interactive `brew uninstall --zap`; the release workflow
+  auto-bumps version + sha256 there on each tag.
 * **A8** — security/UX hardening on top of A1–A7:
   * `/etc/screentimed/config.toml` is now mode 0600 root-owned at
-    every write site (`packaging/install.sh`, the tray's first-launch
-    `install::build_install_script`, and the Save flow's
-    `config_ui::build_admin_script`). Other users on the machine
-    can't see whose limits are configured.
+    every write site (the tray's first-launch
+    `install::build_install_script` and the Save flow's
+    `config_ui::build_admin_script`). Other users on the machine can't
+    see whose limits are configured.
   * `Configure…` therefore prompts for an admin password to *open*
     the window: a single `admin::run_with_progress` invocation
     (`config_ui::build_open_admin_script`) copies the config out to
@@ -257,6 +298,19 @@ These were Nikita's choices; revisit explicitly before changing them.
     the Configure window actually steals focus from the previously
     frontmost app. `NSApplication::activate()` is cooperative on
     macOS 14+ and isn't sufficient for accessory apps.
+* **A9** — in-app updater (`mod update` + `Check for Updates…` menu
+  item). Driven by `env!("CARGO_PKG_VERSION")` (CI runs `cargo
+  set-version --workspace "$VERSION"` before each release build, so
+  the value baked into a tagged binary is always correct). The
+  privileged `admin::run_with_progress` core was extracted into a
+  reusable `progress::run_with_panel<T>` primitive that takes an
+  arbitrary closure — the updater uses it twice (the unprivileged
+  download phase and as the indirection underneath
+  `admin::run_with_progress`). New deps: `ureq` (rustls-backed,
+  blocking HTTP), `sha2` (digest verification), `semver` (version
+  comparison). Asset SHA-256 is read straight from the GitHub API's
+  per-asset `digest` field — no sidecar files in the release. See
+  decision #11 for the full design.
 
 Tests, unsafe-block count: both will drift. The CI signal is
 `cargo test --workspace` clean. Don't pin counts here — they
@@ -273,9 +327,10 @@ wider distribution:
   and so we can move to `SMAppService` and `UNUserNotificationCenter`.
 * **Real `AppIcon.iconset/`** in `packaging/`. Currently the bundle
   ships with macOS's generic application icon.
-* **Homebrew tap repo** (`github.com/gitopolis/homebrew-konstantin`) hosting
-  the cask formula at `packaging/konstantin.rb`. Plus a release pipeline
-  that builds, zips, and pushes `Konstantin-<version>.zip` artifacts.
+
+The Homebrew tap is live at `github.com/gitopolis/homebrew-konstantin`
+(cask at `Casks/konstantin.rb`); the release workflow zips, uploads,
+and bumps the cask on each tag.
 
 ## Hard safety rules
 
@@ -305,33 +360,21 @@ machine.
 
 ## Build, smoke-test, install (development workflow)
 
-End users will install via Homebrew cask once A1 ships. For development,
-the existing scripts remain authoritative.
+End users install via Homebrew cask. For development, build/test the
+workspace and package the `.app`; the bundle's first-launch setup is
+the install path.
 
 ```sh
 cargo check --workspace
 cargo test  --workspace
 cargo build --release
+./packaging/build-app.sh
+open target/Konstantin.app
 ```
 
 Smoke-test without installing (no root). Use an ad-hoc config (e.g.
 at `/tmp/screentimed-smoketest.toml`, gitignored) — see
 `docs/concepts.md` for the full recipe.
-
-System install (requires root):
-
-```sh
-sudo packaging/create-test-users.sh        # makes alice + bob
-cargo build --release
-sudo packaging/install.sh                  # daemon + tray for $SUDO_USER
-sudo packaging/install.sh alice bob        # also/instead: tray for those users
-```
-
-Per-user-only tray install (no root):
-
-```sh
-./packaging/install-tray.sh
-```
 
 Uninstall:
 
@@ -340,9 +383,8 @@ sudo packaging/uninstall.sh                # daemon + binaries + tray for $SUDO_
 ./packaging/uninstall-tray.sh              # tray-only, no root
 ```
 
-`uninstall.sh` removes binaries / plists / socket but preserves
-`/etc/screentimed/` and `/var/db/screentimed/` so configs and counters
-survive reinstalls.
+`uninstall.sh` removes binaries / plists / socket / counter state but
+preserves `/etc/screentimed/` so configs survive reinstalls.
 
 ## Layout
 
@@ -363,10 +405,10 @@ konstantin/
 │                   src/bin/{status,tray}.rs            # konstantin-status + tray
 └── packaging/
     ├── com.gitopolis.screentimed.plist          # LaunchDaemon, runs as root
-    ├── com.gitopolis.konstantin-tray.plist      # LaunchAgent, Aqua-only
     ├── config.example.toml
-    ├── install.sh, uninstall.sh                 # system-side, requires sudo
-    ├── install-tray.sh, uninstall-tray.sh       # per-user, no sudo
+    ├── build-app.sh                             # app bundle builder
+    ├── uninstall.sh                             # system-side, requires sudo
+    ├── uninstall-tray.sh                        # tray-only, no sudo
     └── create-test-users.sh, delete-test-users.sh
 ```
 
