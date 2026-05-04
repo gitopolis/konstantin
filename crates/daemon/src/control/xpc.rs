@@ -6,7 +6,7 @@
 
 #![allow(dead_code)]
 
-use super::{AdminRequest, AdminResponse};
+use super::{auth, AdminRequest, AdminResponse, Controller};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
@@ -73,6 +73,40 @@ impl ResponseEnvelope {
             serde_json::from_str(json).context("parsing admin XPC response envelope")?;
         ensure_protocol_version(env.version)?;
         Ok(env)
+    }
+}
+
+pub fn handle_request_json(
+    controller: &Controller,
+    operator: &auth::Operator,
+    request_json: &str,
+) -> String {
+    let response = match RequestEnvelope::from_json(request_json) {
+        Ok(env) => {
+            let response = controller.handle(operator, env.request);
+            ResponseEnvelope::new(env.request_id, response)
+        }
+        Err(e) => ResponseEnvelope::new(
+            "",
+            AdminResponse::Error {
+                message: e.to_string(),
+            },
+        ),
+    };
+
+    match response.to_json() {
+        Ok(json) => json,
+        Err(e) => {
+            let fallback = ResponseEnvelope::new(
+                "",
+                AdminResponse::Error {
+                    message: format!("serializing admin XPC response envelope: {e}"),
+                },
+            );
+            serde_json::to_string(&fallback).unwrap_or_else(|_| {
+                r#"{"version":1,"request_id":"","response":{"kind":"error","message":"fatal response serialization error"}}"#.to_string()
+            })
+        }
     }
 }
 
@@ -209,6 +243,58 @@ pub mod dictionary {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::{Path, PathBuf};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn allowed_operator() -> auth::Operator {
+        auth::Operator {
+            uid: 501,
+            username: "admin".into(),
+            allowed: true,
+            reason: "admin".into(),
+        }
+    }
+
+    fn denied_operator() -> auth::Operator {
+        auth::Operator {
+            uid: 502,
+            username: "standard".into(),
+            allowed: false,
+            reason: "user is not in the local admin group".into(),
+        }
+    }
+
+    fn tempdir(name: &str) -> PathBuf {
+        let n = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let p = std::env::temp_dir().join(format!(
+            "screentimed-xpc-test-{name}-{n}-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    fn config_text(dir: &Path) -> String {
+        format!(
+            r#"
+socket_path = "{socket}"
+state_path = "{state}"
+tick_seconds = 5
+default_policy = "unrestricted"
+enforcement = "logout"
+kill_switch_path = "{kill_switch}"
+
+[users.alice]
+daily_limit_minutes = 120
+"#,
+            socket = dir.join("screentimed.sock").display(),
+            state = dir.join("state.json").display(),
+            kill_switch = dir.join("disable").display(),
+        )
+    }
 
     #[test]
     fn request_envelope_round_trips() {
@@ -243,6 +329,49 @@ mod tests {
         let err = RequestEnvelope::from_json(json).unwrap_err();
 
         assert!(err.to_string().contains("unsupported"));
+    }
+
+    #[test]
+    fn dispatches_request_json_through_controller() {
+        let dir = tempdir("dispatch");
+        let config_path = dir.join("config.toml");
+        std::fs::write(&config_path, config_text(&dir)).unwrap();
+        let controller = Controller::new(config_path);
+        let request = RequestEnvelope::new("abc", AdminRequest::GetEnforcementState)
+            .to_json()
+            .unwrap();
+
+        let response_json = handle_request_json(&controller, &allowed_operator(), &request);
+        let response = ResponseEnvelope::from_json(&response_json).unwrap();
+
+        assert_eq!(response.request_id, "abc");
+        assert_eq!(
+            response.response,
+            AdminResponse::EnforcementState {
+                paused: false,
+                kill_switch_path: dir.join("disable"),
+            }
+        );
+    }
+
+    #[test]
+    fn dispatch_preserves_unauthorized_response() {
+        let dir = tempdir("unauthorized");
+        let config_path = dir.join("config.toml");
+        std::fs::write(&config_path, config_text(&dir)).unwrap();
+        let controller = Controller::new(config_path);
+        let request = RequestEnvelope::new("abc", AdminRequest::GetConfig)
+            .to_json()
+            .unwrap();
+
+        let response_json = handle_request_json(&controller, &denied_operator(), &request);
+        let response = ResponseEnvelope::from_json(&response_json).unwrap();
+
+        assert_eq!(response.request_id, "abc");
+        assert!(matches!(
+            response.response,
+            AdminResponse::Unauthorized { .. }
+        ));
     }
 
     #[cfg(target_os = "macos")]
