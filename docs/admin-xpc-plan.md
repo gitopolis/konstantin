@@ -436,6 +436,9 @@ Progress tracking:
   Configure open/save `osascript` paths with admin XPC, including
   daemon-owned config writes and daemon-owned tray LaunchAgent autostart
   changes.
+* `d9dba9f feat: reload configuration over admin xpc` replaced the
+  routine Restart Daemon menu action with Reload Configuration over admin
+  XPC and added periodic pause-state refreshes for all connected trays.
 
 ### Phase 0: Documentation and scaffolding
 
