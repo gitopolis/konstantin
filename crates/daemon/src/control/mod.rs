@@ -147,8 +147,12 @@ fn schedule_uninstall_after_reply(operator_uid: u32, preserve_config: bool) {
 fn schedule_uninstall_after_reply(_operator_uid: u32, _preserve_config: bool) {}
 
 fn uninstall_system(operator_uid: u32, preserve_config: bool) -> Result<()> {
-    remove_file_if_exists(Path::new("/Library/LaunchDaemons/com.gitopolis.screentimed.plist"))?;
-    remove_file_if_exists(Path::new("/Library/LaunchAgents/com.gitopolis.konstantin-tray.plist"))?;
+    remove_file_if_exists(Path::new(
+        "/Library/LaunchDaemons/com.gitopolis.screentimed.plist",
+    ))?;
+    remove_file_if_exists(Path::new(
+        "/Library/LaunchAgents/com.gitopolis.konstantin-tray.plist",
+    ))?;
     remove_file_if_exists(Path::new("/usr/local/libexec/screentimed"))?;
     remove_file_if_exists(Path::new("/usr/local/bin/konstantin-status"))?;
     remove_file_if_exists(Path::new("/usr/local/bin/konstantin-tray"))?;
@@ -175,7 +179,8 @@ fn remove_user_tray_agents(operator_uid: u32) -> Result<()> {
     };
 
     for entry in entries {
-        let entry = entry.with_context(|| format!("reading entry under {}", users_root.display()))?;
+        let entry =
+            entry.with_context(|| format!("reading entry under {}", users_root.display()))?;
         let home = entry.path();
         if !home.is_dir() {
             continue;
@@ -253,10 +258,7 @@ fn tray_autostart_states(probes: &[TrayAutostartProbe]) -> Vec<TrayAutostartStat
         .collect()
 }
 
-fn validate_tray_autostart_request(
-    tray_exe: &Path,
-    changes: &[TrayAutostartChange],
-) -> Result<()> {
+fn validate_tray_autostart_request(tray_exe: &Path, changes: &[TrayAutostartChange]) -> Result<()> {
     validate_tray_exe(tray_exe)?;
     for change in changes {
         validate_autostart_change(change)?;

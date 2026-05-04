@@ -31,10 +31,7 @@ extern "C" {
         connection: XpcConnection,
         signing_identifier: *const c_char,
     ) -> i32;
-    fn xpc_connection_set_event_handler(
-        connection: XpcConnection,
-        handler: *mut XpcHandlerBlock,
-    );
+    fn xpc_connection_set_event_handler(connection: XpcConnection, handler: *mut XpcHandlerBlock);
     fn xpc_connection_activate(connection: XpcConnection);
     fn xpc_connection_cancel(connection: XpcConnection);
     fn xpc_connection_send_message_with_reply_sync(

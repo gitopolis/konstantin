@@ -125,7 +125,13 @@ impl Enforcer {
                     continue;
                 }
             };
-            let decision = decide(cfg, username, used, self.last_kicked.get(&uid).copied(), now);
+            let decision = decide(
+                cfg,
+                username,
+                used,
+                self.last_kicked.get(&uid).copied(),
+                now,
+            );
             if let Decision::Kick(reason) = decision {
                 self.act_on(cfg, username, uid, used, reason).await;
             }
@@ -204,14 +210,20 @@ async fn force_logout<R: LogoutRunner + ?Sized>(
     // Best-effort. We don't bail on failure here; the re-check below is
     // what tells us whether we're done.
     let _ = runner
-        .run("/bin/launchctl", vec!["bootout".into(), format!("gui/{uid}")])
+        .run(
+            "/bin/launchctl",
+            vec!["bootout".into(), format!("gui/{uid}")],
+        )
         .await
         .map_err(|e| {
             warn!(error = %e, %username, uid, step = "gui-bootout", "logout step error");
             e
         });
     let _ = runner
-        .run("/bin/launchctl", vec!["bootout".into(), format!("user/{uid}")])
+        .run(
+            "/bin/launchctl",
+            vec!["bootout".into(), format!("user/{uid}")],
+        )
         .await
         .map_err(|e| {
             warn!(error = %e, %username, uid, step = "user-bootout", "logout step error");
@@ -234,7 +246,10 @@ async fn force_logout<R: LogoutRunner + ?Sized>(
         "bootouts did not terminate session, escalating to pkill -KILL -U"
     );
     let ok = runner
-        .run("/usr/bin/pkill", vec!["-KILL".into(), "-U".into(), uid.to_string()])
+        .run(
+            "/usr/bin/pkill",
+            vec!["-KILL".into(), "-U".into(), uid.to_string()],
+        )
         .await
         .with_context(|| format!("pkill -KILL -U {uid}"))?;
     if !ok {
@@ -313,14 +328,22 @@ mod tests {
 
     #[test]
     fn configured_user_under_limit_is_noop() {
-        let cfg = cfg_with(Enforcement::Logout, DefaultPolicy::Unrestricted, &[("alice", 30)]);
+        let cfg = cfg_with(
+            Enforcement::Logout,
+            DefaultPolicy::Unrestricted,
+            &[("alice", 30)],
+        );
         let now = Instant::now();
         assert_eq!(decide(&cfg, "alice", 100, None, now), Decision::NoOp);
     }
 
     #[test]
     fn configured_user_at_limit_kicks_for_limit_reached() {
-        let cfg = cfg_with(Enforcement::Logout, DefaultPolicy::Unrestricted, &[("alice", 1)]);
+        let cfg = cfg_with(
+            Enforcement::Logout,
+            DefaultPolicy::Unrestricted,
+            &[("alice", 1)],
+        );
         let now = Instant::now();
         assert_eq!(
             decide(&cfg, "alice", 60, None, now),
@@ -353,7 +376,11 @@ mod tests {
 
     #[test]
     fn backoff_suppresses_repeat_kick() {
-        let cfg = cfg_with(Enforcement::Logout, DefaultPolicy::Unrestricted, &[("alice", 1)]);
+        let cfg = cfg_with(
+            Enforcement::Logout,
+            DefaultPolicy::Unrestricted,
+            &[("alice", 1)],
+        );
         let now = Instant::now();
         // Just kicked 1 ms ago.
         let recent = now - Duration::from_millis(1);

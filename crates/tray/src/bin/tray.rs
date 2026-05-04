@@ -40,15 +40,15 @@ mod imp {
     };
     // `NSApplicationActivationPolicy` is declared in the
     // NSRunningApplication header, not NSApplication's.
-    use objc2_app_kit::NSApplicationActivationPolicy;
-    use objc2_foundation::{MainThreadMarker, NSString, NSTimer};
     use konstantin_proto::admin::{
         AdminRequest, AdminResponse, TrayAutostartChange, TrayAutostartProbe, TrayAutostartState,
     };
-    use konstantin_tray::admin_xpc::AdminClient;
     use konstantin_proto::{SessionState, UserStatus};
+    use konstantin_tray::admin_xpc::AdminClient;
     use konstantin_tray::notifications::{self, NotifTracker};
     use konstantin_tray::{default_socket_path, format_remaining, Subscription};
+    use objc2_app_kit::NSApplicationActivationPolicy;
+    use objc2_foundation::{MainThreadMarker, NSString, NSTimer};
     use std::ptr::NonNull;
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
@@ -137,8 +137,8 @@ mod imp {
             Err(e) => tracing::warn!(error = %e, "could not resolve bundle paths"),
         }
 
-        let mtm = MainThreadMarker::new()
-            .expect("konstantin-tray must be launched on the main thread");
+        let mtm =
+            MainThreadMarker::new().expect("konstantin-tray must be launched on the main thread");
 
         let app = NSApplication::sharedApplication(mtm);
         // Accessory: menu-bar item only — no Dock icon, no main menu.
@@ -214,10 +214,18 @@ mod imp {
         // calls in the drain timer are authoritative.
         menu.setAutoenablesItems(false);
 
-        let pause_enforcement_item =
-            make_action_item(mtm, "Pause Enforcement", sel!(toggleEnforcement:), controller);
-        let reload_item =
-            make_action_item(mtm, "Reload Configuration", sel!(reloadConfiguration:), controller);
+        let pause_enforcement_item = make_action_item(
+            mtm,
+            "Pause Enforcement",
+            sel!(toggleEnforcement:),
+            controller,
+        );
+        let reload_item = make_action_item(
+            mtm,
+            "Reload Configuration",
+            sel!(reloadConfiguration:),
+            controller,
+        );
 
         // Initial enable-state matches the default `disconnected: true`
         // — daemon-mediated controls wait until the worker reports back.
@@ -243,8 +251,12 @@ mod imp {
         // check has surfaced a newer release that the user deferred
         // via "Later" — drain timer drives the morph from
         // `Latest::pending_update`.
-        let updates_item =
-            make_action_item(mtm, "Check for Updates…", sel!(checkForUpdates:), controller);
+        let updates_item = make_action_item(
+            mtm,
+            "Check for Updates…",
+            sel!(checkForUpdates:),
+            controller,
+        );
         updates_item.setEnabled(true);
         menu.addItem(&updates_item);
 
@@ -371,8 +383,7 @@ mod imp {
         let block = RcBlock::new(move |_timer: NonNull<NSTimer>| {
             // Block fires on the main thread (run loop where the timer was
             // scheduled), so we can re-derive the marker safely.
-            let mtm = MainThreadMarker::new()
-                .expect("drain timer must fire on the main thread");
+            let mtm = MainThreadMarker::new().expect("drain timer must fire on the main thread");
             let (pending, disconnected, pending_update_version, enforcement_paused) = {
                 let mut g = latest.lock().expect("latest mutex");
                 (
@@ -506,12 +517,7 @@ mod imp {
     /// template flag — `NSStatusBarButton` ignores `contentTintColor`
     /// for template images, so we have to encode the gray in the image
     /// itself.
-    fn apply_visual(
-        item: &NSStatusItem,
-        disconnected: bool,
-        label: &str,
-        mtm: MainThreadMarker,
-    ) {
+    fn apply_visual(item: &NSStatusItem, disconnected: bool, label: &str, mtm: MainThreadMarker) {
         let Some(button) = item.button(mtm) else {
             return;
         };
@@ -674,16 +680,12 @@ mod imp {
                     .parent()
                     .and_then(|p| p.parent())
                     .ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "can't infer workspace root from {}",
-                            exe.display()
-                        )
+                        anyhow::anyhow!("can't infer workspace root from {}", exe.display())
                     })?;
 
                 Ok(Self {
                     daemon_binary: profile_dir.join("screentimed"),
-                    daemon_plist: workspace
-                        .join("packaging/com.gitopolis.screentimed.plist"),
+                    daemon_plist: workspace.join("packaging/com.gitopolis.screentimed.plist"),
                     config_example: workspace.join("packaging/config.example.toml"),
                     source: Source::DevTree,
                     bundle_root: None,
@@ -767,9 +769,8 @@ mod imp {
                 || -> Result<bool> {
                     let paused = query_enforcement_paused()?;
                     let target = !paused;
-                    let changed = AdminClient::send(AdminRequest::SetEnforcementPaused {
-                        paused: target,
-                    })?;
+                    let changed =
+                        AdminClient::send(AdminRequest::SetEnforcementPaused { paused: target })?;
                     match changed {
                         AdminResponse::EnforcementState { paused, .. } => Ok(paused),
                         AdminResponse::Unauthorized { reason } => {
@@ -866,9 +867,11 @@ mod imp {
                 "Uninstalling Konstantin",
                 "Stopping the background service and removing files…",
                 "konstantin-tray-uninstall",
-                || AdminClient::send(AdminRequest::Uninstall {
-                    preserve_config: true,
-                }),
+                || {
+                    AdminClient::send(AdminRequest::Uninstall {
+                        preserve_config: true,
+                    })
+                },
             );
 
             match outcome {
@@ -1044,11 +1047,7 @@ mod imp {
             }
         }
 
-        fn build_panel(
-            mtm: MainThreadMarker,
-            title: &str,
-            message: &str,
-        ) -> Retained<NSPanel> {
+        fn build_panel(mtm: MainThreadMarker, title: &str, message: &str) -> Retained<NSPanel> {
             let content_rect = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(380.0, 110.0));
             let style = NSWindowStyleMask::Titled;
             let backing = NSBackingStoreType::Buffered;
@@ -1130,12 +1129,9 @@ mod imp {
             // AppleScript double-quoted strings escape `\` and `"`. We
             // build single-line bash here so no newline escaping is
             // needed.
-            let escaped = bash_command
-                .replace('\\', "\\\\")
-                .replace('"', "\\\"");
-            let applescript = format!(
-                r#"do shell script "{escaped}" with administrator privileges"#
-            );
+            let escaped = bash_command.replace('\\', "\\\\").replace('"', "\\\"");
+            let applescript =
+                format!(r#"do shell script "{escaped}" with administrator privileges"#);
             let output = std::process::Command::new("/usr/bin/osascript")
                 .arg("-e")
                 .arg(&applescript)
@@ -1156,9 +1152,9 @@ mod imp {
 
     mod service_management {
         use super::*;
+        use objc2::msg_send;
         use objc2::rc::Retained;
         use objc2::runtime::{AnyClass, AnyObject};
-        use objc2::msg_send;
         use objc2_foundation::NSString;
         use std::ptr;
 
@@ -1440,8 +1436,8 @@ mod imp {
                 .as_str()
                 .ok_or_else(|| Error::Parse("missing tag_name".into()))?;
             let version_str = tag.strip_prefix('v').unwrap_or(tag);
-            let version = Version::parse(version_str)
-                .map_err(|e| Error::Parse(format!("tag {tag}: {e}")))?;
+            let version =
+                Version::parse(version_str).map_err(|e| Error::Parse(format!("tag {tag}: {e}")))?;
             let arch = current_arch_label().ok_or(Error::UnsupportedEnvironment)?;
             let asset_name = format!("Konstantin-{version}-{arch}.zip");
 
@@ -1482,9 +1478,7 @@ mod imp {
                 .strip_prefix("sha256:")
                 .ok_or_else(|| Error::Parse(format!("digest is not sha256-prefixed: {s}")))?;
             if hex.len() != 64 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
-                return Err(Error::Parse(format!(
-                    "digest is not 64 hex chars: {hex}"
-                )));
+                return Err(Error::Parse(format!("digest is not 64 hex chars: {hex}")));
             }
             Ok(hex.to_ascii_lowercase())
         }
@@ -1530,9 +1524,7 @@ mod imp {
                 .status()
                 .map_err(|e| Error::Unpack(format!("spawn unzip: {e}")))?;
             if !status.success() {
-                return Err(Error::Unpack(format!(
-                    "unzip exited with {status}"
-                )));
+                return Err(Error::Unpack(format!("unzip exited with {status}")));
             }
             Ok(())
         }
@@ -1690,7 +1682,11 @@ exit 0"#,
 
         fn classify_failure(stderr: &str) -> (&'static str, String) {
             // Pull a trailing `\n`-terminated line for "Details: …".
-            let detail = stderr.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("");
+            let detail = stderr
+                .lines()
+                .rev()
+                .find(|l| !l.trim().is_empty())
+                .unwrap_or("");
             match exit_code_from_stderr(stderr) {
                 Some(10 | 11) => (
                     "Update Failed",
@@ -1787,11 +1783,7 @@ exit 0"#,
                     }
                 }
                 Err(e) => {
-                    alerts::message(
-                        mtm,
-                        "Couldn't Check for Updates",
-                        &format!("{e}"),
-                    );
+                    alerts::message(mtm, "Couldn't Check for Updates", &format!("{e}"));
                 }
             }
         }
@@ -1801,11 +1793,7 @@ exit 0"#,
         /// the prior version in place (errors before the rollback path)
         /// or self-rolls back (errors during install). We just translate
         /// the exit code into a user message.
-        pub fn run_install_flow(
-            mtm: MainThreadMarker,
-            paths: &bundle::Paths,
-            release: &Release,
-        ) {
+        pub fn run_install_flow(mtm: MainThreadMarker, paths: &bundle::Paths, release: &Release) {
             let Some(bundle_root) = paths.bundle_root.clone() else {
                 alerts::message(
                     mtm,
@@ -1816,8 +1804,8 @@ exit 0"#,
             };
 
             // 1. Working dir + RAII cleanup.
-            let work_dir = std::env::temp_dir()
-                .join(format!("konstantin-update-{}", std::process::id()));
+            let work_dir =
+                std::env::temp_dir().join(format!("konstantin-update-{}", std::process::id()));
             let _wd_guard = WorkDirGuard(work_dir.clone());
             if let Err(e) = std::fs::create_dir_all(&work_dir) {
                 alerts::message(
@@ -2118,7 +2106,7 @@ exit 0"#,
             if !alerts::confirm(
                 mtm,
                 "Set up Konstantin",
-                 "Konstantin needs to install its background service. \
+                "Konstantin needs to install its background service. \
                  macOS may ask an administrator to approve it.",
                 "Set Up…",
                 "Quit",
@@ -2129,11 +2117,7 @@ exit 0"#,
                 Ok(p) => p,
                 Err(e) => {
                     tracing::error!(error = %e, "could not resolve bundle paths");
-                    alerts::message(
-                        mtm,
-                        "Could not locate bundled resources.",
-                        &format!("{e}"),
-                    );
+                    alerts::message(mtm, "Could not locate bundled resources.", &format!("{e}"));
                     return false;
                 }
             };
@@ -2231,8 +2215,7 @@ exit 0"#,
         /// instance.
         pub fn ensure_user_launchagent() -> anyhow::Result<()> {
             let exe = std::env::current_exe()?;
-            let home = std::env::var("HOME")
-                .map_err(|_| anyhow::anyhow!("HOME not set"))?;
+            let home = std::env::var("HOME").map_err(|_| anyhow::anyhow!("HOME not set"))?;
             let home = PathBuf::from(home);
             let agents_dir = home.join("Library/LaunchAgents");
             std::fs::create_dir_all(&agents_dir)?;
@@ -2364,9 +2347,8 @@ exit 0"#,
 
                 assert!(script.contains("Delete :BundleProgram"));
                 assert!(script.contains("Add :ProgramArguments array"));
-                assert!(script.contains(
-                    "Add :ProgramArguments:0 string /usr/local/libexec/screentimed"
-                ));
+                assert!(script
+                    .contains("Add :ProgramArguments:0 string /usr/local/libexec/screentimed"));
             }
         }
     }
@@ -2387,6 +2369,7 @@ exit 0"#,
     /// kickstart.
     mod config_ui {
         use super::*;
+        use konstantin_tray::users::{self, LocalUser, UserPicture};
         use objc2::define_class;
         use objc2::rc::Retained;
         use objc2::runtime::{AnyObject, NSObject};
@@ -2397,7 +2380,6 @@ exit 0"#,
             NSWindowStyleMask,
         };
         use objc2_foundation::{NSData, NSPoint, NSRect, NSSize};
-        use konstantin_tray::users::{self, LocalUser, UserPicture};
         use std::cell::RefCell;
         use std::path::{Path, PathBuf};
 
@@ -3124,8 +3106,7 @@ exit 0"#,
                     .iter()
                     .map(|r| {
                         let limited = r.limit_check.state() == NSControlStateValueOn;
-                        let autostart_target =
-                            r.autostart_check.state() == NSControlStateValueOn;
+                        let autostart_target = r.autostart_check.state() == NSControlStateValueOn;
                         let minutes = r
                             .minutes_field
                             .stringValue()
@@ -3199,7 +3180,10 @@ exit 0"#,
                 .iter()
                 .map(|n| toml::Value::Integer(*n as i64))
                 .collect();
-            table.insert("warn_thresholds_minutes".to_string(), toml::Value::Array(arr));
+            table.insert(
+                "warn_thresholds_minutes".to_string(),
+                toml::Value::Array(arr),
+            );
 
             let mut users_table = toml::value::Table::new();
             for row in &snap.rows {

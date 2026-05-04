@@ -19,10 +19,10 @@ use crate::config::Config;
 use crate::state::State;
 use crate::time::next_local_midnight;
 use anyhow::{Context, Result};
-use nix::unistd::{getpeereid, User};
 use konstantin_proto::{
     read_frame, write_frame, FrameError, Request, Response, SessionState, UserStatus,
 };
+use nix::unistd::{getpeereid, User};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
