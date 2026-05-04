@@ -119,11 +119,13 @@ fn ensure_protocol_version(version: u64) -> Result<()> {
 
 #[cfg(target_os = "macos")]
 pub mod ffi {
+    use block2::Block;
     use std::ffi::{c_char, c_void};
 
     pub type XpcObject = *mut c_void;
     pub type XpcConnection = XpcObject;
     pub type DispatchQueue = *mut c_void;
+    pub type XpcHandlerBlock = Block<dyn Fn(XpcObject)>;
 
     pub const XPC_CONNECTION_MACH_SERVICE_LISTENER: u64 = 1 << 0;
 
@@ -141,8 +143,13 @@ pub mod ffi {
 
         pub fn xpc_connection_get_euid(connection: XpcConnection) -> u32;
 
+        pub fn xpc_connection_set_event_handler(
+            connection: XpcConnection,
+            handler: *mut XpcHandlerBlock,
+        );
         pub fn xpc_connection_activate(connection: XpcConnection);
         pub fn xpc_connection_cancel(connection: XpcConnection);
+        pub fn xpc_connection_send_message(connection: XpcConnection, message: XpcObject);
 
         pub fn xpc_connection_send_message_with_reply_sync(
             connection: XpcConnection,
@@ -176,6 +183,13 @@ pub mod dictionary {
     }
 
     impl OwnedObject {
+        pub fn from_raw(raw: ffi::XpcObject) -> Result<Self> {
+            if raw.is_null() {
+                anyhow::bail!("XPC object pointer was NULL");
+            }
+            Ok(Self { raw })
+        }
+
         pub fn empty_dictionary() -> Result<Self> {
             let raw = unsafe { ffi::xpc_dictionary_create_empty() };
             if raw.is_null() {
@@ -238,6 +252,196 @@ pub mod dictionary {
     fn cstring(value: &str, what: &str) -> Result<CString> {
         CString::new(value).with_context(|| format!("{what} contains an interior NUL byte"))
     }
+}
+
+#[cfg(target_os = "macos")]
+pub struct ControlListener {
+    listener: ffi::XpcConnection,
+    _handler: block2::RcBlock<dyn Fn(ffi::XpcObject)>,
+}
+
+#[cfg(target_os = "macos")]
+impl ControlListener {
+    pub fn start(config_path: std::path::PathBuf) -> Result<Self> {
+        use block2::RcBlock;
+        use std::ffi::CString;
+        use std::ptr;
+        use std::sync::Arc;
+
+        let service_name = CString::new(MACH_SERVICE_NAME).context("XPC service name")?;
+        let listener = unsafe {
+            ffi::xpc_connection_create_mach_service(
+                service_name.as_ptr(),
+                ptr::null_mut(),
+                ffi::XPC_CONNECTION_MACH_SERVICE_LISTENER,
+            )
+        };
+        if listener.is_null() {
+            anyhow::bail!("xpc_connection_create_mach_service returned NULL");
+        }
+
+        let signing_identifier =
+            CString::new(TRAY_SIGNING_IDENTIFIER).context("XPC peer signing identifier")?;
+        let peer_req_status = unsafe {
+            ffi::xpc_connection_set_peer_team_identity_requirement(
+                listener,
+                signing_identifier.as_ptr(),
+            )
+        };
+        if peer_req_status != 0 {
+            tracing::warn!(
+                status = peer_req_status,
+                signing_identifier = TRAY_SIGNING_IDENTIFIER,
+                "could not set XPC peer team identity requirement"
+            );
+        }
+
+        let controller = Arc::new(Controller::new(config_path));
+        let handler_controller = controller.clone();
+        let handler = RcBlock::new(move |peer: ffi::XpcObject| {
+            if peer.is_null() {
+                tracing::debug!("admin XPC listener received NULL peer");
+                return;
+            }
+            unsafe {
+                accept_peer(peer, handler_controller.clone());
+            }
+        });
+
+        unsafe {
+            ffi::xpc_connection_set_event_handler(listener, RcBlock::as_ptr(&handler));
+            ffi::xpc_connection_activate(listener);
+        }
+
+        tracing::info!(service = MACH_SERVICE_NAME, "admin XPC listener active");
+        Ok(Self {
+            listener,
+            _handler: handler,
+        })
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for ControlListener {
+    fn drop(&mut self) {
+        if !self.listener.is_null() {
+            unsafe {
+                ffi::xpc_connection_cancel(self.listener);
+                ffi::xpc_release(self.listener);
+            }
+            self.listener = std::ptr::null_mut();
+        }
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+pub struct ControlListener;
+
+#[cfg(not(target_os = "macos"))]
+impl ControlListener {
+    pub fn start(_config_path: std::path::PathBuf) -> Result<Self> {
+        anyhow::bail!("admin XPC is only available on macOS");
+    }
+}
+
+#[cfg(target_os = "macos")]
+unsafe fn accept_peer(peer: ffi::XpcConnection, controller: std::sync::Arc<Controller>) {
+    use block2::RcBlock;
+
+    let euid = ffi::xpc_connection_get_euid(peer);
+    let operator = auth::operator_from_uid(euid);
+    tracing::debug!(
+        euid,
+        username = %operator.username,
+        allowed = operator.allowed,
+        "admin XPC peer connected"
+    );
+
+    let peer_handler = RcBlock::new(move |message: ffi::XpcObject| {
+        if message.is_null() {
+            tracing::debug!("admin XPC peer received NULL message");
+            return;
+        }
+        unsafe {
+            handle_peer_message(message, peer, controller.clone(), &operator);
+        }
+    });
+
+    ffi::xpc_connection_set_event_handler(peer, RcBlock::as_ptr(&peer_handler));
+    ffi::xpc_connection_activate(peer);
+}
+
+#[cfg(target_os = "macos")]
+unsafe fn handle_peer_message(
+    message: ffi::XpcObject,
+    peer: ffi::XpcConnection,
+    controller: std::sync::Arc<Controller>,
+    operator: &auth::Operator,
+) {
+    let response_json = match borrowed_dictionary_string(message, KEY_PAYLOAD_JSON) {
+        Ok(Some(request_json)) => handle_request_json(&controller, operator, &request_json),
+        Ok(None) => error_response_json("admin XPC request missing payload_json"),
+        Err(e) => error_response_json(&e.to_string()),
+    };
+
+    let reply = ffi::xpc_dictionary_create_reply(message);
+    if reply.is_null() {
+        tracing::warn!("admin XPC request had no reply context");
+        return;
+    }
+
+    let response = match dictionary::OwnedObject::from_raw(reply) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(error = %e, "could not wrap admin XPC reply dictionary");
+            ffi::xpc_release(reply);
+            return;
+        }
+    };
+    if let Err(e) = response.set_string(KEY_PAYLOAD_JSON, &response_json) {
+        tracing::warn!(error = %e, "could not populate admin XPC reply");
+        return;
+    }
+    let ok = ResponseEnvelope::from_json(&response_json)
+        .map(|env| {
+            !matches!(
+                env.response,
+                AdminResponse::Error { .. } | AdminResponse::Unauthorized { .. }
+            )
+        })
+        .unwrap_or(false);
+    let _ = response.set_bool(KEY_OK, ok);
+    ffi::xpc_connection_send_message(peer, response.raw());
+}
+
+#[cfg(target_os = "macos")]
+unsafe fn borrowed_dictionary_string(object: ffi::XpcObject, key: &str) -> Result<Option<String>> {
+    use std::ffi::{CStr, CString};
+    let key = CString::new(key).context("dictionary key contains an interior NUL byte")?;
+    let ptr = ffi::xpc_dictionary_get_string(object, key.as_ptr());
+    if ptr.is_null() {
+        return Ok(None);
+    }
+    Ok(Some(
+        CStr::from_ptr(ptr)
+            .to_str()
+            .context("XPC string was not UTF-8")?
+            .to_string(),
+    ))
+}
+
+#[cfg(target_os = "macos")]
+fn error_response_json(message: &str) -> String {
+    ResponseEnvelope::new(
+        "",
+        AdminResponse::Error {
+            message: message.to_string(),
+        },
+    )
+    .to_json()
+    .unwrap_or_else(|_| {
+        r#"{"version":1,"request_id":"","response":{"kind":"error","message":"fatal response serialization error"}}"#.to_string()
+    })
 }
 
 #[cfg(test)]

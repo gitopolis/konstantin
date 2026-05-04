@@ -85,6 +85,13 @@ async fn main() -> Result<()> {
     let server = ipc::Server::bind(cfg.clone(), state.clone(), tick_tx.clone())
         .await
         .context("binding IPC socket")?;
+    let _control_listener = match control::xpc::ControlListener::start(config_path.clone()) {
+        Ok(listener) => Some(listener),
+        Err(e) => {
+            warn!(error = %e, "admin XPC listener unavailable");
+            None
+        }
+    };
 
     let ticker_state = state.clone();
     let ticker_cfg = cfg.clone();
