@@ -17,6 +17,7 @@
 //!     resolved `SessionState`
 
 mod config;
+mod control;
 mod enforcement;
 mod ipc;
 mod sessions;

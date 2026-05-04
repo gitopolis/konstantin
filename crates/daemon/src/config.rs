@@ -101,12 +101,16 @@ impl Config {
     pub fn load(path: &Path) -> Result<Self> {
         let text = std::fs::read_to_string(path)
             .with_context(|| format!("reading config file {}", path.display()))?;
-        let cfg: Self = toml::from_str(&text).context("parsing config TOML")?;
+        Self::parse_toml(&text)
+    }
+
+    pub fn parse_toml(text: &str) -> Result<Self> {
+        let cfg: Self = toml::from_str(text).context("parsing config TOML")?;
         cfg.validate()?;
         Ok(cfg)
     }
 
-    fn validate(&self) -> Result<()> {
+    pub(crate) fn validate(&self) -> Result<()> {
         if self.tick_seconds == 0 {
             anyhow::bail!("tick_seconds must be > 0");
         }
