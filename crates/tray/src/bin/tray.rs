@@ -603,7 +603,7 @@ mod imp {
 
         /// Where we found the bundled artifacts. Useful for logs and
         /// for telling devs apart from end users.
-        #[derive(Debug, Clone, Copy)]
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
         pub enum Source {
             /// Resolved from a real `.app` bundle's `Contents/`.
             Bundle,
@@ -1209,6 +1209,93 @@ mod imp {
         }
     }
 
+    mod service_management {
+        use super::*;
+        use objc2::rc::Retained;
+        use objc2::runtime::{AnyClass, AnyObject};
+        use objc2::msg_send;
+        use objc2_foundation::NSString;
+        use std::ptr;
+
+        #[link(name = "ServiceManagement", kind = "framework")]
+        extern "C" {}
+
+        const DAEMON_PLIST_NAME: &str = "com.gitopolis.screentimed.plist";
+
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        pub enum Status {
+            NotRegistered,
+            Enabled,
+            RequiresApproval,
+            NotFound,
+            Unknown(isize),
+        }
+
+        pub fn daemon_status() -> Result<Status> {
+            let service = daemon_service()?;
+            let raw: isize = unsafe { msg_send![&*service, status] };
+            Ok(Status::from_raw(raw))
+        }
+
+        pub fn register_daemon() -> Result<Status> {
+            let service = daemon_service()?;
+            let mut error: *mut AnyObject = ptr::null_mut();
+            let ok: bool = unsafe { msg_send![&*service, registerAndReturnError: &mut error] };
+            if !ok {
+                let status = daemon_status().unwrap_or(Status::NotFound);
+                if matches!(status, Status::Enabled | Status::RequiresApproval) {
+                    return Ok(status);
+                }
+                anyhow::bail!("{}", error_message(error));
+            }
+            daemon_status()
+        }
+
+        pub fn open_login_items_settings() {
+            if let Some(cls) = sm_app_service_class() {
+                unsafe {
+                    let _: () = msg_send![cls, openSystemSettingsLoginItems];
+                }
+            }
+        }
+
+        fn daemon_service() -> Result<Retained<AnyObject>> {
+            let cls = sm_app_service_class()
+                .ok_or_else(|| anyhow::anyhow!("SMAppService is unavailable"))?;
+            let plist = NSString::from_str(DAEMON_PLIST_NAME);
+            let service: Option<Retained<AnyObject>> =
+                unsafe { msg_send![cls, daemonServiceWithPlistName: &*plist] };
+            service.ok_or_else(|| anyhow::anyhow!("SMAppService returned nil daemon service"))
+        }
+
+        fn sm_app_service_class() -> Option<&'static AnyClass> {
+            AnyClass::get(c"SMAppService")
+        }
+
+        fn error_message(error: *mut AnyObject) -> String {
+            if error.is_null() {
+                return "ServiceManagement registration failed".to_string();
+            }
+            let desc: Option<Retained<NSString>> =
+                unsafe { msg_send![&*error, localizedDescription] };
+            desc.map(|s| s.to_string())
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "ServiceManagement registration failed".to_string())
+        }
+
+        impl Status {
+            fn from_raw(raw: isize) -> Self {
+                match raw {
+                    0 => Self::NotRegistered,
+                    1 => Self::Enabled,
+                    2 => Self::RequiresApproval,
+                    3 => Self::NotFound,
+                    other => Self::Unknown(other),
+                }
+            }
+        }
+    }
+
     /// In-app updater. Hits `api.github.com/repos/<repo>/releases/latest`,
     /// finds the architecture-matched asset zip plus a `.sha256` sidecar,
     /// downloads both with checksum verification, and re-installs the
@@ -1576,13 +1663,21 @@ wait_for_daemon_exit() {{
   sleep 0.5
 }}
 
+install_legacy_plist() {{
+  install -m 644 "$BUNDLE/Contents/Library/LaunchDaemons/com.gitopolis.screentimed.plist" "$PLIST" || return 1
+  /usr/libexec/PlistBuddy -c 'Delete :BundleProgram' "$PLIST" 2>/dev/null || true
+  /usr/libexec/PlistBuddy -c 'Delete :ProgramArguments' "$PLIST" 2>/dev/null || true
+  /usr/libexec/PlistBuddy -c 'Add :ProgramArguments array' "$PLIST" || return 1
+  /usr/libexec/PlistBuddy -c 'Add :ProgramArguments:0 string /usr/local/libexec/screentimed' "$PLIST" || return 1
+}}
+
 restore_backup() {{
   launchctl bootout system/com.gitopolis.screentimed 2>/dev/null || true
   wait_for_daemon_exit
   rm -rf "$BUNDLE"
   mv "$BACKUP" "$BUNDLE" || exit 50
   install -m 755 "$BUNDLE/Contents/Resources/screentimed" /usr/local/libexec/screentimed || true
-  install -m 644 "$BUNDLE/Contents/Library/LaunchDaemons/com.gitopolis.screentimed.plist" "$PLIST" || true
+  install_legacy_plist || true
   launchctl bootstrap system "$PLIST" || true
 }}
 
@@ -1595,7 +1690,7 @@ fi
 
 install -m 755 "$BUNDLE/Contents/Resources/screentimed" /usr/local/libexec/screentimed \
   || {{ restore_backup; echo "could not install daemon binary" >&2; exit 20; }}
-install -m 644 "$BUNDLE/Contents/Library/LaunchDaemons/com.gitopolis.screentimed.plist" "$PLIST" \
+install_legacy_plist \
   || {{ restore_backup; echo "could not install LaunchDaemon plist" >&2; exit 21; }}
 printf '%s\n' "$BUNDLE" > /etc/screentimed/bundle_path
 
@@ -2040,11 +2135,9 @@ exit 0"#,
     /// First-launch install + per-user LaunchAgent management.
     ///
     /// Two responsibilities:
-    ///   * **System side** (privileged) — copy the bundled daemon binary
-    ///     and plist into `/usr/local/libexec/` and `/Library/LaunchDaemons/`,
-    ///     seed a default config, and bootstrap the daemon. Routed
-    ///     through `admin::run_with_progress` so the user gets a
-    ///     standard password prompt and a progress panel.
+    ///   * **System side** — signed bundles register the bundled
+    ///     LaunchDaemon through `SMAppService`. Dev-tree runs and
+    ///     migration fallback still use the legacy copy/bootstrap script.
     ///   * **User side** (no auth) — write a per-user LaunchAgent plist
     ///     pointing at this tray binary's absolute path, so launchd
     ///     auto-starts us at next login.
@@ -2073,15 +2166,15 @@ exit 0"#,
         }
 
         /// Show a Set-up dialog. If the user proceeds, run the
-        /// privileged install via `admin::run_with_progress`. Returns
+        /// appropriate daemon registration path. Returns
         /// `true` on success, `false` on cancel / failure (alerts the
         /// user before returning false).
         pub fn run_first_launch_install(mtm: MainThreadMarker) -> bool {
             if !alerts::confirm(
                 mtm,
                 "Set up Konstantin",
-                "Konstantin needs to install its background service. \
-                 You'll be prompted for your administrator password.",
+                 "Konstantin needs to install its background service. \
+                 macOS may ask an administrator to approve it.",
                 "Set Up…",
                 "Quit",
             ) {
@@ -2099,7 +2192,69 @@ exit 0"#,
                     return false;
                 }
             };
-            let script = build_install_script(&paths);
+
+            if paths.source == bundle::Source::Bundle {
+                return run_smappservice_install(mtm, &paths);
+            }
+
+            run_legacy_install(mtm, &paths)
+        }
+
+        fn run_smappservice_install(mtm: MainThreadMarker, paths: &bundle::Paths) -> bool {
+            let result = super::progress::run_with_panel(
+                mtm,
+                "Setting Up Konstantin",
+                "Registering Konstantin's background service…",
+                "konstantin-smappservice-register",
+                super::service_management::register_daemon,
+            );
+
+            match result {
+                Ok(super::service_management::Status::Enabled) => {
+                    tracing::info!("SMAppService daemon enabled");
+                    true
+                }
+                Ok(super::service_management::Status::RequiresApproval) => {
+                    super::service_management::open_login_items_settings();
+                    alerts::message(
+                        mtm,
+                        "Approval Needed",
+                        "Enable Konstantin in System Settings, then open Konstantin again.",
+                    );
+                    false
+                }
+                Ok(status) => {
+                    tracing::warn!(?status, "unexpected SMAppService daemon status");
+                    alerts::message(
+                        mtm,
+                        "Konstantin install needs attention.",
+                        &format!("Unexpected ServiceManagement status: {status:?}"),
+                    );
+                    false
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "SMAppService install failed; offering legacy fallback");
+                    if !alerts::confirm(
+                        mtm,
+                        "Use Legacy Installer?",
+                        &format!(
+                            "macOS couldn't register the bundled service with ServiceManagement.\n\n{e}\n\nKonstantin can try the older installer instead. You'll be prompted for an administrator password."
+                        ),
+                        "Use Legacy Installer",
+                        "Quit",
+                    ) {
+                        return false;
+                    }
+                    run_legacy_install(mtm, paths)
+                }
+            }
+        }
+
+        fn run_legacy_install(mtm: MainThreadMarker, paths: &bundle::Paths) -> bool {
+            if paths.source == bundle::Source::Bundle {
+                tracing::info!("using legacy LaunchDaemon installer fallback for bundled app");
+            }
+            let script = build_legacy_install_script(paths);
 
             match admin::run_with_progress(
                 mtm,
@@ -2150,7 +2305,7 @@ exit 0"#,
             Ok(())
         }
 
-        fn build_install_script(p: &bundle::Paths) -> String {
+        fn build_legacy_install_script(p: &bundle::Paths) -> String {
             // Single bash command via `&&` chains. `install -d` creates
             // missing dirs idempotently. Re-running is safe — `cp`
             // overwrites the daemon binary (handles upgrades), and the
@@ -2173,6 +2328,10 @@ exit 0"#,
                  install -d -m 0700 /var/db/screentimed && \
                  install -m 0755 '{daemon}' /usr/local/libexec/screentimed && \
                  install -m 0644 '{plist}' /Library/LaunchDaemons/com.gitopolis.screentimed.plist && \
+                 (/usr/libexec/PlistBuddy -c 'Delete :BundleProgram' /Library/LaunchDaemons/com.gitopolis.screentimed.plist || true) && \
+                 (/usr/libexec/PlistBuddy -c 'Delete :ProgramArguments' /Library/LaunchDaemons/com.gitopolis.screentimed.plist || true) && \
+                 /usr/libexec/PlistBuddy -c 'Add :ProgramArguments array' /Library/LaunchDaemons/com.gitopolis.screentimed.plist && \
+                 /usr/libexec/PlistBuddy -c 'Add :ProgramArguments:0 string /usr/local/libexec/screentimed' /Library/LaunchDaemons/com.gitopolis.screentimed.plist && \
                  ([ -f /etc/screentimed/config.toml ] || install -m 0600 '{config}' /etc/screentimed/config.toml)",
                 daemon = p.daemon_binary.display(),
                 plist = p.daemon_plist.display(),
@@ -2240,6 +2399,30 @@ exit 0"#,
                 .replace('>', "&gt;")
                 .replace('"', "&quot;")
                 .replace('\'', "&apos;")
+        }
+
+        #[cfg(test)]
+        mod tests {
+            use super::*;
+
+            #[test]
+            fn legacy_installer_rewrites_bundle_program_plist() {
+                let paths = bundle::Paths {
+                    daemon_binary: PathBuf::from("/Applications/Konstantin.app/Contents/Resources/screentimed"),
+                    daemon_plist: PathBuf::from("/Applications/Konstantin.app/Contents/Library/LaunchDaemons/com.gitopolis.screentimed.plist"),
+                    config_example: PathBuf::from("/Applications/Konstantin.app/Contents/Resources/config.example.toml"),
+                    source: bundle::Source::Bundle,
+                    bundle_root: Some(PathBuf::from("/Applications/Konstantin.app")),
+                };
+
+                let script = build_legacy_install_script(&paths);
+
+                assert!(script.contains("Delete :BundleProgram"));
+                assert!(script.contains("Add :ProgramArguments array"));
+                assert!(script.contains(
+                    "Add :ProgramArguments:0 string /usr/local/libexec/screentimed"
+                ));
+            }
         }
     }
 

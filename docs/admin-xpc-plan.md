@@ -550,11 +550,25 @@ Status: partially complete.
 
 ### Phase 6: ServiceManagement first-launch setup
 
-* Convert bundled plist to `BundleProgram`.
-* Add `SMAppService.daemon(plistName:)` registration path.
-* Keep legacy `osascript` installer for migration/fallback only.
-* Add upgrade logic that recognizes old `/Library/LaunchDaemons` and
+Status: implemented for fresh signed-bundle setup; legacy migration still
+needs manual validation.
+
+* [x] Convert bundled plist to `BundleProgram`.
+* [x] Add `SMAppService.daemon(plistName:)` registration path.
+  * Fresh signed-bundle setup now calls
+    `SMAppService.daemon(plistName:)` for
+    `com.gitopolis.screentimed.plist`. If System Settings approval is
+    required, the tray opens Login Items settings and exits cleanly.
+* [x] Keep legacy `osascript` installer for migration/fallback only.
+  * Dev-tree runs still use the legacy installer. Bundled runs offer the
+    legacy installer only if ServiceManagement registration fails.
+* [~] Add upgrade logic that recognizes old `/Library/LaunchDaemons` and
   `/usr/local/libexec` installs and migrates them cleanly.
+  * Legacy copied plists are rewritten from bundled `BundleProgram` to
+    `/usr/local/libexec/screentimed` `ProgramArguments` for fallback and
+    update rollback compatibility. A one-time proactive migration from a
+    running legacy install to SMAppService is still deferred until the
+    signed manual pass.
 
 ### Phase 7: Updates and uninstall
 
@@ -612,8 +626,8 @@ Support three installation states during migration:
    launchd registration points to the app-bundled daemon via
    `BundleProgram`.
 3. Dev-tree run:
-   no signed XPC trust. Keep current shell/admin fallback or disable admin
-   XPC explicitly with a useful message.
+   first-launch setup uses the legacy shell/admin fallback. Admin XPC may
+   be unavailable depending on signing identity.
 
 Do not strand users on the legacy install. The signed app should detect
 legacy state and offer a one-time migration.
