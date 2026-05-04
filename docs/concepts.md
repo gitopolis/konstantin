@@ -235,12 +235,10 @@ the stream:
 * Once fired, won't fire again until a strictly smaller threshold is
   crossed. So 15 → 5 → 1 each fire exactly once per day.
 
-Dispatch shells out to `osascript -e 'display notification "..." with
-title "..."'`. Per CLAUDE.md, this is the pragmatic choice for an
-unsigned bundle: `osascript` itself is signed by Apple, so notifications
-work without TCC consent dialogs and without notarization.
-`UNUserNotificationCenter` via `objc2` is the future path for a polished
-distribution build.
+Dispatch uses `UNUserNotificationCenter` from the signed app bundle so
+warnings are attributed to Konstantin and use the bundle icon. Developer
+runs without an `NSBundle` context no-op with a tracing warning rather
+than crashing.
 
 ## What's *not* tampered with
 

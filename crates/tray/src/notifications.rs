@@ -185,9 +185,7 @@ mod macos {
         let id = NSUUID::new();
         let id_string = id.UUIDString();
         let request = UNNotificationRequest::requestWithIdentifier_content_trigger(
-            &id_string,
-            &content,
-            None, // immediate delivery
+            &id_string, &content, None, // immediate delivery
         );
 
         // Completion handler logs errors. We don't block on it — the
@@ -228,9 +226,15 @@ mod tests {
         let thr = [15, 5, 1];
 
         assert_eq!(t.evaluate(&at(1000, &thr, SessionState::Active, 26)), None);
-        assert_eq!(t.evaluate(&at(900, &thr, SessionState::Active, 26)), Some(15));
+        assert_eq!(
+            t.evaluate(&at(900, &thr, SessionState::Active, 26)),
+            Some(15)
+        );
         assert_eq!(t.evaluate(&at(800, &thr, SessionState::Active, 26)), None);
-        assert_eq!(t.evaluate(&at(300, &thr, SessionState::Active, 26)), Some(5));
+        assert_eq!(
+            t.evaluate(&at(300, &thr, SessionState::Active, 26)),
+            Some(5)
+        );
         assert_eq!(t.evaluate(&at(60, &thr, SessionState::Active, 26)), Some(1));
         assert_eq!(t.evaluate(&at(30, &thr, SessionState::Active, 26)), None);
     }
@@ -241,7 +245,10 @@ mod tests {
         // 15 is "missed"; 5 is the smallest that still applies; 1 not yet.
         let mut t = NotifTracker::new();
         let thr = [15, 5, 1];
-        assert_eq!(t.evaluate(&at(100, &thr, SessionState::Active, 26)), Some(5));
+        assert_eq!(
+            t.evaluate(&at(100, &thr, SessionState::Active, 26)),
+            Some(5)
+        );
         assert_eq!(t.evaluate(&at(99, &thr, SessionState::Active, 26)), None);
     }
 
@@ -249,15 +256,18 @@ mod tests {
     fn day_rollover_rearms() {
         let mut t = NotifTracker::new();
         let thr = [15, 5, 1];
-        assert_eq!(t.evaluate(&at(900, &thr, SessionState::Active, 26)), Some(15));
+        assert_eq!(
+            t.evaluate(&at(900, &thr, SessionState::Active, 26)),
+            Some(15)
+        );
         assert_eq!(t.evaluate(&at(60, &thr, SessionState::Active, 26)), Some(1));
         // New day: counters reset, remaining is full again.
-        assert_eq!(
-            t.evaluate(&at(3600, &thr, SessionState::Active, 27)),
-            None
-        );
+        assert_eq!(t.evaluate(&at(3600, &thr, SessionState::Active, 27)), None);
         // Threshold fires fresh on the new day.
-        assert_eq!(t.evaluate(&at(900, &thr, SessionState::Active, 27)), Some(15));
+        assert_eq!(
+            t.evaluate(&at(900, &thr, SessionState::Active, 27)),
+            Some(15)
+        );
     }
 
     #[test]
@@ -266,7 +276,10 @@ mod tests {
         let thr = [15, 5, 1];
         // 0 remaining and LimitReached: no notification (the user is
         // being kicked, not warned).
-        assert_eq!(t.evaluate(&at(0, &thr, SessionState::LimitReached, 26)), None);
+        assert_eq!(
+            t.evaluate(&at(0, &thr, SessionState::LimitReached, 26)),
+            None
+        );
     }
 
     #[test]

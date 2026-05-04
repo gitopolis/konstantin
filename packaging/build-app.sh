@@ -41,8 +41,8 @@ if [[ -z "${VERSION}" ]]; then
     exit 1
 fi
 
-# Verify all three release binaries exist.
-for bin in screentimed konstantin-status konstantin-tray; do
+# Verify all release binaries exist.
+for bin in screentimed konstantin-status konstantin-tray konstantin-updater; do
     if [[ ! -x "${TARGET}/${bin}" ]]; then
         echo "missing ${TARGET}/${bin} — run 'cargo build --release' first" >&2
         exit 1
@@ -68,6 +68,7 @@ install -m 0755 "${TARGET}/konstantin-tray"   "${APP}/Contents/MacOS/konstantin-
 # installer/update fallback still copies the daemon into /usr/local/libexec/.
 install -m 0755 "${TARGET}/screentimed"        "${APP}/Contents/Resources/screentimed"
 install -m 0755 "${TARGET}/konstantin-status"  "${APP}/Contents/Resources/konstantin-status"
+install -m 0755 "${TARGET}/konstantin-updater" "${APP}/Contents/Resources/konstantin-updater"
 install -m 0644 "${ROOT}/packaging/config.example.toml" \
     "${APP}/Contents/Resources/config.example.toml"
 
@@ -139,6 +140,7 @@ ENTITLEMENTS="${CODESIGN_ENTITLEMENTS:-${ROOT}/packaging/Konstantin.entitlements
 NESTED=(
     "${APP}/Contents/Resources/screentimed"
     "${APP}/Contents/Resources/konstantin-status"
+    "${APP}/Contents/Resources/konstantin-updater"
     "${APP}/Contents/MacOS/konstantin-tray"
 )
 

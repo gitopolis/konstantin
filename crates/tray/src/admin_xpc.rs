@@ -12,12 +12,14 @@ use konstantin_proto::admin::{
 };
 use std::ffi::{c_char, c_void, CStr, CString};
 use std::ptr;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 type XpcObject = *mut c_void;
 type XpcConnection = XpcObject;
 type DispatchQueue = *mut c_void;
 type XpcHandlerBlock = Block<dyn Fn(XpcObject)>;
+
+const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 
 extern "C" {
     fn xpc_connection_create_mach_service(
@@ -29,10 +31,7 @@ extern "C" {
         connection: XpcConnection,
         signing_identifier: *const c_char,
     ) -> i32;
-    fn xpc_connection_set_event_handler(
-        connection: XpcConnection,
-        handler: *mut XpcHandlerBlock,
-    );
+    fn xpc_connection_set_event_handler(connection: XpcConnection, handler: *mut XpcHandlerBlock);
     fn xpc_connection_activate(connection: XpcConnection);
     fn xpc_connection_cancel(connection: XpcConnection);
     fn xpc_connection_send_message_with_reply_sync(
@@ -51,6 +50,30 @@ pub struct AdminClient;
 
 impl AdminClient {
     pub fn send(request: AdminRequest) -> Result<AdminResponse> {
+        Self::send_with_timeout(request, DEFAULT_REQUEST_TIMEOUT)
+    }
+
+    pub fn send_with_timeout(request: AdminRequest, timeout: Duration) -> Result<AdminResponse> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::Builder::new()
+            .name("konstantin-admin-xpc-request".into())
+            .spawn(move || {
+                let _ = tx.send(Self::send_blocking(request));
+            })
+            .context("spawning admin XPC request thread")?;
+
+        match rx.recv_timeout(timeout) {
+            Ok(result) => result,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                anyhow::bail!("admin XPC request timed out after {}s", timeout.as_secs());
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                anyhow::bail!("admin XPC request thread exited without a response");
+            }
+        }
+    }
+
+    fn send_blocking(request: AdminRequest) -> Result<AdminResponse> {
         let connection = Connection::connect()?;
         let request_id = request_id();
         let envelope = RequestEnvelope::new(&request_id, request);

@@ -73,8 +73,7 @@ impl State {
             std::path::PathBuf::from(p)
         };
         let body = serde_json::to_vec_pretty(self).context("serializing state")?;
-        std::fs::write(&tmp, &body)
-            .with_context(|| format!("writing {}", tmp.display()))?;
+        std::fs::write(&tmp, &body).with_context(|| format!("writing {}", tmp.display()))?;
         std::fs::rename(&tmp, path)
             .with_context(|| format!("renaming {} -> {}", tmp.display(), path.display()))?;
         Ok(())
