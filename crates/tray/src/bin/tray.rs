@@ -1518,7 +1518,7 @@ mod imp {
                          Details: {message}"
                     ),
                 ),
-                20 | 21 | 22 | 23 => (
+                20..=23 => (
                     "Update Failed",
                     format!(
                         "The new version did not start; rolled back to the previous version.\n\n\
