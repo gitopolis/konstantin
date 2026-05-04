@@ -1,4 +1,4 @@
-# Project context for Claude
+# Project context for Codex
 
 A macOS screen-time enforcer in Rust. This file is the design handoff —
 read it before making changes so decisions stay consistent.

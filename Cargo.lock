@@ -475,6 +475,7 @@ dependencies = [
 name = "konstantin-proto"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "chrono",
  "serde",
  "serde_json",
@@ -933,6 +934,7 @@ name = "screentimed"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "block2",
  "chrono",
  "konstantin-proto",
  "libc",

@@ -5,6 +5,9 @@
 pub mod notifications;
 pub mod users;
 
+#[cfg(target_os = "macos")]
+pub mod admin_xpc;
+
 use anyhow::{Context, Result};
 use konstantin_proto::{
     read_frame, write_frame, FrameError, Request, Response, UserStatus, DEFAULT_SOCKET_PATH,

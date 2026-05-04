@@ -64,16 +64,16 @@ install -d "${APP}/Contents/Library/LaunchDaemons"
 install -m 0755 "${TARGET}/konstantin-tray"   "${APP}/Contents/MacOS/konstantin-tray"
 
 # Resources: the daemon binary + diagnostic CLI + the example config.
-# At first-launch install (phase A2) the tray copies the daemon binary
-# from here into /usr/local/libexec/.
+# SMAppService runs the daemon in place via BundleProgram. The legacy
+# installer/update fallback still copies the daemon into /usr/local/libexec/.
 install -m 0755 "${TARGET}/screentimed"        "${APP}/Contents/Resources/screentimed"
 install -m 0755 "${TARGET}/konstantin-status"  "${APP}/Contents/Resources/konstantin-status"
 install -m 0644 "${ROOT}/packaging/config.example.toml" \
     "${APP}/Contents/Resources/config.example.toml"
 
-# LaunchDaemon plist. We hand-install (cp + bootstrap) at runtime, but
-# placing it in Contents/Library/LaunchDaemons/ matches SMAppService's
-# expected layout — easy migration if/when we have Developer ID.
+# LaunchDaemon plist for SMAppService. Legacy fallback rewrites the
+# bundled BundleProgram key into ProgramArguments after copying it to
+# /Library/LaunchDaemons/.
 install -m 0644 "${ROOT}/packaging/com.gitopolis.screentimed.plist" \
     "${APP}/Contents/Library/LaunchDaemons/com.gitopolis.screentimed.plist"
 

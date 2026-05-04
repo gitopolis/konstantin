@@ -17,6 +17,7 @@
 //!     resolved `SessionState`
 
 mod config;
+mod control;
 mod enforcement;
 mod ipc;
 mod sessions;
@@ -46,7 +47,7 @@ async fn main() -> Result<()> {
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("/etc/screentimed/config.toml"));
 
-    let cfg = config::Config::load(&config_path)
+    let cfg = config::Config::load_or_seed(&config_path)
         .with_context(|| format!("loading config at {}", config_path.display()))?;
     info!(
         socket = %cfg.socket_path.display(),
@@ -55,6 +56,7 @@ async fn main() -> Result<()> {
         tick_s = cfg.tick_seconds,
         "config loaded"
     );
+    record_bundle_marker();
 
     let state = Arc::new(Mutex::new(state::State::load(&cfg.state_path)));
 
@@ -84,6 +86,13 @@ async fn main() -> Result<()> {
     let server = ipc::Server::bind(cfg.clone(), state.clone(), tick_tx.clone())
         .await
         .context("binding IPC socket")?;
+    let _control_listener = match control::xpc::ControlListener::start(config_path.clone()) {
+        Ok(listener) => Some(listener),
+        Err(e) => {
+            warn!(error = %e, "admin XPC listener unavailable");
+            None
+        }
+    };
 
     let ticker_state = state.clone();
     let ticker_cfg = cfg.clone();
@@ -118,6 +127,40 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+fn record_bundle_marker() {
+    match infer_bundle_root_from_exe() {
+        Some(root) => {
+            if let Some(parent) = std::path::Path::new(uninstall::MARKER_PATH).parent() {
+                if let Err(e) = std::fs::create_dir_all(parent) {
+                    warn!(error = %e, "could not create bundle marker directory");
+                    return;
+                }
+            }
+            if let Err(e) = std::fs::write(uninstall::MARKER_PATH, format!("{}\n", root.display()))
+            {
+                warn!(error = %e, path = uninstall::MARKER_PATH, "could not write bundle marker");
+            }
+        }
+        // Legacy installs run from /usr/local/libexec/screentimed but
+        // still get a bundle marker written by the installer. Preserve
+        // that marker so the drag-to-Trash watcher keeps working.
+        None => {}
+    }
+}
+
+fn infer_bundle_root_from_exe() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let resources = exe.parent()?;
+    if resources.file_name()? != "Resources" {
+        return None;
+    }
+    let contents = resources.parent()?;
+    if contents.file_name()? != "Contents" {
+        return None;
+    }
+    contents.parent().map(PathBuf::from)
 }
 
 /// Sleep until the next local midnight, fire the day rollover, persist,
