@@ -405,47 +405,96 @@ confirmation even for admin users.
 
 ## Phased Implementation
 
+Progress tracking:
+
+* `4405f77 feat: add daemon admin control primitives` completed the
+  daemon-side authorization/control-handler foundation and added this
+  plan.
+* `925a574 feat: scaffold admin xpc transport` added the Mach service
+  plist entry and initial XPC dictionary/envelope scaffolding.
+* `1238b8c feat: add admin xpc request dispatch` added pure JSON
+  request dispatch through the daemon controller.
+* `4611738 feat: run daemon admin xpc listener` wired the daemon-side
+  XPC listener, peer EUID lookup, signed-peer requirement setup, and
+  reply path.
+* `4c01d90 feat: share admin xpc protocol with tray` moved the admin
+  wire model into `konstantin-proto::admin` and added the tray
+  `AdminClient`.
+* `baca055 feat: add enforcement pause menu action` replaced routine
+  Start/Stop Daemon menu items with Pause/Unpause Enforcement over admin
+  XPC.
+
 ### Phase 0: Documentation and scaffolding
 
-* Add this plan.
+Status: complete.
+
+* [x] Add this plan.
 * Add an `xpc-control` Cargo feature or cfg gate if needed.
-* Add internal docs explaining that status IPC and admin control IPC have
+  * Not added yet; current code is always compiled on macOS and has
+    non-macOS stubs where needed.
+* [x] Add internal docs explaining that status IPC and admin control IPC have
   different threat models.
 
 ### Phase 1: Daemon-side authorization primitives
 
-* Add `control::auth`.
-* Implement `operator_from_uid(uid) -> Result<Operator, AuthError>`.
-* Implement local admin-group lookup using Open Directory or `dscl`;
+Status: mostly complete; audit logging can be tightened during the
+Configure-over-XPC work.
+
+* [x] Add `control::auth`.
+* [x] Implement `operator_from_uid(uid) -> Operator`.
+  * Implemented as an `Operator` snapshot with `allowed` + `reason`
+    rather than a fallible return type, so denied users can be returned
+    as structured `Unauthorized` responses.
+* [x] Implement local admin-group lookup using `dscl`;
   tests should use injectable command/output helpers.
-* Add structured audit logging for allowed and denied admin attempts.
-* Unit-test standard user denied, admin allowed, root allowed, unknown UID
-  denied.
+  * Parser is unit-tested. The live command wrapper is intentionally
+    small; a fully injectable command runner can be added if this grows.
+* [ ] Add structured audit logging for allowed and denied admin attempts.
+  * Current listener logs peer EUID, username, and allowed/denied state
+    at debug level.
+* [x] Unit-test standard user denied behavior at the controller boundary.
+* [ ] Add direct unit coverage for admin/root/unknown UID resolution.
 
 ### Phase 2: Control protocol without XPC
 
-* Add Rust request/response structs.
-* Add pure handlers for `GetConfig`, `ValidateConfig`, `SetConfig`, and
+Status: complete for the initial scope.
+
+* [x] Add Rust request/response structs.
+  * Initially added in the daemon, then moved to
+    `konstantin-proto::admin` so the tray can share them.
+* [x] Add pure handlers for `GetConfig`, `ValidateConfig`, `SetConfig`, and
   `ReloadDaemon`.
-* Exercise handlers directly in tests, without transport.
-* Preserve current `osascript` tray path while daemon handlers mature.
+* [x] Add pure handlers for `GetEnforcementState` and
+  `SetEnforcementPaused`.
+* [x] Exercise handlers directly in tests, without transport.
+* [x] Preserve current `osascript` configure/update/restart paths while
+  daemon handlers mature.
 
 ### Phase 3: XPC transport
 
-* Add minimal libxpc bindings.
-* Register a daemon Mach service such as:
+Status: implemented, but still needs signed-app manual verification.
+
+* [x] Add minimal libxpc bindings.
+* [x] Register a daemon Mach service:
 
 ```text
 com.gitopolis.screentimed.control
 ```
 
-* Add the matching `MachServices` key to the LaunchDaemon plist.
-* Enforce Konstantin peer code-signing requirement.
-* Extract peer EUID from XPC and feed daemon authorization.
-* Build tray `AdminClient` with request/reply and timeout handling.
-* Add a signed-build manual test recipe.
+* [x] Add the matching `MachServices` key to the LaunchDaemon plist.
+* [x] Enforce Konstantin peer code-signing requirement.
+  * Daemon requires peer Team ID plus tray signing identifier.
+  * Tray requires same-Team daemon peer.
+* [x] Extract peer EUID from XPC and feed daemon authorization.
+* [x] Build tray `AdminClient` with request/reply.
+* [ ] Add timeout handling around tray requests.
+  * Current implementation uses `xpc_connection_send_message_with_reply_sync`
+    from a worker thread; it can block if the daemon stalls.
+* [ ] Add a signed-build manual test recipe.
 
 ### Phase 4: Configure over XPC
+
+Status: next.
 
 * Replace Configure Open admin script with `GetConfig`.
 * Replace Save admin script with `SetConfig`.
@@ -455,13 +504,17 @@ com.gitopolis.screentimed.control
 
 ### Phase 5: Reload / pause controls
 
-* Replace Restart with `ReloadDaemon` where possible.
-* Remove routine Start/Stop Daemon menu items.
-* Add Pause Enforcement / Unpause Enforcement menu item backed by
+Status: partially complete.
+
+* [ ] Replace Restart with `ReloadDaemon` where possible.
+* [x] Remove routine Start/Stop Daemon menu items.
+* [x] Add Pause Enforcement / Unpause Enforcement menu item backed by
   `GetEnforcementState` and `SetEnforcementPaused`.
-* Reflect the kill-switch state in the menu so every admin tray shows
+* [~] Reflect the kill-switch state in the menu so every admin tray shows
   whether enforcement is currently paused.
-* Add a daemon status/control field if the tray needs to distinguish
+  * The acting tray updates immediately from the XPC response. Other
+    trays will need a control/status broadcast or periodic refresh.
+* [ ] Add a daemon status/control field if the tray needs to distinguish
   disconnected/running/enforcement-paused.
 
 ### Phase 6: ServiceManagement first-launch setup
