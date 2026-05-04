@@ -50,7 +50,7 @@ jobs:
           set -euo pipefail
           cargo build --release --workspace --target "${{ matrix.target }}"
           mkdir -p target/release
-          for bin in screentimed konstantin-status konstantin-tray; do
+          for bin in screentimed konstantin-status konstantin-tray konstantin-updater; do
             cp "target/${{ matrix.target }}/release/$bin" "target/release/$bin"
           done
 

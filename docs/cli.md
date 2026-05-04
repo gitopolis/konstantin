@@ -133,23 +133,30 @@ GUI terminal session.
 No arguments. Show or hide via the menu-bar item; quit via the menu's
 "Quit" option (`⌘Q`).
 
-### Privileged menu actions
+### Admin menu actions
 
-`Start / Stop / Restart`, `Configure…`, and `Uninstall…` all funnel
-through one `osascript … with administrator privileges` helper —
-macOS shows the standard password sheet, the command runs as root for
-that one invocation, then privilege is released. There is no
-persistent privilege handle.
+Routine operator actions use the signed admin XPC channel exposed by
+the root daemon. Standard users can see their own status, but only
+local admins can configure, pause/unpause enforcement, reload, update,
+or uninstall.
 
-Notable consequences:
+Notable actions:
 
-* `Configure…` requires an admin password to *open* the window
-  (because `/etc/screentimed/config.toml` is mode 0600 root-owned).
-  Save then prompts a second time to write the file back. Cancel the
-  password sheet → the window doesn't open and nothing is changed.
+* `Configure…` reads and writes `/etc/screentimed/config.toml` through
+  the daemon, preserving mode 0600 root ownership.
+* `Pause Enforcement` / `Unpause Enforcement` creates or removes the
+  configured kill-switch file (default `/etc/screentimed/disable`).
+* `Check for Updates…` downloads and verifies the release zip in the
+  tray, then asks the daemon to stage and launch the detached
+  `konstantin-updater` helper. The helper swaps the bundle, restarts
+  the daemon, and rolls back if the new daemon does not become reachable.
 * `Uninstall…` removes the binaries, plists, socket, and counter state
   at `/var/db/screentimed/`. It preserves `/etc/screentimed/` so a
   reinstall picks up your settings.
+
+The legacy first-launch fallback still uses
+`osascript … with administrator privileges` when ServiceManagement
+registration is unavailable.
 
 ### Environment variables
 

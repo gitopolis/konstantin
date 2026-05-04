@@ -38,6 +38,11 @@ pub enum AdminRequest {
     SetEnforcementPaused {
         paused: bool,
     },
+    InstallUpdate {
+        zip_path: PathBuf,
+        expected_version: String,
+        expected_sha256: String,
+    },
     Uninstall {
         preserve_config: bool,
     },
@@ -77,6 +82,10 @@ pub enum AdminResponse {
         paused: bool,
         kill_switch_path: PathBuf,
     },
+    UpdateInstallStarted {
+        result_path: PathBuf,
+        bundle_root: PathBuf,
+    },
     Ok,
     Unauthorized {
         reason: String,
@@ -84,6 +93,13 @@ pub enum AdminResponse {
     Error {
         message: String,
     },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum UpdateInstallResult {
+    Succeeded,
+    Failed { code: i32, message: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

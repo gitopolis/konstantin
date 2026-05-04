@@ -42,6 +42,7 @@ mod imp {
     // NSRunningApplication header, not NSApplication's.
     use konstantin_proto::admin::{
         AdminRequest, AdminResponse, TrayAutostartChange, TrayAutostartProbe, TrayAutostartState,
+        UpdateInstallResult,
     };
     use konstantin_proto::{SessionState, UserStatus};
     use konstantin_tray::admin_xpc::AdminClient;
@@ -353,7 +354,7 @@ mod imp {
                     Ok(Some(s)) => {
                         if let Some(minutes) = notif.evaluate(&s) {
                             tracing::info!(minutes, "firing threshold notification");
-                            // Fire-and-forget; an osascript hiccup must
+                            // Fire-and-forget; a notification hiccup must
                             // not stall the subscribe loop.
                             tokio::spawn(async move {
                                 if let Err(e) = notifications::show(minutes).await {
@@ -949,10 +950,8 @@ mod imp {
     }
 
     /// Generic "show a spinner panel while a closure runs on a worker
-    /// thread" primitive. Used by both the privileged `mod admin` path
-    /// (osascript with admin privileges) and the unprivileged updater
-    /// download path. Decoupled from any specific kind of work — it
-    /// just owns the panel + run-loop pump.
+    /// thread" primitive. Decoupled from any specific kind of work —
+    /// it just owns the panel + run-loop pump.
     mod progress {
         use super::*;
         use objc2::rc::Retained;
@@ -1238,10 +1237,11 @@ mod imp {
     }
 
     /// In-app updater. Hits `api.github.com/repos/<repo>/releases/latest`,
-    /// finds the architecture-matched asset zip plus a `.sha256` sidecar,
-    /// downloads both with checksum verification, and re-installs the
-    /// `.app` bundle in place. The privileged install script self-rolls
-    /// back if the new daemon doesn't come up — see `build_install_script`.
+    /// finds the architecture-matched asset zip, verifies GitHub's
+    /// per-asset SHA-256 digest, and asks the privileged daemon to
+    /// install the `.app` bundle in place through the detached updater
+    /// helper. The helper self-rolls back if the new daemon does not
+    /// become reachable.
     ///
     /// Source of truth for the version comparison is
     /// `env!("CARGO_PKG_VERSION")`. CI runs `cargo set-version
@@ -1312,10 +1312,6 @@ mod imp {
             Parse(String),
             /// No `Konstantin-<version>-<arch>.zip` asset for our arch.
             NoAssetForArch,
-            /// `unzip` failed.
-            Unpack(String),
-            /// Staged bundle is missing required files.
-            BadStagedBundle(String),
             /// Running from a dev tree, or running on an unsupported
             /// architecture — refuse to update.
             UnsupportedEnvironment,
@@ -1332,8 +1328,6 @@ mod imp {
                         f,
                         "no compatible release asset for this architecture"
                     ),
-                    Self::Unpack(s) => write!(f, "couldn't unpack archive: {s}"),
-                    Self::BadStagedBundle(s) => write!(f, "downloaded bundle is malformed: {s}"),
                     Self::UnsupportedEnvironment => write!(
                         f,
                         "updates are only available from an installed .app bundle on a supported architecture"
@@ -1515,194 +1509,23 @@ mod imp {
             Ok(digest.iter().map(|b| format!("{b:02x}")).collect())
         }
 
-        fn unzip(zip: &Path, into: &Path) -> Result<(), Error> {
-            let status = std::process::Command::new("/usr/bin/unzip")
-                .arg("-q")
-                .arg(zip)
-                .arg("-d")
-                .arg(into)
-                .status()
-                .map_err(|e| Error::Unpack(format!("spawn unzip: {e}")))?;
-            if !status.success() {
-                return Err(Error::Unpack(format!("unzip exited with {status}")));
-            }
-            Ok(())
-        }
-
-        fn strip_quarantine(path: &Path) {
-            // Best-effort. The attribute may not be present, which is
-            // fine — `xattr` returns non-zero in that case but we don't
-            // care.
-            let _ = std::process::Command::new("/usr/bin/xattr")
-                .arg("-dr")
-                .arg("com.apple.quarantine")
-                .arg(path)
-                .status();
-        }
-
-        fn validate_staged_bundle(staged: &Path) -> Result<(), Error> {
-            let must_exist: [(&str, &str); 3] = [
-                ("Contents/MacOS/konstantin-tray", "tray binary"),
-                ("Contents/Resources/screentimed", "daemon binary"),
-                (
-                    "Contents/Library/LaunchDaemons/com.gitopolis.screentimed.plist",
-                    "LaunchDaemon plist",
-                ),
-            ];
-            for (rel, label) in must_exist {
-                let p = staged.join(rel);
-                let meta = std::fs::metadata(&p).map_err(|e| {
-                    Error::BadStagedBundle(format!("{label} missing at {}: {e}", p.display()))
-                })?;
-                if meta.len() == 0 {
-                    return Err(Error::BadStagedBundle(format!(
-                        "{label} at {} is empty",
-                        p.display()
-                    )));
-                }
-            }
-            Ok(())
-        }
-
-        // ─── Privileged install script ───────────────────────────────
-
-        /// Build the bash script that does the swap-with-rollback in
-        /// one elevation. Exit codes:
-        ///
-        ///   0   — success, new version live
-        ///  10/11 — bundle move failed before any state change of note
-        ///         (prior version still in place, no rollback needed)
-        ///  20–23 — install or daemon-bootstrap failed; rollback
-        ///         already ran inside this same elevation
-        ///  50    — catastrophic: rollback itself couldn't restore
-        ///         the bundle. Rare. The script writes the reason to
-        ///         stderr in every non-zero case.
-        fn build_install_script(staged: &Path, dest_bundle: &Path) -> String {
-            // Reuse the project's quote helper. `config_ui::shell_quote`
-            // wraps a path in `'…'` and escapes any embedded single
-            // quotes.
-            let bundle_q = super::config_ui::shell_quote(dest_bundle);
-            let staged_q = super::config_ui::shell_quote(staged);
-            format!(
-                r#"set -u
-BUNDLE={bundle}
-STAGED={staged}
-BACKUP="${{BUNDLE}}.update-backup-$$"
-PLIST=/Library/LaunchDaemons/com.gitopolis.screentimed.plist
-SOCK=/var/run/screentimed.sock
-
-wait_for_daemon_exit() {{
-  for _ in $(seq 1 40); do
-    if ! pgrep -x screentimed >/dev/null 2>&1; then return 0; fi
-    sleep 0.25
-  done
-  pkill -KILL -x screentimed 2>/dev/null || true
-  sleep 0.5
-}}
-
-install_legacy_plist() {{
-  install -m 644 "$BUNDLE/Contents/Library/LaunchDaemons/com.gitopolis.screentimed.plist" "$PLIST" || return 1
-  /usr/libexec/PlistBuddy -c 'Delete :BundleProgram' "$PLIST" 2>/dev/null || true
-  /usr/libexec/PlistBuddy -c 'Delete :ProgramArguments' "$PLIST" 2>/dev/null || true
-  /usr/libexec/PlistBuddy -c 'Add :ProgramArguments array' "$PLIST" || return 1
-  /usr/libexec/PlistBuddy -c 'Add :ProgramArguments:0 string /usr/local/libexec/screentimed' "$PLIST" || return 1
-}}
-
-restore_backup() {{
-  launchctl bootout system/com.gitopolis.screentimed 2>/dev/null || true
-  wait_for_daemon_exit
-  rm -rf "$BUNDLE"
-  mv "$BACKUP" "$BUNDLE" || exit 50
-  install -m 755 "$BUNDLE/Contents/Resources/screentimed" /usr/local/libexec/screentimed || true
-  install_legacy_plist || true
-  launchctl bootstrap system "$PLIST" || true
-}}
-
-mv "$BUNDLE" "$BACKUP" || {{ echo "couldn't move existing bundle aside" >&2; exit 10; }}
-if ! mv "$STAGED" "$BUNDLE"; then
-  echo "couldn't move new bundle into place" >&2
-  mv "$BACKUP" "$BUNDLE" || true
-  exit 11
-fi
-
-install -m 755 "$BUNDLE/Contents/Resources/screentimed" /usr/local/libexec/screentimed \
-  || {{ restore_backup; echo "could not install daemon binary" >&2; exit 20; }}
-install_legacy_plist \
-  || {{ restore_backup; echo "could not install LaunchDaemon plist" >&2; exit 21; }}
-printf '%s\n' "$BUNDLE" > /etc/screentimed/bundle_path
-
-launchctl bootout system/com.gitopolis.screentimed 2>/dev/null || true
-# `bootout` is async on macOS Tahoe — it returns 0 while the daemon
-# lingers for several seconds. We need it gone before `bootstrap`,
-# otherwise launchd treats the new instance as a duplicate and the
-# probe below would race against the old daemon's still-open socket.
-# Same pattern as `enforcement::force_logout` (decision #1).
-wait_for_daemon_exit
-
-if ! launchctl bootstrap system "$PLIST"; then
-  restore_backup
-  echo "launchctl bootstrap failed" >&2
-  exit 22
-fi
-
-# Probe the new daemon's socket. `nc -z -U` is broken for Unix-domain
-# sockets on macOS BSD netcat — it returns 1 even on a successful
-# connect (the `-z` flag is TCP-only despite the man page). Use plain
-# `nc -U "$SOCK" </dev/null`: connect, send EOF, exit 0 on success.
-READY=0
-for i in $(seq 1 80); do
-  if [ -S "$SOCK" ] && nc -U "$SOCK" </dev/null >/dev/null 2>&1; then
-    READY=1; break
-  fi
-  sleep 0.25
-done
-if [ "$READY" != "1" ]; then
-  restore_backup
-  echo "new daemon did not become reachable on $SOCK within 20s" >&2
-  exit 23
-fi
-
-rm -rf "$BACKUP"
-exit 0"#,
-                bundle = bundle_q,
-                staged = staged_q,
-            )
-        }
-
-        /// Map the script's exit code (extracted from osascript stderr)
-        /// to a user-facing message. osascript reports the bash exit
-        /// code in its error string as `Konstantin got an error: <msg>
-        /// (<code>)`. We grep for the trailing `(N)`.
-        fn exit_code_from_stderr(stderr: &str) -> Option<i32> {
-            let last_paren = stderr.rfind('(')?;
-            let close = stderr[last_paren..].find(')')?;
-            let inner = &stderr[last_paren + 1..last_paren + close];
-            inner.trim().parse().ok()
-        }
-
-        fn classify_failure(stderr: &str) -> (&'static str, String) {
-            // Pull a trailing `\n`-terminated line for "Details: …".
-            let detail = stderr
-                .lines()
-                .rev()
-                .find(|l| !l.trim().is_empty())
-                .unwrap_or("");
-            match exit_code_from_stderr(stderr) {
-                Some(10 | 11) => (
+        fn classify_failure(code: i32, message: &str) -> (&'static str, String) {
+            match code {
+                10 | 11 => (
                     "Update Failed",
                     format!(
                         "Could not install the update. The previous version is still active.\n\n\
-                         Details: {detail}"
+                         Details: {message}"
                     ),
                 ),
-                Some(20 | 21 | 22 | 23) => (
+                20 | 21 | 22 | 23 => (
                     "Update Failed",
                     format!(
                         "The new version did not start; rolled back to the previous version.\n\n\
-                         Details: {detail}"
+                         Details: {message}"
                     ),
                 ),
-                Some(50) => (
+                50 => (
                     "Update Failed",
                     "Konstantin's bundle is missing — the rollback did not complete. \
                      Reinstall via Homebrew (`brew reinstall --cask konstantin`) or \
@@ -1711,8 +1534,31 @@ exit 0"#,
                 ),
                 _ => (
                     "Update Failed",
-                    format!("Unexpected error during install.\n\nDetails: {detail}"),
+                    format!("Unexpected error during install.\n\nDetails: {message}"),
                 ),
+            }
+        }
+
+        fn poll_update_result(path: &Path, timeout: Duration) -> Result<UpdateInstallResult> {
+            let deadline = std::time::Instant::now() + timeout;
+            loop {
+                match std::fs::read_to_string(path) {
+                    Ok(json) => {
+                        return serde_json::from_str(&json)
+                            .map_err(|e| anyhow::anyhow!("parsing update result: {e}"));
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => {
+                        return Err(anyhow::anyhow!(
+                            "reading update result {}: {e}",
+                            path.display()
+                        ));
+                    }
+                }
+                if std::time::Instant::now() >= deadline {
+                    anyhow::bail!("timed out waiting for update result");
+                }
+                std::thread::sleep(Duration::from_millis(250));
             }
         }
 
@@ -1788,20 +1634,18 @@ exit 0"#,
             }
         }
 
-        /// Download → verify → unpack → privileged re-install →
-        /// auto-relaunch. On failure the privileged script either keeps
-        /// the prior version in place (errors before the rollback path)
-        /// or self-rolls back (errors during install). We just translate
-        /// the exit code into a user message.
+        /// Download → verify → daemon-mediated install → auto-relaunch.
+        /// The root daemon validates and stages the zip, then spawns the
+        /// detached updater helper that owns the bundle swap and rollback.
         pub fn run_install_flow(mtm: MainThreadMarker, paths: &bundle::Paths, release: &Release) {
-            let Some(bundle_root) = paths.bundle_root.clone() else {
+            if paths.bundle_root.is_none() {
                 alerts::message(
                     mtm,
                     "Updates Disabled",
                     "Couldn't determine the install location.",
                 );
                 return;
-            };
+            }
 
             // 1. Working dir + RAII cleanup.
             let work_dir =
@@ -1856,39 +1700,44 @@ exit 0"#,
                 return;
             }
 
-            // 4. Unpack.
-            let staged_root = work_dir.join("unpacked");
-            if let Err(e) = std::fs::create_dir_all(&staged_root) {
-                alerts::message(
-                    mtm,
-                    "Update Failed",
-                    &format!("Couldn't create unpack directory: {e}"),
-                );
-                return;
-            }
-            if let Err(e) = unzip(&zip_path, &staged_root) {
-                alerts::message(mtm, "Update Failed", &format!("{e}"));
-                return;
-            }
-
-            // 5. Strip quarantine + 6. sanity-check the staged bundle.
-            let staged_app = staged_root.join("Konstantin.app");
-            strip_quarantine(&staged_app);
-            if let Err(e) = validate_staged_bundle(&staged_app) {
-                alerts::message(mtm, "Update Failed", &format!("{e}"));
-                return;
-            }
-
-            // 7. Privileged install with self-rollback.
-            let script = build_install_script(&staged_app, &bundle_root);
-            match admin::run_with_progress(
+            // 4. Ask the root daemon to validate, stage, and launch
+            // the detached updater helper. Then poll the helper's
+            // result file while the progress panel stays open.
+            let zip_for_install = zip_path.clone();
+            let expected_version = release.version.to_string();
+            let expected_sha256 = release.asset_sha256.clone();
+            let install_result = progress::run_with_panel(
                 mtm,
                 "Installing Update",
                 &format!("Installing Konstantin {}…", release.version),
-                &script,
-            ) {
-                Ok(()) => {
-                    // 8. Relaunch the freshly installed tray.
+                "konstantin-tray-update-install",
+                move || -> Result<(PathBuf, UpdateInstallResult)> {
+                    let response = AdminClient::send_with_timeout(
+                        AdminRequest::InstallUpdate {
+                            zip_path: zip_for_install,
+                            expected_version,
+                            expected_sha256,
+                        },
+                        Duration::from_secs(120),
+                    )?;
+                    let (result_path, bundle_root) = match response {
+                        AdminResponse::UpdateInstallStarted {
+                            result_path,
+                            bundle_root,
+                        } => (result_path, bundle_root),
+                        AdminResponse::Unauthorized { reason } => {
+                            anyhow::bail!("Not authorized: {reason}");
+                        }
+                        AdminResponse::Error { message } => anyhow::bail!("{message}"),
+                        other => anyhow::bail!("unexpected daemon response: {other:?}"),
+                    };
+                    let result = poll_update_result(&result_path, Duration::from_secs(120))?;
+                    Ok((bundle_root, result))
+                },
+            );
+
+            match install_result {
+                Ok((bundle_root, UpdateInstallResult::Succeeded)) => {
                     let new_tray = bundle_root.join("Contents/MacOS/konstantin-tray");
                     match std::process::Command::new(&new_tray).spawn() {
                         Ok(_) => {
@@ -1916,18 +1765,12 @@ exit 0"#,
                         }
                     }
                 }
-                Err(admin::Error::Cancelled) => {
-                    // Silent — matches the rest of the codebase.
-                }
-                Err(admin::Error::Failed(stderr)) => {
-                    // Full stderr is what diagnoses a failed update —
-                    // log it before classifying down to a one-line
-                    // alert so the operator can find the cause in the
-                    // tray's `~/Library/Logs/konstantin-tray.err.log`.
-                    tracing::error!(stderr = %stderr, "update install script failed");
-                    let (title, body) = classify_failure(&stderr);
+                Ok((_, UpdateInstallResult::Failed { code, message })) => {
+                    tracing::error!(code, message = %message, "update helper failed");
+                    let (title, body) = classify_failure(code, &message);
                     alerts::message(mtm, title, &body);
                 }
+                Err(e) => alerts::message(mtm, "Update Failed", &e.to_string()),
             }
         }
 
@@ -2044,22 +1887,13 @@ exit 0"#,
             }
 
             #[test]
-            fn exit_code_from_known_stderr() {
-                let s = "Konstantin got an error: bad bundle (22)";
-                assert_eq!(exit_code_from_stderr(s), Some(22));
-                let s = "couldn't move existing bundle aside\nKonstantin got an error: do shell script: ... (10)\n";
-                assert_eq!(exit_code_from_stderr(s), Some(10));
-                assert_eq!(exit_code_from_stderr(""), None);
-            }
-
-            #[test]
             fn classify_picks_right_message() {
-                let (t, b) = classify_failure("...failed: bootstrap (22)\n");
+                let (t, b) = classify_failure(22, "bootstrap failed");
                 assert_eq!(t, "Update Failed");
                 assert!(b.contains("rolled back"));
-                let (_, b) = classify_failure("...mv aside (10)\n");
+                let (_, b) = classify_failure(10, "move aside failed");
                 assert!(b.contains("previous version is still active"));
-                let (_, b) = classify_failure("...catastrophe (50)\n");
+                let (_, b) = classify_failure(50, "catastrophe");
                 assert!(b.contains("Reinstall"));
             }
         }
@@ -2573,14 +2407,11 @@ exit 0"#,
                 });
             });
 
-            // After `osascript … with administrator privileges`,
-            // SecurityAgent dismisses and macOS hands focus back to
-            // whichever app was previously frontmost (e.g. VSCode),
-            // *not* us — accessory apps (`LSUIElement=true`) don't
-            // auto-activate. `NSApplication::activate` is *cooperative*
-            // on macOS 14+ ("the framework does not guarantee that the
-            // app will be activated at all" — Apple), so it's not
-            // enough to steal focus from a regular app. Use the
+            // Accessory apps (`LSUIElement=true`) don't auto-activate.
+            // `NSApplication::activate` is *cooperative* on macOS 14+
+            // ("the framework does not guarantee that the app will be
+            // activated at all" — Apple), so it's not enough to steal
+            // focus from a regular app. Use the
             // deprecated-but-functional `activateIgnoringOtherApps:`
             // which is the only reliable way to do so.
             #[allow(deprecated)]

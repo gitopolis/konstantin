@@ -101,6 +101,21 @@ impl Controller {
                     kill_switch_path: cfg.kill_switch_path,
                 })
             }
+            AdminRequest::InstallUpdate {
+                zip_path,
+                expected_version,
+                expected_sha256,
+            } => {
+                if self.config_path != Path::new(SYSTEM_CONFIG_PATH) {
+                    anyhow::bail!("update install is only available for the system daemon");
+                }
+                let started =
+                    crate::update::start_update(&zip_path, &expected_version, &expected_sha256)?;
+                Ok(AdminResponse::UpdateInstallStarted {
+                    result_path: started.result_path,
+                    bundle_root: started.bundle_root,
+                })
+            }
             AdminRequest::Uninstall { preserve_config } => {
                 if self.config_path != Path::new(SYSTEM_CONFIG_PATH) {
                     anyhow::bail!("uninstall is only available for the system daemon");
@@ -702,6 +717,25 @@ daily_limit_minutes = 120
             &allowed_operator(),
             AdminRequest::Uninstall {
                 preserve_config: true,
+            },
+        );
+
+        assert!(matches!(resp, AdminResponse::Error { .. }));
+    }
+
+    #[test]
+    fn update_install_is_system_daemon_only() {
+        let dir = tempdir("update-dev");
+        let path = dir.join("config.toml");
+        std::fs::write(&path, config_text(&dir)).unwrap();
+        let controller = Controller::new(path);
+
+        let resp = controller.handle(
+            &allowed_operator(),
+            AdminRequest::InstallUpdate {
+                zip_path: dir.join("Konstantin.zip"),
+                expected_version: "1.2.3".into(),
+                expected_sha256: "a".repeat(64),
             },
         );
 

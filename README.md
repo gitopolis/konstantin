@@ -52,16 +52,13 @@ Download the latest `Konstantin-<version>.zip` from the
 [Releases](https://github.com/gitopolis/konstantin/releases) page,
 unzip it, drag `Konstantin.app` into `/Applications`, and double-click.
 
-The bundle is currently unsigned (no Apple Developer ID). Both the
-Homebrew cask and a manual download handle macOS's quarantine flag on
-first launch — no right-click-Open dance required.
+The release bundle is Developer ID signed and notarized.
 
 ### First-launch setup
 
 On first launch you'll see a *Set up Konstantin* alert. Click
-`Set Up`. macOS asks for an admin password — Konstantin uses it to
-copy the privileged background service into place and register it
-with `launchd`. After a few seconds the menu-bar icon appears.
+`Set Up`. macOS may ask you to approve Konstantin's background service
+in System Settings. After approval, the menu-bar icon appears.
 
 By default:
 
@@ -88,18 +85,20 @@ Click the menu-bar icon to see:
 * A clock glyph plus the remaining-time display (e.g. `🕒 1h23m`,
   `🕒 12m05s`, `🕒 0s`). When the daemon is down, the clock goes
   muted gray and the time disappears.
-* `Start Daemon` / `Stop Daemon` / `Restart Daemon` — controls the
-  background service. Each prompts for an admin password.
-* `Configure…` — opens the settings window. Asks for an admin
-  password (the config is root-only). For each local user account
-  you can:
+* `Pause Enforcement` / `Unpause Enforcement` — toggles the daemon's
+  kill-switch file so logging users out can be suspended without
+  stopping the privileged service.
+* `Reload Configuration` — asks the daemon to reload its root-owned
+  config.
+* `Configure…` — opens the settings window through the signed admin XPC
+  channel. For each local user account you can:
   * Toggle a daily limit on/off.
   * Set the limit in minutes.
   * Toggle whether the menu-bar app starts at that user's login.
   
   There's also a single field for the warning thresholds (e.g.
-  `10, 2, 1`) shared across all users. Save prompts a second time
-  to commit the change and reload the daemon.
+  `10, 2, 1`) shared across all users. Save writes through the daemon
+  and reloads configuration.
 * `Open Log` — opens `/var/log/screentimed.log` for spot-checking.
 * `Check for Updates…` — fetches the latest release from GitHub. If a
   newer version exists you'll be offered an `Update to X.Y.Z` button;
@@ -107,7 +106,7 @@ Click the menu-bar icon to see:
   GitHub publishes alongside each release asset, replaces the bundle,
   restarts the daemon, and relaunches the menu-bar app. If anything
   fails after the swap the previous version is restored automatically
-  — same admin password prompt, no manual rollback. If you click
+  with no manual rollback. If you click
   `Later`, the menu item morphs to `Update to X.Y.Z` so you can
   install whenever you're ready.
 * `Uninstall…` — removes the app, the daemon, and the per-user
@@ -151,9 +150,9 @@ the daemon log while it's active.
 
 ## Uninstall
 
-Click `Uninstall…` in the menu, enter your admin password, and the
-app removes itself, the daemon, and the counter state. Drag
-`Konstantin.app` to the Trash to remove the bundle.
+Click `Uninstall…` in the menu and the authorized daemon removes its
+system files and counter state. Drag `Konstantin.app` to the Trash to
+remove the bundle.
 
 `/etc/screentimed/config.toml` is preserved by default, in case you
 reinstall. For a full wipe:

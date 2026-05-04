@@ -497,6 +497,10 @@ Progress tracking:
   `AdminRequest::Uninstall` handled by the root daemon. The daemon removes
   system files, counter state, and per-user tray LaunchAgents after
   replying, then boots itself out through launchd.
+* `feat: install updates through admin xpc` adds a hidden
+  `konstantin-updater` helper, extends the admin protocol with
+  `InstallUpdate`, and moves in-app update installation from an elevated
+  tray-owned shell script to a daemon-authorized, detached root helper.
 
 ### Phase 0: Documentation and scaffolding
 
@@ -633,13 +637,17 @@ needs manual validation.
 
 Status: in progress.
 
-* [ ] Move updater install to daemon-mediated XPC once lower-risk admin
+* [x] Move updater install to daemon-mediated XPC once lower-risk admin
   operations are stable.
-  * Investigation complete. Use a detached root `konstantin-updater`
-    helper spawned by the daemon in a new process group; have the tray
-    monitor a structured result file while the helper performs the
-    bundle swap, launchd restart, readiness probe, and rollback.
-    Implementation still pending.
+  * Implemented with a hidden `konstantin-updater` helper shipped in
+    `Contents/Resources`. The tray downloads and verifies the release
+    zip, then sends `AdminRequest::InstallUpdate` over admin XPC. The
+    daemon recomputes the SHA-256, unpacks and validates the bundle,
+    copies the helper to a root-owned `/var/tmp/konstantin-updates/...`
+    work directory, detaches it with `process_group(0)`, and returns a
+    readable result JSON path. The tray polls that result while the helper
+    swaps the bundle, restarts launchd, probes the daemon socket, and
+    rolls back on failure.
 * [x] Decide whether uninstall remains one prompted `osascript` path or moves
   to XPC.
   * Moved to XPC. The tray confirms locally, then sends
@@ -651,7 +659,7 @@ Status: in progress.
     system daemon last.
 * [ ] Remove `admin::run_with_progress` only when every retained action has a
   replacement or an explicit fallback reason.
-  * Not yet. It is still used for legacy setup fallback and update install.
+  * Not yet. It is still used for legacy setup fallback.
 
 ## Testing Plan
 

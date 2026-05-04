@@ -23,6 +23,7 @@ mod ipc;
 mod sessions;
 mod state;
 mod time;
+mod update;
 mod uninstall;
 
 use anyhow::{Context, Result};
