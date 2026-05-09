@@ -14,7 +14,7 @@
         <key>SCREENTIMED_CONFIG</key>
         <string>/etc/screentimed/config.toml</string>
         <key>SCREENTIMED_LOG</key>
-        <string>info,screentimed=debug</string>
+        <string>info,screentimed=info</string>
     </dict>
 
     <key>RunAtLoad</key>
