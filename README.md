@@ -10,6 +10,19 @@ user switching, and re-logins. There's no parental-controls profile,
 no MDM, and no online account. Everything lives on disk in two
 directories and can be removed with one menu click.
 
+## Screenshots
+
+
+The menu-bar app shows the current remaining time, daemon controls,
+configuration, update checks, logs, and uninstall.
+![Konstantin menu showing remaining time and daemon controls](assets/tray-menu.png)
+
+
+The configuration window lets an administrator choose which local
+accounts are limited, set daily budgets, and manage login startup for
+each user.
+![Konstantin configuration window with per-user daily limits](assets/config-ui.png)
+
 ## What it does
 
 * Tracks per-user logged-in time at the macOS console (Aqua sessions
