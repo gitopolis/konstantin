@@ -23,9 +23,9 @@ enforcement path or adding new wire types.
   `NSApplication` and a 5 Hz `NSTimer` block that drains the latest
   `UserStatus` and writes the title
 * auto-reconnects with a 2 s backoff if the daemon stops
-* fires threshold notifications via `osascript` when `remaining_seconds`
-  crosses one of `warn_thresholds_minutes` (config-driven, shipped
-  with each `UserStatus`)
+* fires threshold notifications via `UNUserNotificationCenter` when
+  `remaining_seconds` crosses one of `warn_thresholds_minutes`
+  (config-driven, shipped with each `UserStatus`)
 
 All three communicate over a Unix socket at `/var/run/screentimed.sock`
 (mode 0666). Wire types and framing live in the shared

@@ -180,9 +180,10 @@ mod imp {
             Err(_) => {} // already logged above
         }
 
-        // First-launch flow: if we can't reach the daemon AND no system
-        // plist is present, ask for admin auth and run the privileged
-        // install. If the user cancels, exit cleanly.
+        // First-launch flow: if we can't reach the daemon AND no legacy
+        // system plist is present, ask the operator to register the
+        // bundled daemon with ServiceManagement. If setup is cancelled or
+        // unavailable, exit cleanly.
         if !install::daemon_socket_reachable()
             && !install::system_plist_present()
             && !install::run_first_launch_install(mtm)
@@ -631,8 +632,6 @@ mod imp {
 
         pub struct Paths {
             pub daemon_binary: PathBuf,
-            pub daemon_plist: PathBuf,
-            pub config_example: PathBuf,
             pub source: Source,
             /// `.app` bundle root (`/Applications/Konstantin.app`-ish)
             /// when running from a real bundle. `None` in dev-tree mode.
@@ -663,9 +662,6 @@ mod imp {
                         let bundle_root = contents.parent().map(PathBuf::from);
                         return Ok(Self {
                             daemon_binary: bundled_daemon,
-                            daemon_plist: contents
-                                .join("Library/LaunchDaemons/com.gitopolis.screentimed.plist"),
-                            config_example: resources.join("config.example.toml"),
                             source: Source::Bundle,
                             bundle_root,
                         });
@@ -674,20 +670,11 @@ mod imp {
 
                 // Dev-tree fallback. `exe_dir` is `target/<profile>/`
                 // (`release` or `debug`); the daemon binary lives next
-                // to the tray, and `packaging/` lives at the workspace
-                // root.
+                // to the tray.
                 let profile_dir = exe_dir;
-                let workspace = profile_dir
-                    .parent()
-                    .and_then(|p| p.parent())
-                    .ok_or_else(|| {
-                        anyhow::anyhow!("can't infer workspace root from {}", exe.display())
-                    })?;
 
                 Ok(Self {
                     daemon_binary: profile_dir.join("screentimed"),
-                    daemon_plist: workspace.join("packaging/com.gitopolis.screentimed.plist"),
-                    config_example: workspace.join("packaging/config.example.toml"),
                     source: Source::DevTree,
                     bundle_root: None,
                 })
@@ -1085,67 +1072,6 @@ mod imp {
             content.addSubview(&label);
 
             panel
-        }
-    }
-
-    /// Privileged-action primitive: run a bash command as root via
-    /// `osascript … with administrator privileges`, with a small
-    /// progress panel and a responsive main thread. Thin wrapper
-    /// around `mod progress` that knows how to invoke osascript and
-    /// classify cancel-vs-failure outcomes.
-    mod admin {
-        use super::*;
-
-        pub enum Error {
-            /// User dismissed the OS password prompt.
-            Cancelled,
-            /// osascript or the underlying command exited non-zero. The
-            /// string is the captured stderr.
-            Failed(String),
-        }
-
-        /// Run `bash_command` as root. Shows a progress panel titled
-        /// `panel_title` with the spinner-adjacent message
-        /// `panel_message` for the duration. Must be called from the
-        /// main thread.
-        pub fn run_with_progress(
-            mtm: MainThreadMarker,
-            panel_title: &str,
-            panel_message: &str,
-            bash_command: &str,
-        ) -> Result<(), Error> {
-            let cmd = bash_command.to_string();
-            super::progress::run_with_panel(
-                mtm,
-                panel_title,
-                panel_message,
-                "konstantin-tray-admin",
-                move || run_osascript_blocking(&cmd),
-            )
-        }
-
-        fn run_osascript_blocking(bash_command: &str) -> Result<(), Error> {
-            // AppleScript double-quoted strings escape `\` and `"`. We
-            // build single-line bash here so no newline escaping is
-            // needed.
-            let escaped = bash_command.replace('\\', "\\\\").replace('"', "\\\"");
-            let applescript =
-                format!(r#"do shell script "{escaped}" with administrator privileges"#);
-            let output = std::process::Command::new("/usr/bin/osascript")
-                .arg("-e")
-                .arg(&applescript)
-                .output()
-                .map_err(|e| Error::Failed(format!("spawn osascript: {e}")))?;
-            if output.status.success() {
-                return Ok(());
-            }
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            // osascript reports user cancellation as
-            // `execution error: User canceled. (-128)`.
-            if stderr.contains("User canceled") {
-                return Err(Error::Cancelled);
-            }
-            Err(Error::Failed(stderr.into_owned()))
         }
     }
 
@@ -1899,12 +1825,11 @@ mod imp {
         }
     }
 
-    /// First-launch install + per-user LaunchAgent management.
+    /// First-launch setup + per-user LaunchAgent management.
     ///
     /// Two responsibilities:
     ///   * **System side** — signed bundles register the bundled
-    ///     LaunchDaemon through `SMAppService`. Dev-tree runs and
-    ///     migration fallback still use the legacy copy/bootstrap script.
+    ///     LaunchDaemon through `SMAppService`.
     ///   * **User side** (no auth) — write a per-user LaunchAgent plist
     ///     pointing at this tray binary's absolute path, so launchd
     ///     auto-starts us at next login.
@@ -1924,10 +1849,11 @@ mod imp {
             std::os::unix::net::UnixStream::connect(SOCKET_PATH).is_ok()
         }
 
-        /// Returns true iff the system-side LaunchDaemon plist already
-        /// exists. If yes, the daemon is "installed" and any "not
-        /// reachable" condition is treated as transient — the subscribe
-        /// loop will retry silently.
+        /// Returns true iff the old system-side LaunchDaemon plist already
+        /// exists. If yes, the daemon is considered installed and any "not
+        /// reachable" condition is treated as transient so the subscribe
+        /// loop can keep retrying. New installs are registered through
+        /// ServiceManagement and do not write this plist from the tray.
         pub fn system_plist_present() -> bool {
             Path::new(SYSTEM_PLIST).exists()
         }
@@ -1956,14 +1882,21 @@ mod imp {
                 }
             };
 
-            if paths.source == bundle::Source::Bundle {
-                return run_smappservice_install(mtm, &paths);
+            if paths.source != bundle::Source::Bundle {
+                alerts::message(
+                    mtm,
+                    "Build App First",
+                    "Konstantin setup is only available from the packaged app bundle. \
+                     For development, build the release binaries, run \
+                     ./packaging/build-app.sh, then launch target/Konstantin.app.",
+                );
+                return false;
             }
 
-            run_legacy_install(mtm, &paths)
+            run_smappservice_install(mtm)
         }
 
-        fn run_smappservice_install(mtm: MainThreadMarker, paths: &bundle::Paths) -> bool {
+        fn run_smappservice_install(mtm: MainThreadMarker) -> bool {
             let result = super::progress::run_with_panel(
                 mtm,
                 "Setting Up Konstantin",
@@ -1996,47 +1929,12 @@ mod imp {
                     false
                 }
                 Err(e) => {
-                    tracing::warn!(error = %e, "SMAppService install failed; offering legacy fallback");
-                    if !alerts::confirm(
+                    tracing::warn!(error = %e, "SMAppService install failed");
+                    alerts::message(
                         mtm,
-                        "Use Legacy Installer?",
-                        &format!(
-                            "macOS couldn't register the bundled service with ServiceManagement.\n\n{e}\n\nKonstantin can try the older installer instead. You'll be prompted for an administrator password."
-                        ),
-                        "Use Legacy Installer",
-                        "Quit",
-                    ) {
-                        return false;
-                    }
-                    run_legacy_install(mtm, paths)
-                }
-            }
-        }
-
-        fn run_legacy_install(mtm: MainThreadMarker, paths: &bundle::Paths) -> bool {
-            if paths.source == bundle::Source::Bundle {
-                tracing::info!("using legacy LaunchDaemon installer fallback for bundled app");
-            }
-            let script = build_legacy_install_script(paths);
-
-            match admin::run_with_progress(
-                mtm,
-                "Setting Up Konstantin",
-                "Installing Konstantin's background service.\n\
-                 You may be prompted for your administrator password.",
-                &script,
-            ) {
-                Ok(()) => {
-                    tracing::info!("first-launch install complete");
-                    true
-                }
-                Err(admin::Error::Cancelled) => {
-                    tracing::info!("user cancelled the password prompt");
-                    false
-                }
-                Err(admin::Error::Failed(msg)) => {
-                    tracing::error!(error = %msg, "install command failed");
-                    alerts::message(mtm, "Konstantin install failed.", &msg);
+                        "Konstantin install failed.",
+                        &format!("macOS couldn't register the bundled service with ServiceManagement.\n\n{e}"),
+                    );
                     false
                 }
             }
@@ -2065,53 +1963,6 @@ mod imp {
             std::fs::write(&dst, want)?;
             tracing::info!(path = %dst.display(), "wrote user LaunchAgent plist");
             Ok(())
-        }
-
-        fn build_legacy_install_script(p: &bundle::Paths) -> String {
-            // Single bash command via `&&` chains. `install -d` creates
-            // missing dirs idempotently. Re-running is safe — `cp`
-            // overwrites the daemon binary (handles upgrades), and the
-            // config copy is guarded by a `[ -f ... ] ||` so an existing
-            // `/etc/screentimed/config.toml` is never trampled.
-            //
-            // `launchctl bootstrap` is ORed with `true` because it fails
-            // if the service is already loaded — kickstart -k afterwards
-            // forces a restart either way.
-            //
-            // When installed from a real `.app` bundle, also drop the
-            // bundle's absolute path into `/etc/screentimed/bundle_path`
-            // so the daemon's bundle-watcher can self-uninstall if the
-            // operator drag-to-Trashes the app. In dev-tree mode
-            // (`bundle_root = None`) the marker is removed so the
-            // watcher stays disabled.
-            let mut s = format!(
-                "install -d -m 0755 /usr/local/libexec && \
-                 install -d -m 0755 /etc/screentimed && \
-                 install -d -m 0700 /var/db/screentimed && \
-                 install -m 0755 '{daemon}' /usr/local/libexec/screentimed && \
-                 install -m 0644 '{plist}' /Library/LaunchDaemons/com.gitopolis.screentimed.plist && \
-                 (/usr/libexec/PlistBuddy -c 'Delete :BundleProgram' /Library/LaunchDaemons/com.gitopolis.screentimed.plist || true) && \
-                 (/usr/libexec/PlistBuddy -c 'Delete :ProgramArguments' /Library/LaunchDaemons/com.gitopolis.screentimed.plist || true) && \
-                 /usr/libexec/PlistBuddy -c 'Add :ProgramArguments array' /Library/LaunchDaemons/com.gitopolis.screentimed.plist && \
-                 /usr/libexec/PlistBuddy -c 'Add :ProgramArguments:0 string /usr/local/libexec/screentimed' /Library/LaunchDaemons/com.gitopolis.screentimed.plist && \
-                 ([ -f /etc/screentimed/config.toml ] || install -m 0600 '{config}' /etc/screentimed/config.toml)",
-                daemon = p.daemon_binary.display(),
-                plist = p.daemon_plist.display(),
-                config = p.config_example.display(),
-            );
-            match &p.bundle_root {
-                Some(root) => s.push_str(&format!(
-                    " && printf '%s\\n' {root_q} > /etc/screentimed/bundle_path",
-                    root_q = super::config_ui::shell_quote(root),
-                )),
-                None => s.push_str(" && rm -f /etc/screentimed/bundle_path"),
-            }
-            s.push_str(
-                " && (launchctl bootstrap system /Library/LaunchDaemons/com.gitopolis.screentimed.plist || true) && \
-                 launchctl enable system/com.gitopolis.screentimed && \
-                 launchctl kickstart -k system/com.gitopolis.screentimed",
-            );
-            s
         }
 
         pub(super) fn build_user_launchagent_plist(tray_exe: &Path, home: &Path) -> String {
@@ -2161,29 +2012,6 @@ mod imp {
                 .replace('>', "&gt;")
                 .replace('"', "&quot;")
                 .replace('\'', "&apos;")
-        }
-
-        #[cfg(test)]
-        mod tests {
-            use super::*;
-
-            #[test]
-            fn legacy_installer_rewrites_bundle_program_plist() {
-                let paths = bundle::Paths {
-                    daemon_binary: PathBuf::from("/Applications/Konstantin.app/Contents/Resources/screentimed"),
-                    daemon_plist: PathBuf::from("/Applications/Konstantin.app/Contents/Library/LaunchDaemons/com.gitopolis.screentimed.plist"),
-                    config_example: PathBuf::from("/Applications/Konstantin.app/Contents/Resources/config.example.toml"),
-                    source: bundle::Source::Bundle,
-                    bundle_root: Some(PathBuf::from("/Applications/Konstantin.app")),
-                };
-
-                let script = build_legacy_install_script(&paths);
-
-                assert!(script.contains("Delete :BundleProgram"));
-                assert!(script.contains("Add :ProgramArguments array"));
-                assert!(script
-                    .contains("Add :ProgramArguments:0 string /usr/local/libexec/screentimed"));
-            }
         }
     }
 
@@ -3038,16 +2866,6 @@ mod imp {
                 .unwrap_or_else(|_| PathBuf::from("/usr/local/bin/konstantin-tray"))
         }
 
-        pub(super) fn shell_quote(p: &Path) -> String {
-            shell_quote_arg(&p.display().to_string())
-        }
-
-        pub(super) fn shell_quote_arg(s: &str) -> String {
-            // Wrap in single quotes, escape any embedded single quote as
-            // `'\''` (close, escape, reopen).
-            format!("'{}'", s.replace('\'', "'\\''"))
-        }
-
         #[cfg(test)]
         mod tests {
             use super::*;
@@ -3063,12 +2881,6 @@ mod imp {
             fn thresholds_rejects_garbage() {
                 assert!(parse_thresholds("15, abc, 1").is_err());
                 assert!(parse_thresholds("-3").is_err());
-            }
-
-            #[test]
-            fn shell_quote_escapes_apostrophe() {
-                assert_eq!(shell_quote_arg("alice"), "'alice'");
-                assert_eq!(shell_quote_arg("o'brien"), "'o'\\''brien'");
             }
 
             #[test]
