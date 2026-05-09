@@ -63,8 +63,9 @@ Konstantin.app/Contents/
   MacOS/konstantin-tray                     — main bundle executable
   Library/LaunchDaemons/com.gitopolis.screentimed.plist
   Resources/
-    screentimed                             — daemon binary (copied to
-                                              /usr/local/libexec/ at install)
+    screentimed                             — daemon binary run in place
+                                              by SMAppService
+    konstantin-updater                      — root-owned update helper
     konstantin-status                       — diagnostic CLI
     config.example.toml
     AppIcon.icns
@@ -75,18 +76,19 @@ First-launch flow:
 1. Tray attempts `UnixStream::connect("/var/run/screentimed.sock")`.
    If it succeeds, the daemon is already running — proceed with normal
    subscribe.
-2. If the connect fails AND `/Library/LaunchDaemons/com.gitopolis.screentimed.plist`
-   is missing, the tray puts up a "Set up Konstantin" alert that runs
-   the install steps (copy daemon binary into `/usr/local/libexec/`,
-   plist into `/Library/LaunchDaemons/`, `launchctl bootstrap`).
+2. If the connect fails AND the legacy
+   `/Library/LaunchDaemons/com.gitopolis.screentimed.plist` is missing,
+   the tray puts up a "Set up Konstantin" alert. Packaged app runs
+   register the bundled LaunchDaemon with `SMAppService.daemon(plistName:)`.
+   Dev-tree runs tell the developer to package `target/Konstantin.app`
+   first instead of self-installing a development daemon.
 3. The per-user LaunchAgent is dropped into `~/Library/LaunchAgents/`
    (no auth needed for that one).
 
-Privileged menu actions (Start / Stop / Restart / Configure /
-Uninstall) all funnel through one `run_as_root` helper that wraps
-`osascript -e 'do shell script "..." with administrator privileges'`.
-macOS shows the standard password sheet; the command then runs as
-root. Each invocation is one-shot — no persistent privilege handle.
+Privileged menu actions go through the daemon's admin XPC control
+channel. The tray is only a signed UI client; the root daemon owns
+config writes, LaunchAgent changes, enforcement pause, reload, update
+install, and uninstall.
 
 Daemon-running detection: try to connect to the socket. Cheap, no
 privileges, no `launchctl print` parsing. The worker thread's existing
@@ -153,25 +155,26 @@ These were Nikita's choices; revisit explicitly before changing them.
    request_authorization` runs once at tray startup so the TCC
    consent sheet appears proactively. The decision logic
    (`NotifTracker`) is unchanged from phase 7 — only the delivery
-   side moved from `osascript` to `UNUserNotificationCenter`.
+   side moved to `UNUserNotificationCenter`.
    Bare `cargo run` (no NSBundle context) still no-ops with a
    tracing warning instead of crashing.
 
 7. **`.app` bundle is the canonical install path.** The bundle ships
-   the daemon binary at `Contents/Resources/screentimed`. On
-   "Set up Konstantin", the binary is **copied** (not symlinked) into
-   `/usr/local/libexec/`. Re-running setup re-copies, fixing version
-   skew when the user upgrades the bundle.
+   the daemon binary at `Contents/Resources/screentimed` and registers
+   the bundled LaunchDaemon through `SMAppService`. The tray no longer
+   creates new hand-placed `/Library/LaunchDaemons` installs. Legacy
+   files are still recognized and cleaned up by update/uninstall paths.
 
-8. **Privilege model: `osascript` admin auth.** All privileged actions
-   funnel through one `run_as_root` helper; no persistent privilege
-   handle, no `SMJobBless` helper, no `SMAppService`. SMAppService is
-   the right Mac path long-term but requires Developer ID signing,
-   which we don't have yet.
+8. **Privilege model: signed admin XPC.** Day-to-day privileged actions
+   are authorized by the root daemon over the admin XPC Mach service:
+   the peer must be the signed Konstantin tray and the peer UID must be
+   an allowed operator. No persistent privilege handle, no `SMJobBless`
+   helper, and no tray-owned root shell scripts.
 
-9. **Menu actions are system-wide** (like Docker Desktop). Start / Stop
-   / Restart affect the one shared daemon; Configure edits
-   `/etc/screentimed/config.toml`. There is no per-user mode.
+9. **Menu actions are system-wide** (like Docker Desktop). Pause /
+   Unpause Enforcement, Reload Configuration, Configure, Update, and
+   Uninstall affect the one shared daemon/config. There is no per-user
+   mode.
 
 10. **Status item: `clock` SF Symbol always.** When connected the
     image is a template (menu bar tints it for light/dark); when
@@ -191,18 +194,16 @@ These were Nikita's choices; revisit explicitly before changing them.
     API's per-asset `digest` field (`"sha256:<hex>"` — the same hash
     GitHub displays on the release page; we don't ship a separate
     sidecar), streams the zip to a per-pid temp dir, verifies the
-    hash, unzips, strips the quarantine attribute, and runs one
-    privileged bash script via `admin::run_with_progress` that swaps
-    the bundle in place at `bundle::Paths::resolve()?.bundle_root`
-    (NOT a hardcoded `/Applications/...` — works for any install
-    location). The script self-rolls back if the new daemon doesn't
-    open `/var/run/screentimed.sock` within 20 seconds of `launchctl
-    bootstrap`, all inside the same elevation, so the user types
-    their admin password once even when something fails. Distinct
-    exit codes (10/11 → no state change, 20–23 → rollback already
-    ran, 50 → catastrophic) drive matching alert messages. After a
-    successful install the running tray spawns the new tray binary
-    out of the freshly installed bundle and `terminate:`s itself.
+    hash, then sends `AdminRequest::InstallUpdate` over admin XPC. The
+    daemon recomputes the digest, stages the bundle, validates it, and
+    launches a detached root `konstantin-updater` helper that swaps the
+    bundle in place at the resolved install location (NOT a hardcoded
+    `/Applications/...`). The helper self-rolls back if the new daemon
+    doesn't open `/var/run/screentimed.sock` within 20 seconds. Distinct
+    exit codes (10/11 → no state change, 20–23 → rollback already ran,
+    50 → catastrophic) drive matching alert messages. After a successful
+    install the running tray spawns the new tray binary out of the
+    freshly installed bundle and `terminate:`s itself.
     Architecture mapping (`aarch64`→`arm64`, `x86_64`→`x86_64`) is
     kept in `update::current_arch_label` — a single point of agreement
     with release.yml's matrix `arch:` field. Only canonical URLs
@@ -239,24 +240,21 @@ These were Nikita's choices; revisit explicitly before changing them.
   Main thread runs `NSApplication` and a 5 Hz `NSTimer` block; worker
   thread hosts a current-thread tokio runtime running the
   `Subscription` loop with auto-reconnect (2 s backoff).
-* **Phase 7** — threshold notifications via `osascript`. Pure
+* **Phase 7** — threshold notification decision logic. Pure
   `NotifTracker` decision logic; tracker resets on `resets_at` change,
   fires the smallest applicable threshold only, suppresses
-  `LimitReached` (user is being kicked, not warned).
+  `LimitReached` (user is being kicked, not warned). Delivery is now via
+  `UNUserNotificationCenter`.
 * **A1** — `packaging/build-app.sh` produces `target/Konstantin.app/`
   from release binaries. `LSUIElement=true`, ad-hoc codesigned.
-* **A2** — first-launch install: socket-probe → optional NSAlert →
-  privileged install via `osascript` on a background thread, with
-  the main thread pumping the run loop and showing a progress panel
-  so the cursor stays normal.
-* **A3** — `admin::run_with_progress` primitive lifted out;
-  reusable shape `Result<(), admin::Error::{Cancelled, Failed}>`.
-  `alerts::confirm` / `alerts::message` siblings.
+* **A2** — first-launch setup: socket-probe → optional NSAlert →
+  `SMAppService.daemon(plistName:)` registration from the packaged app.
+  Dev-tree runs ask the developer to package `target/Konstantin.app`.
+* **A3** — reusable progress-panel primitive plus `alerts::confirm` /
+  `alerts::message` siblings.
 * **A4** — `actions::Controller` (NSObject subclass via
-  `define_class!`) routes `startDaemon: / stopDaemon: / restartDaemon:
-  / configure: / openLog: / uninstall:` selectors. Lifecycle commands
-  use `|| true`-tolerant launchctl chains so already-loaded /
-  already-stopped states are idempotent.
+  `define_class!`) routes menu selectors such as pause/unpause,
+  reload, configure, open log, uninstall, and update.
 * **A5** — state-driven UI: muted `clock` SF Symbol when
   `disconnected` (gray baked into the image via an
   `NSImageSymbolConfiguration` with `secondaryLabelColor`), the same
@@ -277,18 +275,11 @@ These were Nikita's choices; revisit explicitly before changing them.
   auto-bumps version + sha256 there on each tag.
 * **A8** — security/UX hardening on top of A1–A7:
   * `/etc/screentimed/config.toml` is now mode 0600 root-owned at
-    every write site (the tray's first-launch
-    `install::build_install_script` and the Save flow's
-    `config_ui::build_admin_script`). Other users on the machine can't
-    see whose limits are configured.
-  * `Configure…` therefore prompts for an admin password to *open*
-    the window: a single `admin::run_with_progress` invocation
-    (`config_ui::build_open_admin_script`) copies the config out to
-    a user-owned temp *and* dumps a manifest of per-user
-    LaunchAgent-plist presence (`<username> 0|1` lines) in the same
-    elevation. Drops the old operator-owned `UiCache` (the
-    `~/Library/Application Support/com.gitopolis.konstantin/ui-state.json`
-    file) — root can stat hardened homes directly, no cache needed.
+    every write site. Other users on the machine can't see whose limits
+    are configured.
+  * `Configure…` uses admin XPC: the daemon reads the root-owned config
+    and stats per-user LaunchAgent plists directly, so hardened homes do
+    not need an operator-owned `UiCache`.
   * `Uninstall…` and `packaging/uninstall.sh` now `rm -rf
     /var/db/screentimed/` (counter state). `/etc/screentimed/`
     (config) is still preserved on uninstall; `--zap` still removes
@@ -301,16 +292,13 @@ These were Nikita's choices; revisit explicitly before changing them.
 * **A9** — in-app updater (`mod update` + `Check for Updates…` menu
   item). Driven by `env!("CARGO_PKG_VERSION")` (CI runs `cargo
   set-version --workspace "$VERSION"` before each release build, so
-  the value baked into a tagged binary is always correct). The
-  privileged `admin::run_with_progress` core was extracted into a
-  reusable `progress::run_with_panel<T>` primitive that takes an
-  arbitrary closure — the updater uses it twice (the unprivileged
-  download phase and as the indirection underneath
-  `admin::run_with_progress`). New deps: `ureq` (rustls-backed,
-  blocking HTTP), `sha2` (digest verification), `semver` (version
-  comparison). Asset SHA-256 is read straight from the GitHub API's
-  per-asset `digest` field — no sidecar files in the release. See
-  decision #11 for the full design.
+  the value baked into a tagged binary is always correct). The tray does
+  unprivileged release lookup/download/digest verification, then asks the
+  daemon to install through admin XPC and the detached root updater
+  helper. New deps: `ureq` (rustls-backed, blocking HTTP), `sha2`
+  (digest verification), `semver` (version comparison). Asset SHA-256 is
+  read straight from the GitHub API's per-asset `digest` field — no
+  sidecar files in the release. See decision #11 for the full design.
 
 Tests, unsafe-block count: both will drift. The CI signal is
 `cargo test --workspace` clean. Don't pin counts here — they
@@ -414,14 +402,13 @@ konstantin/
 
 ## macOS Tahoe gotchas
 
-* **Code signing.** Distribution via Homebrew cask without Developer
-  ID is acceptable — cask handles `com.apple.quarantine` removal.
-  SMAppService and `UNUserNotificationCenter` both require Developer
-  ID; they're deferred until signing is in place.
-* **Modern install path.** For real distribution prefer
-  `SMAppService.daemon(plistName:)` over hand-placed
-  `/Library/LaunchDaemons/` files. We use the hand-placed approach
-  via `run_as_root` because it works without code signing.
+* **Code signing.** Developer ID signing/notarization is required for
+  the packaged app's SMAppService registration, Notification Center
+  attribution, and admin XPC peer requirements. Local ad-hoc builds are
+  useful for development but are not the production install path.
+* **Modern install path.** Real distribution uses
+  `SMAppService.daemon(plistName:)` with the bundled LaunchDaemon plist.
+  Hand-placed `/Library/LaunchDaemons/` files are legacy artifacts only.
 * **Fast user switching.** `SCDynamicStoreCopyConsoleUser` reports
   only the foreground user, so backgrounded FUS users have their
   counters paused while another account is at the keyboard. State

@@ -201,13 +201,17 @@ discover whose limits are configured).
 | Path | What |
 |------|------|
 | `/Applications/Konstantin.app` | The app bundle. |
-| `/usr/local/libexec/screentimed` | Privileged background service. |
-| `/Library/LaunchDaemons/com.gitopolis.screentimed.plist` | Tells `launchd` to run the daemon. |
+| `/Applications/Konstantin.app/Contents/Resources/screentimed` | Privileged background service for ServiceManagement installs. |
+| `/Applications/Konstantin.app/Contents/Library/LaunchDaemons/com.gitopolis.screentimed.plist` | Bundled daemon registration plist. |
 | `~/Library/LaunchAgents/com.gitopolis.konstantin-tray.plist` | Tells `launchd` to run the menu-bar app at your login. |
 | `/etc/screentimed/config.toml` | Your settings. Mode 0600 root-owned. |
 | `/var/db/screentimed/state.json` | Per-user counters. |
 | `/var/log/screentimed.log` | Daemon log. |
 | `/etc/screentimed/disable` | Kill-switch file. Touch to disable enforcement live. |
+
+Older installs may still have `/usr/local/libexec/screentimed` and
+`/Library/LaunchDaemons/com.gitopolis.screentimed.plist`; uninstall and
+update paths still clean those up for compatibility.
 
 ## For developers
 
