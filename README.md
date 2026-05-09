@@ -1,3 +1,4 @@
+![Konstantin App icon](assets/icon_128x128.png)
 # Konstantin
 
 Konstantin is a macOS menu-bar app that enforces daily screen-time
@@ -15,6 +16,7 @@ directories and can be removed with one menu click.
 
 The menu-bar app shows the current remaining time, daemon controls,
 configuration, update checks, logs, and uninstall.
+
 ![Konstantin menu showing remaining time and daemon controls](assets/tray-menu.png)
 
 
