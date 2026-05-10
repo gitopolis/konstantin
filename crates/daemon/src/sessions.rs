@@ -24,7 +24,7 @@ use std::collections::HashSet;
 use std::ffi::{c_char, c_void, CStr};
 
 #[link(name = "SystemConfiguration", kind = "framework")]
-#[link(name = "CoreFoundation", kind = "framework")]
+#[link(name = "CoreFoundation")]
 extern "C" {
     /// Returns a retained `CFStringRef` naming the current console
     /// user, or NULL if nobody is at the console. `store` may be NULL
