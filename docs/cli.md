@@ -154,9 +154,10 @@ Notable actions:
   at `/var/db/screentimed/`. It preserves `/etc/screentimed/` so a
   reinstall picks up your settings.
 
-The legacy first-launch fallback still uses
-`osascript … with administrator privileges` when ServiceManagement
-registration is unavailable.
+First-launch setup registers the bundled daemon through
+ServiceManagement. Development builds should be packaged with
+`./packaging/build-app.sh` and launched from `target/Konstantin.app`
+instead of using the tray to install a dev-tree daemon.
 
 ### Environment variables
 
@@ -179,9 +180,9 @@ registration is unavailable.
   action needed.
 * When `remaining_seconds` crosses one of `warn_thresholds_minutes`
   (configured daemon-side, shipped with each `UserStatus`), the tray
-  fires a notification via `osascript`. Each threshold fires at most
-  once per day; the smallest applicable threshold wins on first
-  crossing.
+  fires a Notification Center warning via `UNUserNotificationCenter`.
+  Each threshold fires at most once per day; the smallest applicable
+  threshold wins on first crossing.
 
 ### Logs
 

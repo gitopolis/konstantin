@@ -11,7 +11,7 @@ The target end state is:
 
 * First setup/registration may require one Apple-managed authorization.
 * Day-to-day operator actions go tray -> root daemon over a signed XPC
-  control channel, without `osascript`.
+  control channel, without AppleScript elevation.
 * The daemon authorizes each mutating request using the connecting
   process identity and the real operator account.
 * Existing status subscription behavior stays available to all users.
@@ -22,14 +22,10 @@ code-signing requirements.
 
 ## Current State
 
-Privileged tray actions currently build shell snippets and pass them to
-`admin::run_with_progress`, which runs:
+Privileged tray actions used to build shell snippets and pass them to an
+AppleScript elevation helper.
 
-```text
-osascript -e 'do shell script "..." with administrator privileges'
-```
-
-This affects at least:
+That affected:
 
 * Restart / Reload Daemon.
 * Open Configuration, because `/etc/screentimed/config.toml` is
@@ -39,6 +35,11 @@ This affects at least:
 * Pause / Unpause Enforcement, once the tray exposes it as a direct menu
   action.
 * First setup, uninstall, and updater install.
+
+Current builds no longer invoke AppleScript for privileged work. Fresh
+first-launch setup uses `SMAppService.daemon(plistName:)`; routine
+operator actions, uninstall, and update installation go through the root
+daemon's admin XPC channel.
 
 The daemon already authenticates status clients with `getpeereid(2)` on
 the Unix socket at `/var/run/screentimed.sock`, but that socket is mode
@@ -373,7 +374,7 @@ Keep the unprivileged parts unchanged:
 * verify GitHub API `digest` SHA-256 locally so bad downloads fail before
   any privileged request.
 
-Replace the privileged `osascript` install script with:
+Replace the privileged shell install script with:
 
 ```rust
 AdminRequest::InstallUpdate {
@@ -482,7 +483,7 @@ Progress tracking:
   Start/Stop Daemon menu items with Pause/Unpause Enforcement over admin
   XPC.
 * `9447551 feat: configure settings over admin xpc` replaced the
-  Configure open/save `osascript` paths with admin XPC, including
+  Configure open/save AppleScript paths with admin XPC, including
   daemon-owned config writes and daemon-owned tray LaunchAgent autostart
   changes.
 * `d9dba9f feat: reload configuration over admin xpc` replaced the
@@ -490,10 +491,9 @@ Progress tracking:
   XPC and added periodic pause-state refreshes for all connected trays.
 * `7aacd3c feat: register daemon with service management` added
   `SMAppService.daemon(plistName:)` first-launch registration for signed
-  bundles, converted the bundled daemon plist to `BundleProgram`, and kept
-  the legacy installer as a dev/fallback path.
+  bundles and converted the bundled daemon plist to `BundleProgram`.
 * `feat: uninstall through admin xpc` moves the tray's Uninstall
-  action from an elevated `osascript` teardown script to an authorized
+  action from an elevated teardown script to an authorized
   `AdminRequest::Uninstall` handled by the root daemon. The daemon removes
   system files, counter state, and per-user tray LaunchAgents after
   replying, then boots itself out through launchd.
@@ -545,9 +545,10 @@ Status: complete for the initial scope.
 * [x] Add pure handlers for `GetEnforcementState` and
   `SetEnforcementPaused`.
 * [x] Exercise handlers directly in tests, without transport.
-* [x] Preserve current `osascript` update/restart paths while daemon
+* [x] Preserve then replace the existing update/restart paths while daemon
   handlers mature.
-  * Configure open/save has now moved to admin XPC in Phase 4.
+  * Configure open/save, reload, update, and uninstall have now moved to
+    admin XPC.
 
 ### Phase 3: XPC transport
 
@@ -622,9 +623,11 @@ needs manual validation.
     `SMAppService.daemon(plistName:)` for
     `com.gitopolis.screentimed.plist`. If System Settings approval is
     required, the tray opens Login Items settings and exits cleanly.
-* [x] Keep legacy `osascript` installer for migration/fallback only.
-  * Dev-tree runs still use the legacy installer. Bundled runs offer the
-    legacy installer only if ServiceManagement registration fails.
+* [x] Remove the legacy AppleScript installer from the tray.
+  * Dev-tree runs now tell developers to package `target/Konstantin.app`
+    instead of trying to self-install. Bundled runs fail visibly if
+    ServiceManagement registration fails rather than falling back to a
+    shell installer.
 * [~] Add upgrade logic that recognizes old `/Library/LaunchDaemons` and
   `/usr/local/libexec` installs and migrates them cleanly.
   * Legacy copied plists are rewritten from bundled `BundleProgram` to
@@ -648,8 +651,7 @@ Status: in progress.
     readable result JSON path. The tray polls that result while the helper
     swaps the bundle, restarts launchd, probes the daemon socket, and
     rolls back on failure.
-* [x] Decide whether uninstall remains one prompted `osascript` path or moves
-  to XPC.
+* [x] Move uninstall to XPC.
   * Moved to XPC. The tray confirms locally, then sends
     `AdminRequest::Uninstall { preserve_config: true }`. The daemon only
     accepts it from the system config path, schedules teardown after
@@ -657,9 +659,11 @@ Status: in progress.
     `/var/db/screentimed/`, removes per-user tray LaunchAgents under
     `/Users`, skips booting out the operator's own tray, and bootouts the
     system daemon last.
-* [ ] Remove `admin::run_with_progress` only when every retained action has a
-  replacement or an explicit fallback reason.
-  * Not yet. It is still used for legacy setup fallback.
+* [x] Remove the tray-owned root-command progress helper.
+  * All retained privileged actions now have XPC or ServiceManagement
+    replacements. Legacy install artifacts are still recognized and
+    cleaned up by update/uninstall paths, but the tray no longer creates
+    new legacy installs.
 
 ## Testing Plan
 
@@ -708,8 +712,9 @@ Support three installation states during migration:
    launchd registration points to the app-bundled daemon via
    `BundleProgram`.
 3. Dev-tree run:
-   first-launch setup uses the legacy shell/admin fallback. Admin XPC may
-   be unavailable depending on signing identity.
+   first-launch setup is unavailable from the tray. Developers should
+   package and launch `target/Konstantin.app` or use explicit manual
+   development commands outside the app.
 
 Do not strand users on the legacy install. The signed app should detect
 legacy state and offer a one-time migration.
