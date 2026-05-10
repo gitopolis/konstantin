@@ -2041,7 +2041,7 @@ mod imp {
         };
         use objc2_foundation::{NSData, NSPoint, NSRect, NSSize};
         use std::cell::RefCell;
-        use std::path::{Path, PathBuf};
+        use std::path::PathBuf;
 
         thread_local! {
             /// At most one configure window at a time. Re-opening just

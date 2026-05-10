@@ -73,7 +73,7 @@ pub fn start_update(
     let staged_bundle = unpacked.join("Konstantin.app");
     validate_staged_bundle(&staged_bundle, expected_version)?;
 
-    let helper_src = current_helper_path(&bundle_root)?;
+    let helper_src = current_helper_path(&staged_bundle)?;
     let helper_copy = work_dir.join("konstantin-updater");
     fs::copy(&helper_src, &helper_copy).with_context(|| {
         format!(
@@ -191,6 +191,10 @@ fn install_update(args: &UpdaterArgs) -> std::result::Result<(), UpdateFailure> 
         });
     }
 
+    write_bundle_marker(&args.dest_bundle)?;
+    bootout_system_daemon();
+    wait_for_daemon_exit();
+
     if let Err(e) = install_daemon_binary(&args.dest_bundle) {
         restore_backup(&args.dest_bundle, &backup)?;
         return Err(UpdateFailure::Classified {
@@ -206,10 +210,6 @@ fn install_update(args: &UpdaterArgs) -> std::result::Result<(), UpdateFailure> 
             message: format!("could not install LaunchDaemon plist: {e}"),
         });
     }
-
-    write_bundle_marker(&args.dest_bundle)?;
-    bootout_system_daemon();
-    wait_for_daemon_exit();
 
     if let Err(e) = bootstrap_system_daemon() {
         restore_backup(&args.dest_bundle, &backup)?;
@@ -492,8 +492,28 @@ fn install_daemon_binary(bundle: &Path) -> Result<()> {
     if let Some(parent) = dst.parent() {
         fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
     }
-    fs::copy(&src, dst).with_context(|| format!("installing daemon binary to {LEGACY_DAEMON}"))?;
-    set_mode(dst, 0o755)
+    replace_file(&src, dst, 0o755)
+        .with_context(|| format!("installing daemon binary to {LEGACY_DAEMON}"))
+}
+
+fn replace_file(src: &Path, dst: &Path, mode: u32) -> Result<()> {
+    let parent = dst
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .context("destination has no parent")?;
+    let name = dst
+        .file_name()
+        .and_then(|s| s.to_str())
+        .context("destination has no file name")?;
+    let tmp = parent.join(format!(".{name}.tmp.{}", std::process::id()));
+
+    let _ = fs::remove_file(&tmp);
+    fs::copy(src, &tmp)
+        .with_context(|| format!("copying {} to {}", src.display(), tmp.display()))?;
+    set_mode(&tmp, mode)?;
+    fs::rename(&tmp, dst)
+        .with_context(|| format!("renaming {} to {}", tmp.display(), dst.display()))?;
+    Ok(())
 }
 
 fn install_legacy_plist(bundle: &Path) -> Result<()> {
@@ -711,6 +731,37 @@ mod tests {
             PathBuf::from("/Applications/Konstantin.app")
         );
         assert_eq!(parsed.result_path, PathBuf::from("/tmp/result.json"));
+    }
+
+    #[test]
+    fn replace_file_uses_sibling_temp_then_rename() {
+        let n = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "konstantin-replace-file-test-{}-{n}",
+            std::process::id()
+        ));
+        fs::create_dir(&dir).unwrap();
+
+        let src = dir.join("src");
+        let dst = dir.join("dst");
+        fs::write(&src, b"new").unwrap();
+        fs::write(&dst, b"old").unwrap();
+
+        replace_file(&src, &dst, 0o755).unwrap();
+
+        assert_eq!(fs::read(&dst).unwrap(), b"new");
+        assert_eq!(
+            fs::metadata(&dst).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+        assert!(!dir
+            .join(format!(".dst.tmp.{}", std::process::id()))
+            .exists());
+
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
