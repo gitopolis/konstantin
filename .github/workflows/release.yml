@@ -137,8 +137,14 @@ jobs:
     steps:
       - name: Extract tag
         run: |
+          set -euo pipefail
           TAG="${GITHUB_REF#refs/tags/}"
           echo "TAG=$TAG" >> "$GITHUB_ENV"
+          if [[ "$TAG" == *-* ]]; then
+            echo "IS_PRERELEASE=1" >> "$GITHUB_ENV"
+          else
+            echo "IS_PRERELEASE=0" >> "$GITHUB_ENV"
+          fi
 
       - name: Download all build artifacts
         uses: actions/download-artifact@v8
@@ -151,13 +157,19 @@ jobs:
           GH_REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
+          args=()
+          if [[ "$IS_PRERELEASE" == "1" ]]; then
+            args+=(--prerelease)
+          fi
           gh release create "$TAG" \
             artifacts/*/*.zip \
             --title "Konstantin $TAG" \
-            --generate-notes
+            --generate-notes \
+            "${args[@]}"
 
   bump-tap:
     needs: release
+    if: ${{ !contains(github.ref_name, '-') }}
     runs-on: macos-26
     steps:
       - name: Extract version from tag
