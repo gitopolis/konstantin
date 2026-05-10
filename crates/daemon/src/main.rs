@@ -131,23 +131,17 @@ async fn main() -> Result<()> {
 }
 
 fn record_bundle_marker() {
-    match infer_bundle_root_from_exe() {
-        Some(root) => {
-            if let Some(parent) = std::path::Path::new(uninstall::MARKER_PATH).parent() {
-                if let Err(e) = std::fs::create_dir_all(parent) {
-                    warn!(error = %e, "could not create bundle marker directory");
-                    return;
-                }
-            }
-            if let Err(e) = std::fs::write(uninstall::MARKER_PATH, format!("{}\n", root.display()))
-            {
-                warn!(error = %e, path = uninstall::MARKER_PATH, "could not write bundle marker");
+    if let Some(root) = infer_bundle_root_from_exe() {
+        if let Some(parent) = std::path::Path::new(uninstall::MARKER_PATH).parent() {
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                warn!(error = %e, "could not create bundle marker directory");
+                return;
             }
         }
-        // Legacy installs run from /usr/local/libexec/screentimed but
-        // still get a bundle marker written by the installer. Preserve
-        // that marker so the drag-to-Trash watcher keeps working.
-        None => {}
+        if let Err(e) = std::fs::write(uninstall::MARKER_PATH, format!("{}\n", root.display()))
+        {
+            warn!(error = %e, path = uninstall::MARKER_PATH, "could not write bundle marker");
+        }
     }
 }
 

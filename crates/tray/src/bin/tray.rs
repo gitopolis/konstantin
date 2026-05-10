@@ -601,7 +601,7 @@ mod imp {
     /// example config — either from this `.app` bundle's
     /// `Contents/Resources/` (production) or from `target/<profile>/`
     /// + `packaging/` (developer running `cargo run` or
-    /// `target/release/konstantin-tray` directly).
+    ///   `target/release/konstantin-tray` directly).
     ///
     /// One source of truth so anyone needing a bundled artifact —
     /// install, future "update daemon" flow, diagnostics — calls
@@ -2866,6 +2866,8 @@ mod imp {
 
         #[cfg(test)]
         mod tests {
+            use std::path::Path;
+
             use super::*;
 
             #[test]
