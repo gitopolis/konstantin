@@ -14,8 +14,11 @@ jobs:
       matrix:
         include:
           - target: aarch64-apple-darwin
-            runner: macos-14
+            runner: macos-26
             arch: arm64
+          - target: x86_64-apple-darwin
+            runner: macos-26-intel
+            arch: x86_64
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v6
@@ -155,7 +158,7 @@ jobs:
 
   bump-tap:
     needs: release
-    runs-on: ubuntu-latest
+    runs-on: macos-26
     steps:
       - name: Extract version from tag
         run: |
@@ -165,16 +168,6 @@ jobs:
           echo "TAG=$TAG"         >> "$GITHUB_ENV"
           echo "VERSION=$VERSION" >> "$GITHUB_ENV"
 
-      - name: Download release zip and compute sha256
-        run: |
-          set -euo pipefail
-          ASSET="Konstantin-${VERSION}-arm64.zip"
-          URL="https://github.com/${{ github.repository }}/releases/download/${TAG}/${ASSET}"
-          curl -fsSL -o "$ASSET" "$URL"
-          SHA256=$(shasum -a 256 "$ASSET" | awk '{print $1}')
-          echo "SHA256=$SHA256" >> "$GITHUB_ENV"
-          echo "Computed sha256 for $ASSET: $SHA256"
-
       - name: Checkout tap repo
         uses: actions/checkout@v6
         with:
@@ -182,16 +175,22 @@ jobs:
           token: ${{ secrets.TAP_PAT }}
           path: tap
 
+      - name: Register local tap checkout
+        run: brew tap gitopolis/konstantin "$PWD/tap"
+
       - name: Update cask formula
         run: |
           set -euo pipefail
-          cd tap
-          # Cask is Ruby, not TOML — sed against uniquely-formatted lines
-          # is the right tool here.
-          sed -i.bak -E "s|^  version \"[^\"]+\"|  version \"${VERSION}\"|" Casks/konstantin.rb
-          sed -i.bak -E "s|^  sha256 \"[^\"]+\"|  sha256 \"${SHA256}\"|"   Casks/konstantin.rb
-          rm Casks/konstantin.rb.bak
-          grep -E '^  (version|sha256)' Casks/konstantin.rb
+          brew bump-cask-pr \
+            --write-only \
+            --no-audit \
+            --no-style \
+            --version-arm "$VERSION" \
+            --version-intel "$VERSION" \
+            gitopolis/konstantin/konstantin
+          cp "$(brew --repository gitopolis/konstantin)/Casks/konstantin.rb" \
+            tap/Casks/konstantin.rb
+          sed -n '1,16p' tap/Casks/konstantin.rb
 
       - name: Commit and push
         run: |
@@ -200,7 +199,7 @@ jobs:
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           if git diff --quiet; then
-            echo "::notice::cask is already at $VERSION/$SHA256 — nothing to commit"
+            echo "::notice::cask is already at $VERSION — nothing to commit"
             exit 0
           fi
           git add Casks/konstantin.rb

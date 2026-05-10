@@ -1201,10 +1201,8 @@ mod imp {
         /// Map `std::env::consts::ARCH` to the `<arch>` token that the
         /// release pipeline embeds in asset filenames. `aarch64` is the
         /// Rust target arch for Apple Silicon; the release matrix labels
-        /// that build `arm64`. The eventual x86_64 matrix entry should
-        /// be labelled `x86_64` (matches `uname -m` and Homebrew's
-        /// bottle-arch convention) — if it lands as `amd64` instead, the
-        /// mapping below is the only thing that changes.
+        /// that build `arm64`. The Intel build is labelled `x86_64`
+        /// (matches `uname -m` and Homebrew's bottle-arch convention).
         pub fn current_arch_label() -> Option<&'static str> {
             match std::env::consts::ARCH {
                 "aarch64" => Some("arm64"),
