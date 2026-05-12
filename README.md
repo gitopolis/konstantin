@@ -55,8 +55,7 @@ each user.
 ### Homebrew (preferred)
 
 ```sh
-brew tap gitopolis/konstantin
-brew install --cask konstantin
+brew install --cask gitopolis/tap/konstantin
 ```
 
 ### Manual
