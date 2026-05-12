@@ -183,12 +183,12 @@ jobs:
       - name: Checkout tap repo
         uses: actions/checkout@v6
         with:
-          repository: gitopolis/homebrew-konstantin
+          repository: gitopolis/homebrew-tap
           token: ${{ secrets.TAP_PAT }}
           path: tap
 
       - name: Register local tap checkout
-        run: brew tap gitopolis/konstantin "$PWD/tap"
+        run: brew tap gitopolis/tap "$PWD/tap"
 
       - name: Update cask formula
         run: |
@@ -199,8 +199,8 @@ jobs:
             --no-style \
             --version-arm "$VERSION" \
             --version-intel "$VERSION" \
-            gitopolis/konstantin/konstantin
-          cp "$(brew --repository gitopolis/konstantin)/Casks/konstantin.rb" \
+            gitopolis/tap/konstantin
+          cp "$(brew --repository gitopolis/tap)/Casks/konstantin.rb" \
             tap/Casks/konstantin.rb
           sed -n '1,16p' tap/Casks/konstantin.rb
 
