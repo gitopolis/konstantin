@@ -269,7 +269,7 @@ These were Nikita's choices; revisit explicitly before changing them.
 * **A7** — `Uninstall…` menu item: confirm → privileged teardown
   (`launchctl bootout` + `rm` of system files) → user LaunchAgent
   cleanup → `NSApplication::terminate`. The cask formula in the
-  separate tap repo (`github.com/gitopolis/homebrew-konstantin`,
+  separate tap repo (`github.com/gitopolis/homebrew-tap`,
   `Casks/konstantin.rb`) carries matching `uninstall` + `zap` stanzas
   for non-interactive `brew uninstall --zap`; the release workflow
   auto-bumps version + sha256 there on each tag.
@@ -316,7 +316,7 @@ wider distribution:
 * **Real `AppIcon.iconset/`** in `packaging/`. Currently the bundle
   ships with macOS's generic application icon.
 
-The Homebrew tap is live at `github.com/gitopolis/homebrew-konstantin`
+The Homebrew tap is live at `github.com/gitopolis/homebrew-tap`
 (cask at `Casks/konstantin.rb`); the release workflow zips, uploads,
 and bumps the cask on each tag.
 

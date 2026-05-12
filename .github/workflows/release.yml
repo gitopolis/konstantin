@@ -137,11 +137,17 @@ jobs:
     steps:
       - name: Extract tag
         run: |
+          set -euo pipefail
           TAG="${GITHUB_REF#refs/tags/}"
           echo "TAG=$TAG" >> "$GITHUB_ENV"
+          if [[ "$TAG" == *-* ]]; then
+            echo "IS_PRERELEASE=1" >> "$GITHUB_ENV"
+          else
+            echo "IS_PRERELEASE=0" >> "$GITHUB_ENV"
+          fi
 
       - name: Download all build artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: artifacts
 
@@ -151,13 +157,19 @@ jobs:
           GH_REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
+          args=()
+          if [[ "$IS_PRERELEASE" == "1" ]]; then
+            args+=(--prerelease)
+          fi
           gh release create "$TAG" \
             artifacts/*/*.zip \
             --title "Konstantin $TAG" \
-            --generate-notes
+            --generate-notes \
+            "${args[@]}"
 
   bump-tap:
     needs: release
+    if: ${{ !contains(github.ref_name, '-') }}
     runs-on: macos-26
     steps:
       - name: Extract version from tag
@@ -171,12 +183,12 @@ jobs:
       - name: Checkout tap repo
         uses: actions/checkout@v6
         with:
-          repository: gitopolis/homebrew-konstantin
+          repository: gitopolis/homebrew-tap
           token: ${{ secrets.TAP_PAT }}
           path: tap
 
       - name: Register local tap checkout
-        run: brew tap gitopolis/konstantin "$PWD/tap"
+        run: brew tap gitopolis/tap "$PWD/tap"
 
       - name: Update cask formula
         run: |
@@ -187,8 +199,8 @@ jobs:
             --no-style \
             --version-arm "$VERSION" \
             --version-intel "$VERSION" \
-            gitopolis/konstantin/konstantin
-          cp "$(brew --repository gitopolis/konstantin)/Casks/konstantin.rb" \
+            gitopolis/tap/konstantin
+          cp "$(brew --repository gitopolis/tap)/Casks/konstantin.rb" \
             tap/Casks/konstantin.rb
           sed -n '1,16p' tap/Casks/konstantin.rb
 

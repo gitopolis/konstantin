@@ -2,7 +2,7 @@ name: Tag
 
 on:
   push:
-    branches: [release]
+    branches: [release, pre-release]
 
 permissions:
   contents: write
@@ -11,7 +11,7 @@ jobs:
   tag:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           fetch-depth: 0
           fetch-tags: true
@@ -37,12 +37,23 @@ jobs:
           svu --version
 
       - name: Compute next version
+        id: version
         run: |
           set -euo pipefail
           git -c advice.detachedHead=false checkout "$TAG_TARGET"
-          VERSION=$(svu next)
+          if [[ "${GITHUB_REF_NAME}" == "pre-release" ]]; then
+            json=$(svu prerelease --json --prerelease rc)
+          else
+            json=$(svu next --json)
+          fi
+          echo "json=$json" >> "$GITHUB_OUTPUT"
+
+      - name: Export version
+        run: |
+          set -euo pipefail
+          VERSION="${{ fromJSON(steps.version.outputs.json).version }}"
           echo "VERSION=$VERSION" >> "$GITHUB_ENV"
-          echo "Next version: $VERSION"
+          echo "Computed version: $VERSION"
 
       - name: Skip if tag already exists
         run: |
@@ -62,5 +73,10 @@ jobs:
         if: env.SKIP != '1'
         run: |
           set -euo pipefail
-          git tag -a "$VERSION" "$TAG_TARGET" -m "Release $VERSION"
+          if [[ "${GITHUB_REF_NAME}" == "pre-release" ]]; then
+            message="Pre-release $VERSION"
+          else
+            message="Release $VERSION"
+          fi
+          git tag -a "$VERSION" "$TAG_TARGET" -m "$message"
           git push origin "$VERSION"
