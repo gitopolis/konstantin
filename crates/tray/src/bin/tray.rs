@@ -33,10 +33,12 @@ mod imp {
     use anyhow::Result;
     use block2::RcBlock;
     use objc2::rc::Retained;
+    use objc2::runtime::AnyObject;
     use objc2::sel;
     use objc2_app_kit::{
-        NSAlert, NSApplication, NSCellImagePosition, NSColor, NSImage, NSImageSymbolConfiguration,
-        NSMenu, NSMenuItem, NSStatusBar, NSStatusItem, NSVariableStatusItemLength,
+        NSAlert, NSApplication, NSCellImagePosition, NSColor, NSForegroundColorAttributeName,
+        NSImage, NSImageSymbolConfiguration, NSMenu, NSMenuItem, NSStatusBar, NSStatusItem,
+        NSVariableStatusItemLength,
     };
     // `NSApplicationActivationPolicy` is declared in the
     // NSRunningApplication header, not NSApplication's.
@@ -49,7 +51,7 @@ mod imp {
     use konstantin_tray::notifications::{self, NotifTracker};
     use konstantin_tray::{default_socket_path, format_remaining, Subscription};
     use objc2_app_kit::NSApplicationActivationPolicy;
-    use objc2_foundation::{MainThreadMarker, NSString, NSTimer};
+    use objc2_foundation::{MainThreadMarker, NSAttributedString, NSDictionary, NSString, NSTimer};
     use std::ptr::NonNull;
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
@@ -158,7 +160,7 @@ mod imp {
 
         // Initial visuals before any update arrives — match the default
         // `disconnected: true` state (muted clock, no time label).
-        apply_visual(&tray.status_item, true, "", mtm);
+        apply_visual(&tray.status_item, true, StatusDisplay::empty(), mtm);
 
         // Idempotent: write our per-user LaunchAgent plist so launchd
         // auto-starts the tray on next login. Doesn't bootstrap — we
@@ -422,9 +424,9 @@ mod imp {
             // we're currently disconnected — even if a stale `pending`
             // is sitting around, the daemon is unreachable *now*.
             if disconnected {
-                apply_visual(&tray.status_item, true, "", mtm);
+                apply_visual(&tray.status_item, true, StatusDisplay::empty(), mtm);
             } else if let Some(status) = pending {
-                apply_visual(&tray.status_item, false, &status_label(&status), mtm);
+                apply_visual(&tray.status_item, false, status_display(&status), mtm);
             }
             // else: connected, no fresh status — leave visuals alone.
         });
@@ -496,18 +498,38 @@ mod imp {
         }
     }
 
-    fn status_label(status: &UserStatus) -> String {
-        match status.state {
-            // No limit configured for this account — clock glyph alone
-            // is enough; an em-dash next to it just looks like noise.
-            SessionState::NotConfigured => String::new(),
-            SessionState::Offline => "offline".to_string(),
-            SessionState::LimitReached => "0s".to_string(),
-            SessionState::Active => format_remaining(status.remaining_seconds),
-            SessionState::Paused => {
-                format!("⏸ {}", format_remaining(status.remaining_seconds))
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct StatusDisplay {
+        label: String,
+        urgent: bool,
+    }
+
+    impl StatusDisplay {
+        fn empty() -> Self {
+            Self {
+                label: String::new(),
+                urgent: false,
             }
         }
+    }
+
+    fn status_display(status: &UserStatus) -> StatusDisplay {
+        let (label, urgent) = match status.state {
+            // No limit configured for this account — clock glyph alone
+            // is enough; an em-dash next to it just looks like noise.
+            SessionState::NotConfigured => (String::new(), false),
+            SessionState::Offline => ("offline".to_string(), false),
+            SessionState::LimitReached => ("0s".to_string(), true),
+            SessionState::Active => (
+                format_remaining(status.remaining_seconds),
+                (0..60).contains(&status.remaining_seconds),
+            ),
+            SessionState::Paused => (
+                format!("⏸ {}", format_remaining(status.remaining_seconds)),
+                false,
+            ),
+        };
+        StatusDisplay { label, urgent }
     }
 
     /// Render the status item's icon + title.
@@ -519,7 +541,12 @@ mod imp {
     /// template flag — `NSStatusBarButton` ignores `contentTintColor`
     /// for template images, so we have to encode the gray in the image
     /// itself.
-    fn apply_visual(item: &NSStatusItem, disconnected: bool, label: &str, mtm: MainThreadMarker) {
+    fn apply_visual(
+        item: &NSStatusItem,
+        disconnected: bool,
+        display: StatusDisplay,
+        mtm: MainThreadMarker,
+    ) {
         let Some(button) = item.button(mtm) else {
             return;
         };
@@ -544,7 +571,19 @@ mod imp {
             button.setImage(Some(&image));
         }
         button.setImagePosition(NSCellImagePosition::ImageLeading);
-        button.setTitle(&NSString::from_str(label));
+        let title = NSString::from_str(&display.label);
+        if display.urgent {
+            let red: Retained<AnyObject> = NSColor::systemRedColor().into();
+            // SAFETY: AppKit provides this process-wide NSString constant.
+            let foreground_color_attr = unsafe { NSForegroundColorAttributeName };
+            let attrs = NSDictionary::from_retained_objects(&[foreground_color_attr], &[red]);
+            // SAFETY: The attributes dictionary contains a valid AppKit text
+            // foreground-color attribute with an NSColor value.
+            let attributed = unsafe { NSAttributedString::new_with_attributes(&title, &attrs) };
+            button.setAttributedTitle(&attributed);
+        } else {
+            button.setTitle(&title);
+        }
     }
 
     fn install_tracing() {
@@ -554,6 +593,67 @@ mod imp {
             .with_env_filter(filter)
             .with_target(true)
             .init();
+    }
+
+    #[cfg(test)]
+    mod status_display_tests {
+        use super::*;
+        use chrono::Local;
+
+        fn status(state: SessionState, remaining_seconds: i64) -> UserStatus {
+            UserStatus {
+                uid: 501,
+                username: "alice".to_string(),
+                state,
+                daily_limit_seconds: 3600,
+                used_seconds: 3600u32.saturating_sub(remaining_seconds.max(0) as u32),
+                remaining_seconds,
+                resets_at: Local::now(),
+                warn_thresholds_minutes: vec![],
+            }
+        }
+
+        #[test]
+        fn active_at_sixty_seconds_is_not_urgent() {
+            assert_eq!(
+                status_display(&status(SessionState::Active, 60)),
+                StatusDisplay {
+                    label: "1m00s".to_string(),
+                    urgent: false,
+                }
+            );
+        }
+
+        #[test]
+        fn active_below_sixty_seconds_is_urgent() {
+            for remaining in [59, 1, 0] {
+                let display = status_display(&status(SessionState::Active, remaining));
+                assert_eq!(display.label, format_remaining(remaining));
+                assert!(display.urgent);
+            }
+        }
+
+        #[test]
+        fn limit_reached_is_urgent_zero() {
+            assert_eq!(
+                status_display(&status(SessionState::LimitReached, 0)),
+                StatusDisplay {
+                    label: "0s".to_string(),
+                    urgent: true,
+                }
+            );
+        }
+
+        #[test]
+        fn non_counting_states_are_not_urgent() {
+            for state in [
+                SessionState::Paused,
+                SessionState::Offline,
+                SessionState::NotConfigured,
+            ] {
+                assert!(!status_display(&status(state, 30)).urgent);
+            }
+        }
     }
 
     /// Click handler for the updates menu item. If a previous check
