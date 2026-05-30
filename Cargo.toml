@@ -52,6 +52,8 @@ libc = "0.2"
 # crate behind `[target.'cfg(target_os = "macos")'.dependencies]`).
 objc2 = "0.6"
 objc2-foundation = { version = "0.3", features = [
+    "NSAttributedString",
+    "NSDictionary",
     "NSString",
     "NSTimer",
     "NSDate",
@@ -63,6 +65,7 @@ objc2-foundation = { version = "0.3", features = [
 ] }
 objc2-app-kit = { version = "0.3", features = [
     "NSApplication",
+    "NSAttributedString",
     "NSRunningApplication",
     "NSResponder",
     "NSStatusBar",

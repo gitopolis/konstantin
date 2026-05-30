@@ -72,6 +72,8 @@ On first launch you'll see a *Set up Konstantin* alert. Click
 `Set Up`. macOS may ask you to approve Konstantin's background service
 in System Settings. After approval, the menu-bar icon appears.
 
+![Konstantin first launch window](assets/first-launch.png)
+
 By default:
 
 * Enforcement is **on** — when a user hits their limit they actually
