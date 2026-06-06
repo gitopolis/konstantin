@@ -138,8 +138,7 @@ fn record_bundle_marker() {
                 return;
             }
         }
-        if let Err(e) = std::fs::write(uninstall::MARKER_PATH, format!("{}\n", root.display()))
-        {
+        if let Err(e) = std::fs::write(uninstall::MARKER_PATH, format!("{}\n", root.display())) {
             warn!(error = %e, path = uninstall::MARKER_PATH, "could not write bundle marker");
         }
     }

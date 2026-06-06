@@ -20,6 +20,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const SYSTEM_PLIST: &str = "/Library/LaunchDaemons/com.gitopolis.screentimed.plist";
 const SOCKET_PATH: &str = "/var/run/screentimed.sock";
+const ADMIN_CONTROL_SERVICE: &str = "system/com.gitopolis.screentimed.control";
 const BUNDLE_MARKER: &str = "/etc/screentimed/bundle_path";
 const LEGACY_DAEMON: &str = "/usr/local/libexec/screentimed";
 const UPDATE_ROOT: &str = "/var/tmp/konstantin-updates";
@@ -224,6 +225,15 @@ fn install_update(args: &UpdaterArgs) -> std::result::Result<(), UpdateFailure> 
         return Err(UpdateFailure::Classified {
             code: 23,
             message: format!("new daemon did not become reachable on {SOCKET_PATH} within 20s"),
+        });
+    }
+    if !wait_for_admin_control(Duration::from_secs(20)) {
+        restore_backup(&args.dest_bundle, &backup)?;
+        return Err(UpdateFailure::Classified {
+            code: 24,
+            message: format!(
+                "new daemon did not register admin XPC service {ADMIN_CONTROL_SERVICE} within 20s"
+            ),
         });
     }
 
@@ -601,6 +611,23 @@ fn wait_for_socket(timeout: Duration) -> bool {
         }
         std::thread::sleep(Duration::from_millis(250));
     }
+}
+
+fn wait_for_admin_control(timeout: Duration) -> bool {
+    let deadline = SystemTime::now() + timeout;
+    loop {
+        if admin_control_registered() {
+            return true;
+        }
+        if SystemTime::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+}
+
+fn admin_control_registered() -> bool {
+    command_success("/bin/launchctl", &["print", ADMIN_CONTROL_SERVICE])
 }
 
 fn command_success(program: &str, args: &[&str]) -> bool {
