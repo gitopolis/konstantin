@@ -193,6 +193,9 @@ mod imp {
             tracing::info!("first-launch setup not completed; quitting");
             return Ok(());
         }
+        if install::daemon_socket_reachable() && !install::admin_control_reachable() {
+            let _ = install::run_admin_control_repair(mtm);
+        }
 
         // Ask for notification permission once at startup. macOS
         // remembers the answer per-bundle, so subsequent launches
@@ -1217,6 +1220,25 @@ mod imp {
             daemon_status()
         }
 
+        pub fn refresh_daemon_registration() -> Result<Status> {
+            unregister_daemon()?;
+            register_daemon()
+        }
+
+        fn unregister_daemon() -> Result<()> {
+            let service = daemon_service()?;
+            let mut error: *mut AnyObject = ptr::null_mut();
+            let ok: bool = unsafe { msg_send![&*service, unregisterAndReturnError: &mut error] };
+            if ok {
+                return Ok(());
+            }
+            let status = daemon_status().unwrap_or(Status::NotFound);
+            if matches!(status, Status::NotRegistered | Status::NotFound) {
+                return Ok(());
+            }
+            anyhow::bail!("{}", error_message(error));
+        }
+
         pub fn open_login_items_settings() {
             if let Some(cls) = sm_app_service_class() {
                 unsafe {
@@ -1542,7 +1564,7 @@ mod imp {
                          Details: {message}"
                     ),
                 ),
-                20..=23 => (
+                20..=24 => (
                     "Update Failed",
                     format!(
                         "The new version did not start; rolled back to the previous version.\n\n\
@@ -1915,6 +1937,8 @@ mod imp {
                 let (t, b) = classify_failure(22, "bootstrap failed");
                 assert_eq!(t, "Update Failed");
                 assert!(b.contains("rolled back"));
+                let (_, b) = classify_failure(24, "admin XPC missing");
+                assert!(b.contains("rolled back"));
                 let (_, b) = classify_failure(10, "move aside failed");
                 assert!(b.contains("previous version is still active"));
                 let (_, b) = classify_failure(50, "catastrophe");
@@ -1945,6 +1969,23 @@ mod imp {
         /// immediately — we don't speak the protocol.
         pub fn daemon_socket_reachable() -> bool {
             std::os::unix::net::UnixStream::connect(SOCKET_PATH).is_ok()
+        }
+
+        /// Returns true if the signed admin XPC control plane is usable.
+        /// Any daemon-level response, including Unauthorized for a
+        /// non-admin user, proves the Mach service is registered and the
+        /// Rust handler received the request.
+        pub fn admin_control_reachable() -> bool {
+            match AdminClient::send_with_timeout(
+                AdminRequest::GetEnforcementState,
+                Duration::from_secs(2),
+            ) {
+                Ok(_) => true,
+                Err(e) => {
+                    tracing::debug!(error = %e, "admin XPC health check failed");
+                    false
+                }
+            }
         }
 
         /// Returns true iff the old system-side LaunchDaemon plist already
@@ -1994,6 +2035,37 @@ mod imp {
             run_smappservice_install(mtm)
         }
 
+        pub fn run_admin_control_repair(mtm: MainThreadMarker) -> bool {
+            if !alerts::confirm(
+                mtm,
+                "Repair Konstantin",
+                "Konstantin's background service is running, but its administrator control \
+                 channel is unavailable. macOS may ask an administrator to refresh the service.",
+                "Repair…",
+                "Later",
+            ) {
+                return false;
+            }
+            let paths = match bundle::Paths::resolve() {
+                Ok(p) => p,
+                Err(e) => {
+                    tracing::error!(error = %e, "could not resolve bundle paths");
+                    alerts::message(mtm, "Could not locate bundled resources.", &format!("{e}"));
+                    return false;
+                }
+            };
+            if paths.source != bundle::Source::Bundle {
+                alerts::message(
+                    mtm,
+                    "Build App First",
+                    "Konstantin service repair is only available from the packaged app bundle.",
+                );
+                return false;
+            }
+
+            run_smappservice_repair(mtm)
+        }
+
         fn run_smappservice_install(mtm: MainThreadMarker) -> bool {
             let result = super::progress::run_with_panel(
                 mtm,
@@ -2032,6 +2104,55 @@ mod imp {
                         mtm,
                         "Konstantin install failed.",
                         &format!("macOS couldn't register the bundled service with ServiceManagement.\n\n{e}"),
+                    );
+                    false
+                }
+            }
+        }
+
+        fn run_smappservice_repair(mtm: MainThreadMarker) -> bool {
+            let result = super::progress::run_with_panel(
+                mtm,
+                "Repairing Konstantin",
+                "Refreshing Konstantin's background service…",
+                "konstantin-smappservice-repair",
+                super::service_management::refresh_daemon_registration,
+            );
+
+            match result {
+                Ok(super::service_management::Status::Enabled) => {
+                    tracing::info!("SMAppService daemon registration refreshed");
+                    true
+                }
+                Ok(super::service_management::Status::RequiresApproval) => {
+                    super::service_management::open_login_items_settings();
+                    alerts::message(
+                        mtm,
+                        "Approval Needed",
+                        "Enable Konstantin in System Settings, then open Konstantin again.",
+                    );
+                    false
+                }
+                Ok(status) => {
+                    tracing::warn!(
+                        ?status,
+                        "unexpected SMAppService daemon status after repair"
+                    );
+                    alerts::message(
+                        mtm,
+                        "Konstantin repair needs attention.",
+                        &format!("Unexpected ServiceManagement status: {status:?}"),
+                    );
+                    false
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "SMAppService repair failed");
+                    alerts::message(
+                        mtm,
+                        "Konstantin repair failed.",
+                        &format!(
+                            "macOS couldn't refresh the bundled service with ServiceManagement.\n\n{e}"
+                        ),
                     );
                     false
                 }
