@@ -20,6 +20,7 @@ type DispatchQueue = *mut c_void;
 type XpcHandlerBlock = Block<dyn Fn(XpcObject)>;
 
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
+const KEY_XPC_ERROR_DESCRIPTION: &str = "XPCErrorDescription";
 
 extern "C" {
     fn xpc_connection_create_mach_service(
@@ -85,9 +86,14 @@ impl AdminClient {
             unsafe { xpc_connection_send_message_with_reply_sync(connection.raw(), message.raw()) };
         let reply = OwnedObject::from_raw(reply_raw)
             .context("admin XPC request did not receive a reply")?;
-        let response_json = reply
-            .get_string(KEY_PAYLOAD_JSON)?
-            .ok_or_else(|| anyhow::anyhow!("admin XPC reply missing payload_json"))?;
+        let response_json = reply.get_string(KEY_PAYLOAD_JSON)?.ok_or_else(|| {
+            reply
+                .get_string(KEY_XPC_ERROR_DESCRIPTION)
+                .ok()
+                .flatten()
+                .map(|description| anyhow::anyhow!("admin XPC failed: {description}"))
+                .unwrap_or_else(|| anyhow::anyhow!("admin XPC reply missing payload_json"))
+        })?;
         let response = ResponseEnvelope::from_json(&response_json)?;
         if response.request_id != request_id {
             anyhow::bail!(
