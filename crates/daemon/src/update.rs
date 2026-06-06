@@ -20,11 +20,13 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const SYSTEM_PLIST: &str = "/Library/LaunchDaemons/com.gitopolis.screentimed.plist";
 const SOCKET_PATH: &str = "/var/run/screentimed.sock";
-const ADMIN_CONTROL_SERVICE: &str = "system/com.gitopolis.screentimed.control";
+const DAEMON_SERVICE_TARGET: &str = "system/com.gitopolis.screentimed";
+const ADMIN_CONTROL_MACH_SERVICE: &str = "com.gitopolis.screentimed.control";
 const BUNDLE_MARKER: &str = "/etc/screentimed/bundle_path";
 const LEGACY_DAEMON: &str = "/usr/local/libexec/screentimed";
 const UPDATE_ROOT: &str = "/var/tmp/konstantin-updates";
-const LOG_PATH: &str = "/var/log/screentimed.log";
+const UPDATER_LOG_PATH: &str = "/var/log/konstantin-updater.log";
+const UPDATER_LOG_FILTER: &str = "debug";
 
 const TRAY_REL: &str = "Contents/MacOS/konstantin-tray";
 const DAEMON_REL: &str = "Contents/Resources/screentimed";
@@ -89,11 +91,11 @@ pub fn start_update(
     let log = OpenOptions::new()
         .create(true)
         .append(true)
-        .open(LOG_PATH)
-        .with_context(|| format!("opening {}", LOG_PATH))?;
+        .open(UPDATER_LOG_PATH)
+        .with_context(|| format!("opening {}", UPDATER_LOG_PATH))?;
     let log_err = log
         .try_clone()
-        .with_context(|| format!("cloning {}", LOG_PATH))?;
+        .with_context(|| format!("cloning {}", UPDATER_LOG_PATH))?;
 
     Command::new(&helper_copy)
         .arg("--staged-bundle")
@@ -116,7 +118,10 @@ pub fn start_update(
 }
 
 pub fn updater_main() -> i32 {
+    install_updater_tracing();
+
     let args: Vec<String> = std::env::args().collect();
+    tracing::debug!(?args, log_path = UPDATER_LOG_PATH, "updater helper started");
     let parsed = parse_updater_args(&args);
     let Some(result_path) = parsed.as_ref().ok().map(|a| a.result_path.clone()) else {
         eprintln!(
@@ -150,10 +155,26 @@ pub fn updater_main() -> i32 {
         return 70;
     }
 
+    match &result {
+        UpdateInstallResult::Succeeded => tracing::info!("updater helper succeeded"),
+        UpdateInstallResult::Failed { code, message } => {
+            tracing::error!(code, message = %message, "updater helper failed");
+        }
+    }
+
     match result {
         UpdateInstallResult::Succeeded => 0,
         UpdateInstallResult::Failed { code, .. } => code,
     }
+}
+
+fn install_updater_tracing() {
+    let filter = tracing_subscriber::EnvFilter::new(UPDATER_LOG_FILTER);
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_target(true)
+        .with_level(true)
+        .try_init();
 }
 
 struct UpdaterArgs {
@@ -177,14 +198,22 @@ fn install_update(args: &UpdaterArgs) -> std::result::Result<(), UpdateFailure> 
     ensure_root()?;
     validate_absolute_existing_dir(&args.staged_bundle, "staged bundle")?;
     validate_absolute_parent(&args.dest_bundle, "destination bundle")?;
+    tracing::debug!(
+        staged_bundle = %args.staged_bundle.display(),
+        dest_bundle = %args.dest_bundle.display(),
+        result_path = %args.result_path.display(),
+        "validated updater arguments"
+    );
 
     let backup = backup_path(&args.dest_bundle)?;
+    tracing::debug!(backup = %backup.display(), "moving existing bundle aside");
     fs::rename(&args.dest_bundle, &backup).map_err(|e| UpdateFailure::Classified {
         code: 10,
         message: format!("couldn't move existing bundle aside: {e}"),
     })?;
 
     if let Err(e) = fs::rename(&args.staged_bundle, &args.dest_bundle) {
+        tracing::debug!(error = %e, "new bundle move failed; restoring original bundle");
         let _ = fs::rename(&backup, &args.dest_bundle);
         return Err(UpdateFailure::Classified {
             code: 11,
@@ -192,10 +221,13 @@ fn install_update(args: &UpdaterArgs) -> std::result::Result<(), UpdateFailure> 
         });
     }
 
+    tracing::debug!("new bundle moved into place");
     write_bundle_marker(&args.dest_bundle)?;
+    tracing::debug!("booting out current system daemon");
     bootout_system_daemon();
     wait_for_daemon_exit();
 
+    tracing::debug!("installing daemon binary");
     if let Err(e) = install_daemon_binary(&args.dest_bundle) {
         restore_backup(&args.dest_bundle, &backup)?;
         return Err(UpdateFailure::Classified {
@@ -204,6 +236,7 @@ fn install_update(args: &UpdaterArgs) -> std::result::Result<(), UpdateFailure> 
         });
     }
 
+    tracing::debug!("installing LaunchDaemon plist");
     if let Err(e) = install_legacy_plist(&args.dest_bundle) {
         restore_backup(&args.dest_bundle, &backup)?;
         return Err(UpdateFailure::Classified {
@@ -212,6 +245,7 @@ fn install_update(args: &UpdaterArgs) -> std::result::Result<(), UpdateFailure> 
         });
     }
 
+    tracing::debug!("bootstrapping system daemon");
     if let Err(e) = bootstrap_system_daemon() {
         restore_backup(&args.dest_bundle, &backup)?;
         return Err(UpdateFailure::Classified {
@@ -220,6 +254,7 @@ fn install_update(args: &UpdaterArgs) -> std::result::Result<(), UpdateFailure> 
         });
     }
 
+    tracing::debug!(socket_path = SOCKET_PATH, "waiting for daemon socket");
     if !wait_for_socket(Duration::from_secs(20)) {
         restore_backup(&args.dest_bundle, &backup)?;
         return Err(UpdateFailure::Classified {
@@ -227,21 +262,31 @@ fn install_update(args: &UpdaterArgs) -> std::result::Result<(), UpdateFailure> 
             message: format!("new daemon did not become reachable on {SOCKET_PATH} within 20s"),
         });
     }
+    tracing::debug!(
+        mach_service = ADMIN_CONTROL_MACH_SERVICE,
+        "waiting for admin XPC endpoint"
+    );
     if !wait_for_admin_control(Duration::from_secs(20)) {
         restore_backup(&args.dest_bundle, &backup)?;
         return Err(UpdateFailure::Classified {
             code: 24,
             message: format!(
-                "new daemon did not register admin XPC service {ADMIN_CONTROL_SERVICE} within 20s"
+                "new daemon did not register admin XPC service {ADMIN_CONTROL_MACH_SERVICE} within 20s"
             ),
         });
     }
 
+    tracing::debug!(backup = %backup.display(), "removing update backup");
     remove_dir_if_exists(&backup).map_err(UpdateFailure::Unexpected)?;
     Ok(())
 }
 
 fn restore_backup(dest_bundle: &Path, backup: &Path) -> std::result::Result<(), UpdateFailure> {
+    tracing::debug!(
+        dest_bundle = %dest_bundle.display(),
+        backup = %backup.display(),
+        "rolling back update"
+    );
     bootout_system_daemon();
     wait_for_daemon_exit();
     let _ = fs::remove_dir_all(dest_bundle);
@@ -627,7 +672,18 @@ fn wait_for_admin_control(timeout: Duration) -> bool {
 }
 
 fn admin_control_registered() -> bool {
-    command_success("/bin/launchctl", &["print", ADMIN_CONTROL_SERVICE])
+    let Ok(output) = Command::new("/bin/launchctl")
+        .args(["print", DAEMON_SERVICE_TARGET])
+        .output()
+    else {
+        return false;
+    };
+    output.status.success()
+        && launchctl_daemon_output_has_admin_control(&String::from_utf8_lossy(&output.stdout))
+}
+
+fn launchctl_daemon_output_has_admin_control(output: &str) -> bool {
+    output.contains(ADMIN_CONTROL_MACH_SERVICE)
 }
 
 fn command_success(program: &str, args: &[&str]) -> bool {
@@ -798,5 +854,45 @@ mod tests {
         assert!(validate_zip_entry_path("../owned").is_err());
         assert!(validate_zip_entry_path("Konstantin.app/../owned").is_err());
         assert!(validate_zip_entry_path(r"Konstantin.app\owned").is_err());
+    }
+
+    #[test]
+    fn detects_admin_control_endpoint_in_daemon_launchctl_output() {
+        let output = r#"
+endpoints = {
+	"com.gitopolis.screentimed.control" = {
+		port = 0x1d03
+		active = 1
+		managed = 1
+	}
+}
+"#;
+
+        assert!(launchctl_daemon_output_has_admin_control(output));
+    }
+
+    #[test]
+    fn rejects_launchctl_output_without_admin_control_endpoint() {
+        let output = r#"
+endpoints = {
+	"com.apple.other.service" = {
+		active = 1
+		managed = 1
+	}
+}
+"#;
+
+        assert!(!launchctl_daemon_output_has_admin_control(output));
+    }
+
+    #[test]
+    fn updater_uses_dedicated_log_path() {
+        assert_eq!(UPDATER_LOG_PATH, "/var/log/konstantin-updater.log");
+        assert_ne!(UPDATER_LOG_PATH, "/var/log/screentimed.log");
+    }
+
+    #[test]
+    fn updater_log_filter_is_always_debug() {
+        assert_eq!(UPDATER_LOG_FILTER, "debug");
     }
 }

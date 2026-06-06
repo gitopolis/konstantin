@@ -422,6 +422,8 @@ konstantin/
 
 ## Style notes
 
+* PR titles must use Conventional Commits format, for example
+  `fix(updater): repair stale daemon registration`.
 * Logging via `tracing`. Structured fields, not `println!`.
 * Errors: `anyhow` in binaries, `thiserror` in libraries.
 * Async I/O: tokio. Keep the daemon single-runtime.
