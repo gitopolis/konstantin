@@ -20,7 +20,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const SYSTEM_PLIST: &str = "/Library/LaunchDaemons/com.gitopolis.screentimed.plist";
 const SOCKET_PATH: &str = "/var/run/screentimed.sock";
-const ADMIN_CONTROL_SERVICE: &str = "system/com.gitopolis.screentimed.control";
+const DAEMON_SERVICE_TARGET: &str = "system/com.gitopolis.screentimed";
+const ADMIN_CONTROL_MACH_SERVICE: &str = "com.gitopolis.screentimed.control";
 const BUNDLE_MARKER: &str = "/etc/screentimed/bundle_path";
 const LEGACY_DAEMON: &str = "/usr/local/libexec/screentimed";
 const UPDATE_ROOT: &str = "/var/tmp/konstantin-updates";
@@ -232,7 +233,7 @@ fn install_update(args: &UpdaterArgs) -> std::result::Result<(), UpdateFailure> 
         return Err(UpdateFailure::Classified {
             code: 24,
             message: format!(
-                "new daemon did not register admin XPC service {ADMIN_CONTROL_SERVICE} within 20s"
+                "new daemon did not register admin XPC service {ADMIN_CONTROL_MACH_SERVICE} within 20s"
             ),
         });
     }
@@ -627,7 +628,18 @@ fn wait_for_admin_control(timeout: Duration) -> bool {
 }
 
 fn admin_control_registered() -> bool {
-    command_success("/bin/launchctl", &["print", ADMIN_CONTROL_SERVICE])
+    let Ok(output) = Command::new("/bin/launchctl")
+        .args(["print", DAEMON_SERVICE_TARGET])
+        .output()
+    else {
+        return false;
+    };
+    output.status.success()
+        && launchctl_daemon_output_has_admin_control(&String::from_utf8_lossy(&output.stdout))
+}
+
+fn launchctl_daemon_output_has_admin_control(output: &str) -> bool {
+    output.contains(ADMIN_CONTROL_MACH_SERVICE)
 }
 
 fn command_success(program: &str, args: &[&str]) -> bool {
@@ -798,5 +810,34 @@ mod tests {
         assert!(validate_zip_entry_path("../owned").is_err());
         assert!(validate_zip_entry_path("Konstantin.app/../owned").is_err());
         assert!(validate_zip_entry_path(r"Konstantin.app\owned").is_err());
+    }
+
+    #[test]
+    fn detects_admin_control_endpoint_in_daemon_launchctl_output() {
+        let output = r#"
+endpoints = {
+	"com.gitopolis.screentimed.control" = {
+		port = 0x1d03
+		active = 1
+		managed = 1
+	}
+}
+"#;
+
+        assert!(launchctl_daemon_output_has_admin_control(output));
+    }
+
+    #[test]
+    fn rejects_launchctl_output_without_admin_control_endpoint() {
+        let output = r#"
+endpoints = {
+	"com.apple.other.service" = {
+		active = 1
+		managed = 1
+	}
+}
+"#;
+
+        assert!(!launchctl_daemon_output_has_admin_control(output));
     }
 }
