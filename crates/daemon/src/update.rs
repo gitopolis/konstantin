@@ -27,6 +27,8 @@ const LEGACY_DAEMON: &str = "/usr/local/libexec/screentimed";
 const UPDATE_ROOT: &str = "/var/tmp/konstantin-updates";
 const UPDATER_LOG_PATH: &str = "/var/log/konstantin-updater.log";
 const UPDATER_LOG_FILTER: &str = "debug";
+const ROOT_UID: u32 = 0;
+const WHEEL_GID: u32 = 0;
 
 const TRAY_REL: &str = "Contents/MacOS/konstantin-tray";
 const DAEMON_REL: &str = "Contents/Resources/screentimed";
@@ -548,7 +550,8 @@ fn install_daemon_binary(bundle: &Path) -> Result<()> {
         fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
     }
     replace_file(&src, dst, 0o755)
-        .with_context(|| format!("installing daemon binary to {LEGACY_DAEMON}"))
+        .with_context(|| format!("installing daemon binary to {LEGACY_DAEMON}"))?;
+    set_root_wheel(dst).with_context(|| format!("setting owner root:wheel on {LEGACY_DAEMON}"))
 }
 
 fn replace_file(src: &Path, dst: &Path, mode: u32) -> Result<()> {
@@ -577,13 +580,16 @@ fn install_legacy_plist(bundle: &Path) -> Result<()> {
     fs::copy(&src, dst)
         .with_context(|| format!("installing LaunchDaemon plist to {SYSTEM_PLIST}"))?;
     set_mode(dst, 0o644)?;
+    set_root_wheel(dst).with_context(|| format!("setting owner root:wheel on {SYSTEM_PLIST}"))?;
     run_plistbuddy_ignore(dst, "Delete :BundleProgram");
     run_plistbuddy_ignore(dst, "Delete :ProgramArguments");
     run_plistbuddy(dst, "Add :ProgramArguments array")?;
     run_plistbuddy(
         dst,
         &format!("Add :ProgramArguments:0 string {LEGACY_DAEMON}"),
-    )
+    )?;
+    set_mode(dst, 0o644)?;
+    set_root_wheel(dst).with_context(|| format!("setting owner root:wheel on {SYSTEM_PLIST}"))
 }
 
 fn run_plistbuddy(path: &Path, command: &str) -> Result<()> {
@@ -769,6 +775,11 @@ fn set_mode(path: &Path, mode: u32) -> Result<()> {
         .with_context(|| format!("chmod {mode:o} {}", path.display()))
 }
 
+fn set_root_wheel(path: &Path) -> Result<()> {
+    std::os::unix::fs::chown(path, Some(ROOT_UID), Some(WHEEL_GID))
+        .with_context(|| format!("chown root:wheel {}", path.display()))
+}
+
 fn ensure_root() -> Result<()> {
     if unsafe { libc::geteuid() } != 0 {
         anyhow::bail!("konstantin-updater must run as root");
@@ -894,5 +905,11 @@ endpoints = {
     #[test]
     fn updater_log_filter_is_always_debug() {
         assert_eq!(UPDATER_LOG_FILTER, "debug");
+    }
+
+    #[test]
+    fn launchdaemon_files_use_root_wheel_constants() {
+        assert_eq!(ROOT_UID, 0);
+        assert_eq!(WHEEL_GID, 0);
     }
 }
