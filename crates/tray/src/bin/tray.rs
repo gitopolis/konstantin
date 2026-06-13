@@ -194,7 +194,7 @@ mod imp {
             return Ok(());
         }
         if install::daemon_socket_reachable() && !install::admin_control_reachable() {
-            let _ = install::run_admin_control_repair(mtm);
+            install::maybe_run_admin_control_repair(mtm);
         }
 
         // Ask for notification permission once at startup. macOS
@@ -2035,7 +2035,26 @@ mod imp {
             run_smappservice_install(mtm)
         }
 
-        pub fn run_admin_control_repair(mtm: MainThreadMarker) -> bool {
+        pub fn maybe_run_admin_control_repair(mtm: MainThreadMarker) {
+            match konstantin_tray::users::current_user_is_admin() {
+                Ok(true) => {
+                    let _ = run_admin_control_repair(mtm);
+                }
+                Ok(false) => {
+                    tracing::warn!(
+                        "admin XPC unavailable; skipping startup repair prompt for non-admin user"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "admin XPC unavailable; could not determine current user's admin status"
+                    );
+                }
+            }
+        }
+
+        fn run_admin_control_repair(mtm: MainThreadMarker) -> bool {
             if !alerts::confirm(
                 mtm,
                 "Repair Konstantin",
