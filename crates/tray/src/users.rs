@@ -39,6 +39,15 @@ pub enum UserPicture {
     Jpeg(Vec<u8>),
 }
 
+/// Return whether the current login user is a local admin.
+pub fn current_user_is_admin() -> Result<bool> {
+    let username = current_username()?;
+    if username == "root" {
+        return Ok(true);
+    }
+    Ok(read_admin_members()?.contains(&username))
+}
+
 /// Enumerate real local users on this Mac. Sorted by username.
 pub fn enumerate() -> Result<Vec<LocalUser>> {
     let candidates = list_users()?;
@@ -135,6 +144,25 @@ fn read_admin_members() -> Result<HashSet<String>> {
     Ok(parse_admin_members(&String::from_utf8_lossy(
         &output.stdout,
     )))
+}
+
+fn current_username() -> Result<String> {
+    let output = Command::new("/usr/bin/id")
+        .arg("-un")
+        .output()
+        .context("reading current username")?;
+    if !output.status.success() {
+        anyhow::bail!("id -un failed: {}", String::from_utf8_lossy(&output.stderr));
+    }
+    parse_current_username(&output.stdout)
+}
+
+fn parse_current_username(stdout: &[u8]) -> Result<String> {
+    let username = String::from_utf8_lossy(stdout).trim().to_string();
+    if username.is_empty() {
+        anyhow::bail!("id -un returned an empty username");
+    }
+    Ok(username)
 }
 
 fn parse_admin_members(stdout: &str) -> HashSet<String> {
@@ -340,6 +368,12 @@ bob                     502
         // member name.
         let m = parse_admin_members("Preamble blah\nGroupMembership: alice\n");
         assert_eq!(m, HashSet::from(["alice".into()]));
+    }
+
+    #[test]
+    fn current_username_trims_output() {
+        assert_eq!(parse_current_username(b"alice\n").unwrap(), "alice");
+        assert!(parse_current_username(b"\n").is_err());
     }
 
     #[test]

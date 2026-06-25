@@ -137,8 +137,8 @@ No arguments. Show or hide via the menu-bar item; quit via the menu's
 
 Routine operator actions use the signed admin XPC channel exposed by
 the root daemon. Standard users can see their own status, but only
-local admins can configure, pause/unpause enforcement, reload, update,
-or uninstall.
+local admins can configure, pause/unpause enforcement, reload, or
+change system policy. Uninstall itself is owned by Homebrew.
 
 Notable actions:
 
@@ -146,18 +146,16 @@ Notable actions:
   the daemon, preserving mode 0600 root ownership.
 * `Pause Enforcement` / `Unpause Enforcement` creates or removes the
   configured kill-switch file (default `/etc/screentimed/disable`).
-* `Check for Updates…` downloads and verifies the release zip in the
-  tray, then asks the daemon to stage and launch the detached
-  `konstantin-updater` helper. The helper swaps the bundle, restarts
-  the daemon, and rolls back if the new daemon does not become reachable.
-* `Uninstall…` removes the binaries, plists, socket, and counter state
-  at `/var/db/screentimed/`. It preserves `/etc/screentimed/` so a
-  reinstall picks up your settings.
+* `Uninstall…` shows the appropriate Homebrew uninstall and zap
+  commands.
 
-First-launch setup registers the bundled daemon through
-ServiceManagement. Development builds should be packaged with
+First-launch setup registers both the bundled daemon and per-user tray
+agent through ServiceManagement. Development builds should be packaged with
 `./packaging/build-app.sh` and launched from `target/Konstantin.app`
 instead of using the tray to install a dev-tree daemon.
+
+Application updates are owned by the Homebrew cask, not the tray or
+privileged daemon.
 
 ### Environment variables
 
@@ -186,9 +184,9 @@ instead of using the tray to install a dev-tree daemon.
 
 ### Logs
 
-When run as a LaunchAgent, stdout/stderr go to
-`~/Library/Logs/konstantin-tray.out.log` and
-`~/Library/Logs/konstantin-tray.err.log` for the target user.
+The tray writes structured diagnostics to stderr; its managed launchd
+job can be inspected through Console or `log show`. The daemon log is
+`/var/log/screentimed.log`.
 
 ## Building
 

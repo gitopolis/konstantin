@@ -42,7 +42,7 @@ if [[ -z "${VERSION}" ]]; then
 fi
 
 # Verify all release binaries exist.
-for bin in screentimed konstantin-status konstantin-tray konstantin-updater; do
+for bin in screentimed konstantin-status konstantin-tray; do
     if [[ ! -x "${TARGET}/${bin}" ]]; then
         echo "missing ${TARGET}/${bin} — run 'cargo build --release' first" >&2
         exit 1
@@ -58,25 +58,24 @@ rm -rf "${APP}"
 install -d "${APP}/Contents/MacOS"
 install -d "${APP}/Contents/Resources"
 install -d "${APP}/Contents/Library/LaunchDaemons"
+install -d "${APP}/Contents/Library/LaunchAgents"
 
 # Main executable — the tray. CFBundleExecutable in Info.plist points
 # at this name.
 install -m 0755 "${TARGET}/konstantin-tray"   "${APP}/Contents/MacOS/konstantin-tray"
 
 # Resources: the daemon binary + diagnostic CLI + the example config.
-# SMAppService runs the daemon in place via BundleProgram. The legacy
-# installer/update fallback still copies the daemon into /usr/local/libexec/.
+# SMAppService runs the daemon in place via BundleProgram.
 install -m 0755 "${TARGET}/screentimed"        "${APP}/Contents/Resources/screentimed"
 install -m 0755 "${TARGET}/konstantin-status"  "${APP}/Contents/Resources/konstantin-status"
-install -m 0755 "${TARGET}/konstantin-updater" "${APP}/Contents/Resources/konstantin-updater"
 install -m 0644 "${ROOT}/packaging/config.example.toml" \
     "${APP}/Contents/Resources/config.example.toml"
 
-# LaunchDaemon plist for SMAppService. Legacy fallback rewrites the
-# bundled BundleProgram key into ProgramArguments after copying it to
-# /Library/LaunchDaemons/.
+# LaunchDaemon plist for SMAppService.
 install -m 0644 "${ROOT}/packaging/com.gitopolis.screentimed.plist" \
     "${APP}/Contents/Library/LaunchDaemons/com.gitopolis.screentimed.plist"
+install -m 0644 "${ROOT}/packaging/com.gitopolis.konstantin-tray.plist" \
+    "${APP}/Contents/Library/LaunchAgents/com.gitopolis.konstantin-tray.plist"
 
 # Optional icon. If neither form is present we just don't ship an icon
 # — macOS falls back to the generic app icon. Provide artwork later by
@@ -140,7 +139,6 @@ ENTITLEMENTS="${CODESIGN_ENTITLEMENTS:-${ROOT}/packaging/Konstantin.entitlements
 NESTED=(
     "${APP}/Contents/Resources/screentimed"
     "${APP}/Contents/Resources/konstantin-status"
-    "${APP}/Contents/Resources/konstantin-updater"
     "${APP}/Contents/MacOS/konstantin-tray"
 )
 
