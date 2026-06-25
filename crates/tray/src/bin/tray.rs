@@ -30,7 +30,7 @@ fn main() -> anyhow::Result<()> {
 
 #[cfg(target_os = "macos")]
 mod imp {
-    use anyhow::Result;
+    use anyhow::{Context, Result};
     use block2::RcBlock;
     use objc2::rc::Retained;
     use objc2::runtime::AnyObject;
@@ -42,10 +42,7 @@ mod imp {
     };
     // `NSApplicationActivationPolicy` is declared in the
     // NSRunningApplication header, not NSApplication's.
-    use konstantin_proto::admin::{
-        AdminRequest, AdminResponse, TrayAutostartChange, TrayAutostartProbe, TrayAutostartState,
-        UpdateInstallResult,
-    };
+    use konstantin_proto::admin::{AdminRequest, AdminResponse};
     use konstantin_proto::{SessionState, UserStatus};
     use konstantin_tray::admin_xpc::AdminClient;
     use konstantin_tray::notifications::{self, NotifTracker};
@@ -75,12 +72,6 @@ mod imp {
         /// start in this state and the worker flips it to `false` once
         /// it actually reaches the daemon.
         disconnected: bool,
-        /// A release found by an earlier "Check for Updates…" click
-        /// that the user deferred via "Later". When `Some`, the
-        /// updates menu item is morphed to "Update to <version>" and
-        /// clicking it goes straight into install. Cleared once the
-        /// update is consumed.
-        pending_update: Option<update::Release>,
         /// Last admin-XPC view of `/etc/screentimed/disable` (or the
         /// configured `kill_switch_path`). `None` until the operator
         /// uses the Pause/Unpause action in this process.
@@ -96,7 +87,6 @@ mod imp {
             Self {
                 pending: None,
                 disconnected: true,
-                pending_update: None,
                 enforcement_paused: None,
                 enforcement_refreshing: false,
                 enforcement_last_refresh: None,
@@ -112,18 +102,63 @@ mod imp {
         status_item: Retained<NSStatusItem>,
         pause_enforcement_item: Retained<NSMenuItem>,
         reload_item: Retained<NSMenuItem>,
-        updates_item: Retained<NSMenuItem>,
     }
 
     /// Shared `Arc<Mutex<Latest>>` set during `main()` so action
     /// handlers (which can't be parameterised through the
-    /// `define_class!` macro without ivars) can read pending updates.
+    /// `define_class!` macro without ivars) can read live state.
     /// `OnceLock` so it's a fail-loud configuration mistake to install
     /// it twice.
     static LATEST: std::sync::OnceLock<Arc<Mutex<Latest>>> = std::sync::OnceLock::new();
 
+    struct InstanceLock {
+        _file: std::fs::File,
+    }
+
+    fn acquire_instance_lock() -> Result<Option<InstanceLock>> {
+        use std::os::fd::AsRawFd;
+
+        let uid = unsafe { libc::geteuid() };
+        let path = std::env::temp_dir().join(format!("com.gitopolis.konstantin-tray-{uid}.lock"));
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(&path)?;
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if rc == 0 {
+            return Ok(Some(InstanceLock { _file: file }));
+        }
+
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::EWOULDBLOCK) {
+            Ok(None)
+        } else {
+            Err(error.into())
+        }
+    }
+
     pub fn main() -> Result<()> {
         install_tracing();
+        let mut args = std::env::args_os().skip(1);
+        match args.next().as_deref() {
+            Some(arg) if arg == std::ffi::OsStr::new("--schedule-uninstall-services") => {
+                return schedule_uninstall_services();
+            }
+            Some(arg) if arg == std::ffi::OsStr::new("--deferred-uninstall-services") => {
+                let ready = args
+                    .next()
+                    .map(std::path::PathBuf::from)
+                    .ok_or_else(|| anyhow::anyhow!("missing deferred-uninstall ready path"))?;
+                return deferred_uninstall_services(&ready);
+            }
+            Some(arg) => anyhow::bail!("unknown argument: {}", arg.to_string_lossy()),
+            None => {}
+        }
+        let Some(_instance_lock) = acquire_instance_lock()? else {
+            tracing::info!("another Konstantin tray instance is already running; exiting");
+            return Ok(());
+        };
 
         // Log path-resolution mode early. Useful when a bug report
         // mentions install paths — at a glance you know whether the
@@ -162,41 +197,36 @@ mod imp {
         // `disconnected: true` state (muted clock, no time label).
         apply_visual(&tray.status_item, true, StatusDisplay::empty(), mtm);
 
-        // Idempotent: write our per-user LaunchAgent plist so launchd
-        // auto-starts the tray on next login. Doesn't bootstrap — we
-        // ARE the running tray; bootstrap would race-spawn a sibling.
-        //
-        // Skipped when running from a dev tree, since the LaunchAgent
-        // would point at `target/release/konstantin-tray`; if that
-        // binary is later cleaned (`cargo clean`) or moved, login
-        // auto-start would silently fail.
-        match bundle::Paths::resolve().map(|p| p.source) {
-            Ok(bundle::Source::Bundle) => {
-                if let Err(e) = install::ensure_user_launchagent() {
-                    tracing::warn!(error = %e, "user LaunchAgent setup failed (non-fatal)");
+        let daemon_state = install::daemon_lifecycle_state().unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "could not inspect daemon lifecycle state");
+            install::DaemonLifecycleState::NotRegistered
+        });
+        match daemon_state {
+            install::DaemonLifecycleState::NotRegistered
+            | install::DaemonLifecycleState::RequiresApproval => {
+                if !install::run_first_launch_install(mtm) {
+                    tracing::info!("first-launch setup not completed; quitting");
+                    return Ok(());
                 }
             }
+            install::DaemonLifecycleState::EnabledHealthy => {
+                install::maybe_refresh_daemon_version(mtm);
+            }
+            install::DaemonLifecycleState::EnabledMissingSocket => {
+                tracing::warn!("managed daemon is enabled but its socket is not ready");
+            }
+            install::DaemonLifecycleState::EnabledMissingAdminEndpoint => {
+                install::maybe_run_admin_control_repair(mtm);
+            }
+        }
+
+        match bundle::Paths::resolve().map(|p| p.source) {
+            Ok(bundle::Source::Bundle) => install::ensure_user_agent(mtm),
             Ok(bundle::Source::DevTree) => {
-                tracing::info!("dev-tree run — skipping user LaunchAgent rewrite");
+                tracing::info!("dev-tree run — skipping managed user-agent registration");
             }
             Err(_) => {} // already logged above
         }
-
-        // First-launch flow: if we can't reach the daemon AND no legacy
-        // system plist is present, ask the operator to register the
-        // bundled daemon with ServiceManagement. If setup is cancelled or
-        // unavailable, exit cleanly.
-        if !install::daemon_socket_reachable()
-            && !install::system_plist_present()
-            && !install::run_first_launch_install(mtm)
-        {
-            tracing::info!("first-launch setup not completed; quitting");
-            return Ok(());
-        }
-        if install::daemon_socket_reachable() && !install::admin_control_reachable() {
-            install::maybe_run_admin_control_repair(mtm);
-        }
-
         // Ask for notification permission once at startup. macOS
         // remembers the answer per-bundle, so subsequent launches
         // don't re-prompt. Doing it here means the TCC sheet appears
@@ -210,6 +240,165 @@ mod imp {
         // Blocks until `terminate:` is called from the menu.
         app.run();
         Ok(())
+    }
+
+    fn schedule_uninstall_services() -> Result<()> {
+        use std::os::unix::process::CommandExt;
+
+        let ready =
+            std::env::temp_dir().join(format!("konstantin-uninstall-ready-{}", std::process::id()));
+        let _ = std::fs::remove_file(&ready);
+        let mut child = std::process::Command::new(std::env::current_exe()?)
+            .arg("--deferred-uninstall-services")
+            .arg(&ready)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .process_group(0)
+            .spawn()?;
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if ready.is_file() {
+                return Ok(());
+            }
+            if let Some(status) = child.try_wait()? {
+                anyhow::bail!("deferred uninstaller exited before it was ready: {status}");
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                anyhow::bail!("timed out starting deferred uninstaller");
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    fn deferred_uninstall_services(ready: &std::path::Path) -> Result<()> {
+        use std::os::unix::fs::MetadataExt;
+
+        let paths = bundle::Paths::resolve()?;
+        let bundle_root = paths
+            .bundle_root
+            .ok_or_else(|| anyhow::anyhow!("deferred uninstall requires an app bundle"))?;
+        let original_inode = std::fs::metadata(&bundle_root)?.ino();
+        let handles = service_management::unregister_handles()?;
+        std::fs::write(ready, b"ready\n")?;
+
+        let removed = wait_for_bundle_removal(&bundle_root, original_inode)?;
+        let _ = std::fs::remove_file(ready);
+        if !removed {
+            tracing::info!("bundle was replaced during upgrade; keeping services registered");
+            return Ok(());
+        }
+
+        let cleanup = match AdminClient::send_with_timeout(
+            AdminRequest::PrepareUninstall {
+                preserve_config: true,
+            },
+            Duration::from_secs(10),
+        ) {
+            Ok(AdminResponse::Ok) => Ok(()),
+            Ok(AdminResponse::Unauthorized { reason }) => Err(anyhow::anyhow!(
+                "not authorized to prepare uninstall: {reason}"
+            )),
+            Ok(AdminResponse::Error { message }) => Err(anyhow::anyhow!(message)),
+            Ok(other) => Err(anyhow::anyhow!(
+                "unexpected daemon response during uninstall: {other:?}"
+            )),
+            Err(e) => {
+                tracing::warn!(error = %e, "daemon cleanup unavailable during uninstall");
+                Ok(())
+            }
+        };
+
+        handles.unregister()?;
+        cleanup
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum BundleObservation {
+        Original,
+        Replaced,
+        Missing,
+    }
+
+    fn observe_bundle(
+        bundle_root: &std::path::Path,
+        original_inode: u64,
+    ) -> std::io::Result<BundleObservation> {
+        use std::os::unix::fs::MetadataExt;
+
+        match std::fs::metadata(bundle_root) {
+            Ok(metadata) if metadata.ino() != original_inode => Ok(BundleObservation::Replaced),
+            Ok(_) => Ok(BundleObservation::Original),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(BundleObservation::Missing),
+            Err(e) => Err(e),
+        }
+    }
+
+    fn wait_for_bundle_removal(bundle_root: &std::path::Path, original_inode: u64) -> Result<bool> {
+        let deadline = Instant::now() + Duration::from_secs(120);
+        let mut missing_since = None;
+        loop {
+            match observe_bundle(bundle_root, original_inode) {
+                Ok(BundleObservation::Replaced) => return Ok(false),
+                Ok(BundleObservation::Original) => missing_since = None,
+                Ok(BundleObservation::Missing) => {
+                    let since = missing_since.get_or_insert_with(Instant::now);
+                    if since.elapsed() >= Duration::from_secs(20) {
+                        return Ok(true);
+                    }
+                }
+                Err(e) => {
+                    return Err(e).with_context(|| {
+                        format!("checking app bundle at {}", bundle_root.display())
+                    });
+                }
+            }
+            if Instant::now() >= deadline {
+                anyhow::bail!("timed out waiting for Homebrew to remove or replace the app bundle");
+            }
+            std::thread::sleep(Duration::from_millis(250));
+        }
+    }
+
+    #[cfg(test)]
+    mod lifecycle_tests {
+        use super::*;
+        use std::os::unix::fs::MetadataExt;
+
+        #[test]
+        fn observes_original_replaced_and_missing_bundle() {
+            let base = std::env::temp_dir().join(format!(
+                "konstantin-bundle-observation-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            let bundle = base.join("Konstantin.app");
+            std::fs::create_dir_all(&bundle).unwrap();
+            let inode = std::fs::metadata(&bundle).unwrap().ino();
+            assert_eq!(
+                observe_bundle(&bundle, inode).unwrap(),
+                BundleObservation::Original
+            );
+
+            std::fs::rename(&bundle, base.join("Old.app")).unwrap();
+            std::fs::create_dir(&bundle).unwrap();
+            assert_eq!(
+                observe_bundle(&bundle, inode).unwrap(),
+                BundleObservation::Replaced
+            );
+
+            std::fs::remove_dir(&bundle).unwrap();
+            assert_eq!(
+                observe_bundle(&bundle, inode).unwrap(),
+                BundleObservation::Missing
+            );
+            let _ = std::fs::remove_dir_all(base);
+        }
     }
 
     fn build_status_item(mtm: MainThreadMarker, controller: &actions::Controller) -> Tray {
@@ -254,21 +443,6 @@ mod imp {
 
         menu.addItem(&NSMenuItem::separatorItem(mtm));
 
-        // Updater entry. Title morphs to "Update to <version>" once a
-        // check has surfaced a newer release that the user deferred
-        // via "Later" — drain timer drives the morph from
-        // `Latest::pending_update`.
-        let updates_item = make_action_item(
-            mtm,
-            "Check for Updates…",
-            sel!(checkForUpdates:),
-            controller,
-        );
-        updates_item.setEnabled(true);
-        menu.addItem(&updates_item);
-
-        menu.addItem(&NSMenuItem::separatorItem(mtm));
-
         let uninstall = make_action_item(mtm, "Uninstall…", sel!(uninstall:), controller);
         uninstall.setEnabled(true);
         menu.addItem(&uninstall);
@@ -292,7 +466,6 @@ mod imp {
             status_item: item,
             pause_enforcement_item,
             reload_item,
-            updates_item,
         }
     }
 
@@ -391,14 +564,9 @@ mod imp {
             // Block fires on the main thread (run loop where the timer was
             // scheduled), so we can re-derive the marker safely.
             let mtm = MainThreadMarker::new().expect("drain timer must fire on the main thread");
-            let (pending, disconnected, pending_update_version, enforcement_paused) = {
+            let (pending, disconnected, enforcement_paused) = {
                 let mut g = latest.lock().expect("latest mutex");
-                (
-                    g.pending.take(),
-                    g.disconnected,
-                    g.pending_update.as_ref().map(|r| r.version.to_string()),
-                    g.enforcement_paused,
-                )
+                (g.pending.take(), g.disconnected, g.enforcement_paused)
             };
 
             // Menu enable-state. Idempotent — `setEnabled` with the
@@ -413,15 +581,6 @@ mod imp {
             tray.pause_enforcement_item
                 .setTitle(&NSString::from_str(pause_title));
             maybe_refresh_enforcement_state(latest.clone(), disconnected);
-
-            // Updater menu item morph. AppKit's `setTitle` is also
-            // idempotent — comparing first would just be book-keeping.
-            let updates_title = match &pending_update_version {
-                Some(v) => format!("Update to {v}"),
-                None => "Check for Updates…".to_string(),
-            };
-            tray.updates_item
-                .setTitle(&NSString::from_str(&updates_title));
 
             // Visuals. The muted clock trumps any pending status if
             // we're currently disconnected — even if a stale `pending`
@@ -659,56 +818,14 @@ mod imp {
         }
     }
 
-    /// Click handler for the updates menu item. If a previous check
-    /// has already surfaced a release that the user deferred, jump
-    /// straight into the install flow with that release. Otherwise
-    /// run the check.
-    fn check_for_updates_flow(mtm: MainThreadMarker) {
-        let paths = match bundle::Paths::resolve() {
-            Ok(p) => p,
-            Err(e) => {
-                tracing::error!(error = %e, "could not resolve bundle paths for update");
-                alerts::message(
-                    mtm,
-                    "Couldn't Check for Updates",
-                    &format!("Couldn't locate the running bundle: {e}"),
-                );
-                return;
-            }
-        };
-
-        // Take any pending release out so a successful install doesn't
-        // leave it stale; if the user cancels the admin sheet it'll get
-        // restashed below.
-        let pending = LATEST
-            .get()
-            .and_then(|l| l.lock().ok().and_then(|mut g| g.pending_update.take()));
-
-        if let Some(release) = pending {
-            update::run_install_flow(mtm, &paths, &release);
-            return;
-        }
-
-        update::run_check_for_updates_flow(mtm, &paths, |release| {
-            // User picked "Later" — stash the release so the menu item
-            // morphs to "Update to <version>" on the next drain tick.
-            if let Some(latest) = LATEST.get() {
-                if let Ok(mut g) = latest.lock() {
-                    g.pending_update = Some(release);
-                }
-            }
-        });
-    }
-
     /// Resolves paths to the daemon binary, daemon plist template, and
     /// example config — either from this `.app` bundle's
     /// `Contents/Resources/` (production) or from `target/<profile>/`
     /// + `packaging/` (developer running `cargo run` or
     ///   `target/release/konstantin-tray` directly).
     ///
-    /// One source of truth so anyone needing a bundled artifact —
-    /// install, future "update daemon" flow, diagnostics — calls
-    /// `bundle::Paths::resolve()`.
+    /// One source of truth so setup and diagnostics resolve the same
+    /// bundled artifacts through `bundle::Paths::resolve()`.
     mod bundle {
         use std::path::PathBuf;
 
@@ -736,10 +853,6 @@ mod imp {
         pub struct Paths {
             pub daemon_binary: PathBuf,
             pub source: Source,
-            /// `.app` bundle root (`/Applications/Konstantin.app`-ish)
-            /// when running from a real bundle. `None` in dev-tree mode.
-            /// Recorded at install time so the daemon can self-uninstall
-            /// if the operator drag-to-Trashes the app.
             pub bundle_root: Option<PathBuf>,
         }
 
@@ -830,12 +943,6 @@ mod imp {
                     open_log();
                 }
 
-                #[unsafe(method(checkForUpdates:))]
-                fn check_for_updates_action(&self, _sender: Option<&AnyObject>) {
-                    let mtm = MainThreadMarker::from(self);
-                    super::check_for_updates_flow(mtm);
-                }
-
                 #[unsafe(method(uninstall:))]
                 fn uninstall_action(&self, _sender: Option<&AnyObject>) {
                     let mtm = MainThreadMarker::from(self);
@@ -921,82 +1028,15 @@ mod imp {
                 .status();
         }
 
-        /// Uninstall flow:
-        ///   1. Confirm with the user (destructive).
-        ///   2. Ask the root daemon over admin XPC to tear down the
-        ///      system install plus every per-user tray LaunchAgent plist.
-        ///   3. Tell the user, then terminate.
-        ///
-        /// The daemon skips booting out the operator's own tray so this
-        /// process can render the success alert and quit itself. Other
-        /// users' trays are booted out immediately.
-        ///
-        /// `/etc/screentimed/` (config) is intentionally preserved so a
-        /// reinstall resumes with the user's settings. `/var/db/screentimed/`
-        /// (counter state) *is* removed — uninstall means uninstall.
-        /// The Homebrew cask's `zap` block at `packaging/konstantin.rb`
-        /// also removes the config directory for users who want a
-        /// clean wipe.
+        /// Homebrew owns the app bundle and package receipt. Keep the menu
+        /// action as discoverable guidance rather than deleting files behind
+        /// Homebrew from inside the app.
         fn uninstall_flow(mtm: MainThreadMarker) {
-            if !alerts::confirm(
-                mtm,
-                "Uninstall Konstantin?",
-                "Stops the background service and removes its files, \
-                 including saved counter state.\n\n\
-                 Your configuration (/etc/screentimed/) is preserved so \
-                 a reinstall picks up your settings. To remove that too, \
-                 run `brew uninstall --zap konstantin` after this \
-                 finishes, or delete it by hand.",
-                "Uninstall",
-                "Cancel",
-            ) {
-                return;
-            }
-
-            let outcome = progress::run_with_panel(
-                mtm,
-                "Uninstalling Konstantin",
-                "Stopping the background service and removing files…",
-                "konstantin-tray-uninstall",
-                || {
-                    AdminClient::send(AdminRequest::Uninstall {
-                        preserve_config: true,
-                    })
-                },
-            );
-
-            match outcome {
-                Ok(AdminResponse::Ok) => {}
-                Ok(AdminResponse::Unauthorized { reason }) => {
-                    alerts::message(mtm, "Administrator required.", &reason);
-                    return;
-                }
-                Ok(AdminResponse::Error { message }) => {
-                    alerts::message(mtm, "Couldn't uninstall Konstantin.", &message);
-                    return;
-                }
-                Ok(other) => {
-                    alerts::message(
-                        mtm,
-                        "Couldn't uninstall Konstantin.",
-                        &format!("Unexpected daemon response: {other:?}"),
-                    );
-                    return;
-                }
-                Err(e) => {
-                    alerts::message(mtm, "Couldn't uninstall Konstantin.", &e.to_string());
-                    return;
-                }
-            }
-
             alerts::message(
                 mtm,
-                "Konstantin has been uninstalled.",
-                "The app will now quit. Move Konstantin.app to the Trash \
-                 to finish removing the application bundle.",
+                "Uninstall Konstantin with Homebrew",
+                "Run `brew uninstall --cask konstantin` in Terminal.\n\nTo also remove configuration, logs, preferences, and counters, use `brew uninstall --cask --zap konstantin`.",
             );
-
-            NSApplication::sharedApplication(mtm).terminate(None);
         }
     }
 
@@ -1180,16 +1220,20 @@ mod imp {
 
     mod service_management {
         use super::*;
+        use block2::RcBlock;
         use objc2::msg_send;
         use objc2::rc::Retained;
         use objc2::runtime::{AnyClass, AnyObject};
         use objc2_foundation::NSString;
         use std::ptr;
+        use std::sync::mpsc;
 
         #[link(name = "ServiceManagement", kind = "framework")]
         extern "C" {}
 
         const DAEMON_PLIST_NAME: &str = "com.gitopolis.screentimed.plist";
+        const AGENT_PLIST_NAME: &str = "com.gitopolis.konstantin-tray.plist";
+        const UNREGISTER_TIMEOUT: Duration = Duration::from_secs(15);
 
         #[derive(Debug, Clone, Copy, PartialEq, Eq)]
         pub enum Status {
@@ -1200,43 +1244,110 @@ mod imp {
             Unknown(isize),
         }
 
+        pub struct UnregisterHandles {
+            agent: Retained<AnyObject>,
+            daemon: Retained<AnyObject>,
+        }
+
+        impl UnregisterHandles {
+            pub fn unregister(self) -> Result<()> {
+                unregister_if_present(self.agent)?;
+                unregister_if_present(self.daemon)
+            }
+        }
+
         pub fn daemon_status() -> Result<Status> {
             let service = daemon_service()?;
-            let raw: isize = unsafe { msg_send![&*service, status] };
-            Ok(Status::from_raw(raw))
+            Ok(status_of(&service))
+        }
+
+        pub fn agent_status() -> Result<Status> {
+            let service = agent_service()?;
+            Ok(status_of(&service))
         }
 
         pub fn register_daemon() -> Result<Status> {
             let service = daemon_service()?;
+            register_service(&service, daemon_status)
+        }
+
+        pub fn ensure_agent_registered() -> Result<Status> {
+            match agent_status()? {
+                Status::Enabled => Ok(Status::Enabled),
+                Status::RequiresApproval => Ok(Status::RequiresApproval),
+                Status::NotRegistered | Status::NotFound | Status::Unknown(_) => {
+                    let service = agent_service()?;
+                    register_service(&service, agent_status)
+                }
+            }
+        }
+
+        fn register_service(
+            service: &AnyObject,
+            status: impl Fn() -> Result<Status>,
+        ) -> Result<Status> {
             let mut error: *mut AnyObject = ptr::null_mut();
-            let ok: bool = unsafe { msg_send![&*service, registerAndReturnError: &mut error] };
+            let ok: bool = unsafe { msg_send![service, registerAndReturnError: &mut error] };
             if !ok {
-                let status = daemon_status().unwrap_or(Status::NotFound);
-                if matches!(status, Status::Enabled | Status::RequiresApproval) {
-                    return Ok(status);
+                let current = status().unwrap_or(Status::NotFound);
+                if matches!(current, Status::Enabled | Status::RequiresApproval) {
+                    return Ok(current);
                 }
                 anyhow::bail!("{}", error_message(error));
             }
-            daemon_status()
+            status()
         }
 
         pub fn refresh_daemon_registration() -> Result<Status> {
-            unregister_daemon()?;
+            unregister_service(daemon_service()?)?;
             register_daemon()
         }
 
-        fn unregister_daemon() -> Result<()> {
-            let service = daemon_service()?;
-            let mut error: *mut AnyObject = ptr::null_mut();
-            let ok: bool = unsafe { msg_send![&*service, unregisterAndReturnError: &mut error] };
-            if ok {
+        pub fn unregister_handles() -> Result<UnregisterHandles> {
+            Ok(UnregisterHandles {
+                agent: agent_service()?,
+                daemon: daemon_service()?,
+            })
+        }
+
+        fn unregister_if_present(service: Retained<AnyObject>) -> Result<()> {
+            if matches!(
+                status_of(&service),
+                Status::NotRegistered | Status::NotFound
+            ) {
                 return Ok(());
             }
-            let status = daemon_status().unwrap_or(Status::NotFound);
-            if matches!(status, Status::NotRegistered | Status::NotFound) {
-                return Ok(());
+            unregister_service(service)
+        }
+
+        fn status_of(service: &AnyObject) -> Status {
+            let raw: isize = unsafe { msg_send![service, status] };
+            Status::from_raw(raw)
+        }
+
+        fn unregister_service(service: Retained<AnyObject>) -> Result<()> {
+            let (tx, rx) = mpsc::sync_channel(1);
+            let completion = RcBlock::new(move |error: *mut AnyObject| {
+                let result = if error.is_null() {
+                    Ok(())
+                } else {
+                    Err(error_message(error))
+                };
+                let _ = tx.send(result);
+            });
+            unsafe {
+                let _: () = msg_send![&*service, unregisterWithCompletionHandler: &*completion];
             }
-            anyhow::bail!("{}", error_message(error));
+            match rx.recv_timeout(UNREGISTER_TIMEOUT) {
+                Ok(Ok(())) => Ok(()),
+                Ok(Err(message)) => anyhow::bail!("{message}"),
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    anyhow::bail!("timed out waiting for ServiceManagement to unregister")
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    anyhow::bail!("ServiceManagement unregister callback disconnected")
+                }
+            }
         }
 
         pub fn open_login_items_settings() {
@@ -1254,6 +1365,15 @@ mod imp {
             let service: Option<Retained<AnyObject>> =
                 unsafe { msg_send![cls, daemonServiceWithPlistName: &*plist] };
             service.ok_or_else(|| anyhow::anyhow!("SMAppService returned nil daemon service"))
+        }
+
+        fn agent_service() -> Result<Retained<AnyObject>> {
+            let cls = sm_app_service_class()
+                .ok_or_else(|| anyhow::anyhow!("SMAppService is unavailable"))?;
+            let plist = NSString::from_str(AGENT_PLIST_NAME);
+            let service: Option<Retained<AnyObject>> =
+                unsafe { msg_send![cls, agentServiceWithPlistName: &*plist] };
+            service.ok_or_else(|| anyhow::anyhow!("SMAppService returned nil agent service"))
         }
 
         fn sm_app_service_class() -> Option<&'static AnyClass> {
@@ -1284,685 +1404,27 @@ mod imp {
         }
     }
 
-    /// In-app updater. Hits `api.github.com/repos/<repo>/releases/latest`,
-    /// finds the architecture-matched asset zip, verifies GitHub's
-    /// per-asset SHA-256 digest, and asks the privileged daemon to
-    /// install the `.app` bundle in place through the detached updater
-    /// helper. The helper self-rolls back if the new daemon does not
-    /// become reachable.
-    ///
-    /// Source of truth for the version comparison is
-    /// `env!("CARGO_PKG_VERSION")`. CI runs `cargo set-version
-    /// --workspace "$VERSION"` before each release build, so the version
-    /// baked into a tagged-release binary is always the right one.
-    mod update {
-        use super::*;
-        use semver::Version;
-        use sha2::{Digest, Sha256};
-        use std::io::{Read, Write};
-        use std::path::{Path, PathBuf};
-        use std::sync::OnceLock;
-        use std::time::Duration;
-
-        const REPO: &str = "gitopolis/konstantin";
-        const RELEASES_API: &str =
-            "https://api.github.com/repos/gitopolis/konstantin/releases/latest";
-        const HTTP_TIMEOUT: Duration = Duration::from_secs(20);
-
-        /// `env!("CARGO_PKG_VERSION")` parsed once. Panics at first call
-        /// if the build's version is malformed — that's a bug worth
-        /// crashing on.
-        pub fn current_version() -> &'static Version {
-            static V: OnceLock<Version> = OnceLock::new();
-            V.get_or_init(|| {
-                Version::parse(env!("CARGO_PKG_VERSION"))
-                    .expect("CARGO_PKG_VERSION must be valid semver")
-            })
-        }
-
-        /// Map `std::env::consts::ARCH` to the `<arch>` token that the
-        /// release pipeline embeds in asset filenames. `aarch64` is the
-        /// Rust target arch for Apple Silicon; the release matrix labels
-        /// that build `arm64`. The Intel build is labelled `x86_64`
-        /// (matches `uname -m` and Homebrew's bottle-arch convention).
-        pub fn current_arch_label() -> Option<&'static str> {
-            match std::env::consts::ARCH {
-                "aarch64" => Some("arm64"),
-                "x86_64" => Some("x86_64"),
-                _ => None,
-            }
-        }
-
-        #[derive(Clone, Debug)]
-        pub struct Release {
-            pub version: Version,
-            pub asset_url: String,
-            pub asset_name: String,
-            /// Lowercase hex SHA-256 of the asset, taken from the
-            /// API's `digest` field (the same hash GitHub displays on
-            /// the release page). Format on the wire is `sha256:<hex>`;
-            /// we strip the prefix and lowercase here.
-            pub asset_sha256: String,
-        }
-
-        pub enum CheckOutcome {
-            UpToDate,
-            Newer(Release),
-        }
-
-        #[derive(Debug)]
-        pub enum Error {
-            /// HTTP, DNS, TLS, or transport errors.
-            Network(String),
-            /// JSON couldn't be parsed, or required fields were missing.
-            Parse(String),
-            /// No `Konstantin-<version>-<arch>.zip` asset for our arch.
-            NoAssetForArch,
-            /// Running from a dev tree, or running on an unsupported
-            /// architecture — refuse to update.
-            UnsupportedEnvironment,
-            /// Filesystem error during download / staging.
-            Io(String),
-        }
-
-        impl std::fmt::Display for Error {
-            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                match self {
-                    Self::Network(s) => write!(f, "network error: {s}"),
-                    Self::Parse(s) => write!(f, "couldn't parse GitHub response: {s}"),
-                    Self::NoAssetForArch => write!(
-                        f,
-                        "no compatible release asset for this architecture"
-                    ),
-                    Self::UnsupportedEnvironment => write!(
-                        f,
-                        "updates are only available from an installed .app bundle on a supported architecture"
-                    ),
-                    Self::Io(s) => write!(f, "i/o error: {s}"),
-                }
-            }
-        }
-
-        // ─── Network ─────────────────────────────────────────────────
-
-        fn user_agent() -> String {
-            format!("konstantin-tray/{}", env!("CARGO_PKG_VERSION"))
-        }
-
-        /// One-shot agent for HTTP(S). `ureq`'s default agent is fine
-        /// for the half-dozen requests we make in a session, but we
-        /// build it once with consistent timeout + UA so all requests
-        /// look the same to the server.
-        fn agent() -> ureq::Agent {
-            ureq::Agent::config_builder()
-                .timeout_global(Some(HTTP_TIMEOUT))
-                .build()
-                .into()
-        }
-
-        fn fetch_json(url: &str) -> Result<serde_json::Value, Error> {
-            let mut resp = agent()
-                .get(url)
-                .header("Accept", "application/vnd.github+json")
-                .header("User-Agent", user_agent())
-                .call()
-                .map_err(|e| Error::Network(e.to_string()))?;
-            resp.body_mut()
-                .read_json::<serde_json::Value>()
-                .map_err(|e| Error::Parse(e.to_string()))
-        }
-
-        /// Stream `url` into `dest`, going via a `<dest>.partial` so a
-        /// dropped connection never leaves a half-formed file at the
-        /// final name. Renames atomically on success.
-        fn download_to(url: &str, dest: &Path) -> Result<(), Error> {
-            let partial = dest.with_extension(
-                dest.extension()
-                    .and_then(|e| e.to_str())
-                    .map(|e| format!("{e}.partial"))
-                    .unwrap_or_else(|| "partial".to_string()),
-            );
-            // Cleanup-on-drop guard for the partial file.
-            struct PartialGuard(PathBuf);
-            impl Drop for PartialGuard {
-                fn drop(&mut self) {
-                    let _ = std::fs::remove_file(&self.0);
-                }
-            }
-            let guard = PartialGuard(partial.clone());
-
-            let mut resp = agent()
-                .get(url)
-                .header("User-Agent", user_agent())
-                .call()
-                .map_err(|e| Error::Network(e.to_string()))?;
-            let mut reader = resp.body_mut().as_reader();
-            let mut file = std::fs::File::create(&partial)
-                .map_err(|e| Error::Io(format!("create {}: {e}", partial.display())))?;
-            std::io::copy(&mut reader, &mut file)
-                .map_err(|e| Error::Network(format!("body read: {e}")))?;
-            file.flush()
-                .map_err(|e| Error::Io(format!("flush {}: {e}", partial.display())))?;
-            std::fs::rename(&partial, dest)
-                .map_err(|e| Error::Io(format!("rename to {}: {e}", dest.display())))?;
-            // We renamed to `dest`, so the partial no longer exists.
-            // Disarm the guard.
-            std::mem::forget(guard);
-            Ok(())
-        }
-
-        // ─── Parsing the GitHub release ──────────────────────────────
-
-        fn canonical_url(tag: &str, filename: &str) -> String {
-            format!(
-                "https://github.com/{REPO}/releases/download/{tag}/{filename}",
-                REPO = REPO,
-            )
-        }
-
-        /// Cheap defense against a tampered API response — only trust
-        /// `browser_download_url` values that match the canonical
-        /// `releases/download/<tag>/<file>` shape on the expected repo.
-        fn is_canonical(url: &str, tag: &str, filename: &str) -> bool {
-            url == canonical_url(tag, filename)
-        }
-
-        /// Parse a `releases/latest` JSON payload into a `Release`,
-        /// looking for the asset that matches our arch and pulling its
-        /// SHA-256 from the `digest` field GitHub computes for every
-        /// release asset.
-        fn parse_release(json: &serde_json::Value) -> Result<Release, Error> {
-            let tag = json["tag_name"]
-                .as_str()
-                .ok_or_else(|| Error::Parse("missing tag_name".into()))?;
-            let version_str = tag.strip_prefix('v').unwrap_or(tag);
-            let version =
-                Version::parse(version_str).map_err(|e| Error::Parse(format!("tag {tag}: {e}")))?;
-            let arch = current_arch_label().ok_or(Error::UnsupportedEnvironment)?;
-            let asset_name = format!("Konstantin-{version}-{arch}.zip");
-
-            let assets = json["assets"]
-                .as_array()
-                .ok_or_else(|| Error::Parse("missing assets array".into()))?;
-
-            for a in assets {
-                let name = a["name"].as_str().unwrap_or("");
-                if name != asset_name {
-                    continue;
-                }
-                let url = a["browser_download_url"].as_str().unwrap_or("");
-                if !is_canonical(url, tag, &asset_name) {
-                    return Err(Error::Parse(format!(
-                        "non-canonical asset URL for {asset_name}: {url}"
-                    )));
-                }
-                let digest = a["digest"]
-                    .as_str()
-                    .ok_or_else(|| Error::Parse(format!("missing digest for {asset_name}")))?;
-                let asset_sha256 = parse_digest(digest)?;
-                return Ok(Release {
-                    version,
-                    asset_url: url.to_string(),
-                    asset_name,
-                    asset_sha256,
-                });
-            }
-
-            Err(Error::NoAssetForArch)
-        }
-
-        /// Parse GitHub's `digest` field: `sha256:<64 hex chars>`.
-        /// Returns the lowercase hex without the prefix.
-        fn parse_digest(s: &str) -> Result<String, Error> {
-            let hex = s
-                .strip_prefix("sha256:")
-                .ok_or_else(|| Error::Parse(format!("digest is not sha256-prefixed: {s}")))?;
-            if hex.len() != 64 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
-                return Err(Error::Parse(format!("digest is not 64 hex chars: {hex}")));
-            }
-            Ok(hex.to_ascii_lowercase())
-        }
-
-        /// Fetch the latest release and decide whether it's newer than
-        /// the running build.
-        pub fn fetch_latest() -> Result<CheckOutcome, Error> {
-            let json = fetch_json(RELEASES_API)?;
-            let release = parse_release(&json)?;
-            Ok(if release.version > *current_version() {
-                CheckOutcome::Newer(release)
-            } else {
-                CheckOutcome::UpToDate
-            })
-        }
-
-        // ─── Verification + extraction ───────────────────────────────
-
-        fn sha256_of_file(path: &Path) -> Result<String, Error> {
-            let mut hasher = Sha256::new();
-            let mut file = std::fs::File::open(path)
-                .map_err(|e| Error::Io(format!("open {}: {e}", path.display())))?;
-            let mut buf = vec![0u8; 64 * 1024];
-            loop {
-                let n = file
-                    .read(&mut buf)
-                    .map_err(|e| Error::Io(format!("read {}: {e}", path.display())))?;
-                if n == 0 {
-                    break;
-                }
-                hasher.update(&buf[..n]);
-            }
-            let digest = hasher.finalize();
-            Ok(digest.iter().map(|b| format!("{b:02x}")).collect())
-        }
-
-        fn classify_failure(code: i32, message: &str) -> (&'static str, String) {
-            match code {
-                10 | 11 => (
-                    "Update Failed",
-                    format!(
-                        "Could not install the update. The previous version is still active.\n\n\
-                         Details: {message}"
-                    ),
-                ),
-                20..=24 => (
-                    "Update Failed",
-                    format!(
-                        "The new version did not start; rolled back to the previous version.\n\n\
-                         Details: {message}"
-                    ),
-                ),
-                50 => (
-                    "Update Failed",
-                    "Konstantin's bundle is missing — the rollback did not complete. \
-                     Reinstall via Homebrew (`brew reinstall --cask konstantin`) or \
-                     download the latest release from GitHub."
-                        .to_string(),
-                ),
-                _ => (
-                    "Update Failed",
-                    format!("Unexpected error during install.\n\nDetails: {message}"),
-                ),
-            }
-        }
-
-        fn poll_update_result(path: &Path, timeout: Duration) -> Result<UpdateInstallResult> {
-            let deadline = std::time::Instant::now() + timeout;
-            loop {
-                match std::fs::read_to_string(path) {
-                    Ok(json) => {
-                        return serde_json::from_str(&json)
-                            .map_err(|e| anyhow::anyhow!("parsing update result: {e}"));
-                    }
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(e) => {
-                        return Err(anyhow::anyhow!(
-                            "reading update result {}: {e}",
-                            path.display()
-                        ));
-                    }
-                }
-                if std::time::Instant::now() >= deadline {
-                    anyhow::bail!("timed out waiting for update result");
-                }
-                std::thread::sleep(Duration::from_millis(250));
-            }
-        }
-
-        // ─── Top-level flows ─────────────────────────────────────────
-
-        /// Click handler for "Check for Updates…". Runs the GitHub
-        /// fetch on a worker thread under a progress panel; on result,
-        /// shows the appropriate alert and (on `Newer`) either kicks
-        /// off the install or stashes the release for later via
-        /// `morphed_for_later`.
-        ///
-        /// `morphed_for_later` is invoked on the main thread with the
-        /// release if the user clicked "Later" — that's where the
-        /// caller installs the morphed-menu-item title.
-        pub fn run_check_for_updates_flow(
-            mtm: MainThreadMarker,
-            paths: &bundle::Paths,
-            morphed_for_later: impl FnOnce(Release),
-        ) {
-            // Refuse to update from a dev tree or an unsupported arch.
-            if matches!(paths.source, bundle::Source::DevTree) {
-                alerts::message(
-                    mtm,
-                    "Updates Disabled",
-                    "Konstantin is running from a developer build. \
-                     Use `cargo build` and `packaging/build-app.sh` \
-                     to produce a fresh bundle.",
-                );
-                return;
-            }
-            if current_arch_label().is_none() {
-                alerts::message(
-                    mtm,
-                    "Updates Disabled",
-                    "This Mac's architecture isn't supported by the current release pipeline.",
-                );
-                return;
-            }
-
-            let result = progress::run_with_panel(
-                mtm,
-                "Checking for Updates",
-                "Looking for a newer version of Konstantin…",
-                "konstantin-tray-update-check",
-                fetch_latest,
-            );
-
-            match result {
-                Ok(CheckOutcome::UpToDate) => {
-                    alerts::message(
-                        mtm,
-                        "You're Up to Date",
-                        &format!("Konstantin {} is the latest.", current_version()),
-                    );
-                }
-                Ok(CheckOutcome::Newer(release)) => {
-                    let proceed = alerts::confirm(
-                        mtm,
-                        "Update Available",
-                        &format!("Konstantin {} is available.", release.version),
-                        &format!("Update to {}", release.version),
-                        "Later",
-                    );
-                    if proceed {
-                        run_install_flow(mtm, paths, &release);
-                    } else {
-                        morphed_for_later(release);
-                    }
-                }
-                Err(e) => {
-                    alerts::message(mtm, "Couldn't Check for Updates", &format!("{e}"));
-                }
-            }
-        }
-
-        /// Download → verify → daemon-mediated install → auto-relaunch.
-        /// The root daemon validates and stages the zip, then spawns the
-        /// detached updater helper that owns the bundle swap and rollback.
-        pub fn run_install_flow(mtm: MainThreadMarker, paths: &bundle::Paths, release: &Release) {
-            if paths.bundle_root.is_none() {
-                alerts::message(
-                    mtm,
-                    "Updates Disabled",
-                    "Couldn't determine the install location.",
-                );
-                return;
-            }
-
-            // 1. Working dir + RAII cleanup.
-            let work_dir =
-                std::env::temp_dir().join(format!("konstantin-update-{}", std::process::id()));
-            let _wd_guard = WorkDirGuard(work_dir.clone());
-            if let Err(e) = std::fs::create_dir_all(&work_dir) {
-                alerts::message(
-                    mtm,
-                    "Update Failed",
-                    &format!("Couldn't create temporary directory: {e}"),
-                );
-                return;
-            }
-
-            let zip_path = work_dir.join(&release.asset_name);
-            let asset_url = release.asset_url.clone();
-            let zp = zip_path.clone();
-
-            // 2. Download under a progress panel.
-            let download_result = progress::run_with_panel(
-                mtm,
-                "Downloading Update",
-                &format!("Fetching Konstantin {}…", release.version),
-                "konstantin-tray-update-download",
-                move || -> Result<(), Error> { download_to(&asset_url, &zp) },
-            );
-            if let Err(e) = download_result {
-                alerts::message(mtm, "Download Failed", &format!("{e}"));
-                return;
-            }
-
-            // 3. Verify SHA-256 against the digest GitHub returned in
-            // the API response (same hash shown on the release page).
-            let actual = match sha256_of_file(&zip_path) {
-                Ok(h) => h,
-                Err(e) => {
-                    alerts::message(mtm, "Update Failed", &format!("{e}"));
-                    return;
-                }
-            };
-            if actual != release.asset_sha256 {
-                tracing::warn!(
-                    expected = %release.asset_sha256,
-                    actual = %actual,
-                    "sha256 mismatch"
-                );
-                alerts::message(
-                    mtm,
-                    "Update Failed",
-                    "Checksum mismatch — refusing to install.",
-                );
-                return;
-            }
-
-            // 4. Ask the root daemon to validate, stage, and launch
-            // the detached updater helper. Then poll the helper's
-            // result file while the progress panel stays open.
-            let zip_for_install = zip_path.clone();
-            let expected_version = release.version.to_string();
-            let expected_sha256 = release.asset_sha256.clone();
-            let install_result = progress::run_with_panel(
-                mtm,
-                "Installing Update",
-                &format!("Installing Konstantin {}…", release.version),
-                "konstantin-tray-update-install",
-                move || -> Result<(PathBuf, UpdateInstallResult)> {
-                    let response = AdminClient::send_with_timeout(
-                        AdminRequest::InstallUpdate {
-                            zip_path: zip_for_install,
-                            expected_version,
-                            expected_sha256,
-                        },
-                        Duration::from_secs(120),
-                    )?;
-                    let (result_path, bundle_root) = match response {
-                        AdminResponse::UpdateInstallStarted {
-                            result_path,
-                            bundle_root,
-                        } => (result_path, bundle_root),
-                        AdminResponse::Unauthorized { reason } => {
-                            anyhow::bail!("Not authorized: {reason}");
-                        }
-                        AdminResponse::Error { message } => anyhow::bail!("{message}"),
-                        other => anyhow::bail!("unexpected daemon response: {other:?}"),
-                    };
-                    let result = poll_update_result(&result_path, Duration::from_secs(120))?;
-                    Ok((bundle_root, result))
-                },
-            );
-
-            match install_result {
-                Ok((bundle_root, UpdateInstallResult::Succeeded)) => {
-                    let new_tray = bundle_root.join("Contents/MacOS/konstantin-tray");
-                    match std::process::Command::new(&new_tray).spawn() {
-                        Ok(_) => {
-                            tracing::info!(
-                                new = %new_tray.display(),
-                                "spawned new tray; terminating self"
-                            );
-                            // Drop the work dir before terminate so
-                            // cleanup actually happens.
-                            drop(_wd_guard);
-                            NSApplication::sharedApplication(mtm).terminate(None);
-                        }
-                        Err(e) => {
-                            // Install succeeded but we couldn't spawn —
-                            // tell the user to relaunch manually.
-                            alerts::message(
-                                mtm,
-                                "Update Installed",
-                                &format!(
-                                    "The update is installed but the tray couldn't relaunch \
-                                     automatically. Please reopen Konstantin from \
-                                     Applications.\n\nDetails: {e}"
-                                ),
-                            );
-                        }
-                    }
-                }
-                Ok((_, UpdateInstallResult::Failed { code, message })) => {
-                    tracing::error!(code, message = %message, "update helper failed");
-                    let (title, body) = classify_failure(code, &message);
-                    alerts::message(mtm, title, &body);
-                }
-                Err(e) => alerts::message(mtm, "Update Failed", &e.to_string()),
-            }
-        }
-
-        // ─── RAII cleanup ────────────────────────────────────────────
-
-        struct WorkDirGuard(PathBuf);
-        impl Drop for WorkDirGuard {
-            fn drop(&mut self) {
-                let _ = std::fs::remove_dir_all(&self.0);
-            }
-        }
-
-        // ─── Tests ───────────────────────────────────────────────────
-
-        #[cfg(test)]
-        mod tests {
-            use super::*;
-
-            #[test]
-            fn arch_mapping() {
-                // We can't test all branches at runtime — but we can
-                // assert the live host maps to a known label or None.
-                let label = current_arch_label();
-                assert!(matches!(label, None | Some("arm64") | Some("x86_64")));
-            }
-
-            #[test]
-            fn canonical_url_shape() {
-                let url = canonical_url("v0.1.2", "Konstantin-0.1.2-arm64.zip");
-                assert_eq!(
-                    url,
-                    "https://github.com/gitopolis/konstantin/releases/download/v0.1.2/Konstantin-0.1.2-arm64.zip"
-                );
-            }
-
-            #[test]
-            fn rejects_non_canonical_url() {
-                assert!(!is_canonical(
-                    "https://evil.example/foo.zip",
-                    "v0.1.2",
-                    "Konstantin-0.1.2-arm64.zip"
-                ));
-                assert!(is_canonical(
-                    "https://github.com/gitopolis/konstantin/releases/download/v0.1.2/Konstantin-0.1.2-arm64.zip",
-                    "v0.1.2",
-                    "Konstantin-0.1.2-arm64.zip"
-                ));
-            }
-
-            #[test]
-            fn parses_release_payload() {
-                let json = serde_json::json!({
-                    "tag_name": "v0.1.2",
-                    "assets": [
-                        {
-                            "name": "Konstantin-0.1.2-arm64.zip",
-                            "browser_download_url":
-                                "https://github.com/gitopolis/konstantin/releases/download/v0.1.2/Konstantin-0.1.2-arm64.zip",
-                            "digest": "sha256:dbf5dc5e283847541da9d2222d40951109c59fd5eab277ab03138b226179b5ad"
-                        }
-                    ]
-                });
-                // Test under the assumption we're on arm64 — skip on
-                // hosts where we can't get an arch label.
-                let Some(arch) = current_arch_label() else {
-                    return;
-                };
-                if arch != "arm64" {
-                    return;
-                }
-                let r = parse_release(&json).unwrap();
-                assert_eq!(r.version, Version::new(0, 1, 2));
-                assert_eq!(r.asset_name, "Konstantin-0.1.2-arm64.zip");
-                assert!(r.asset_url.contains("Konstantin-0.1.2-arm64.zip"));
-                assert_eq!(
-                    r.asset_sha256,
-                    "dbf5dc5e283847541da9d2222d40951109c59fd5eab277ab03138b226179b5ad"
-                );
-            }
-
-            #[test]
-            fn rejects_payload_without_digest() {
-                let json = serde_json::json!({
-                    "tag_name": "v0.1.2",
-                    "assets": [
-                        {
-                            "name": "Konstantin-0.1.2-arm64.zip",
-                            "browser_download_url":
-                                "https://github.com/gitopolis/konstantin/releases/download/v0.1.2/Konstantin-0.1.2-arm64.zip"
-                        }
-                    ]
-                });
-                let Some(arch) = current_arch_label() else {
-                    return;
-                };
-                if arch != "arm64" {
-                    return;
-                }
-                assert!(matches!(parse_release(&json), Err(Error::Parse(_))));
-            }
-
-            #[test]
-            fn parses_digest() {
-                assert_eq!(
-                    parse_digest(
-                        "sha256:DBF5DC5E283847541DA9D2222D40951109C59FD5EAB277AB03138B226179B5AD"
-                    )
-                    .unwrap(),
-                    "dbf5dc5e283847541da9d2222d40951109c59fd5eab277ab03138b226179b5ad"
-                );
-                assert!(parse_digest("md5:abcd").is_err());
-                assert!(parse_digest("sha256:tooshort").is_err());
-                assert!(parse_digest("").is_err());
-            }
-
-            #[test]
-            fn classify_picks_right_message() {
-                let (t, b) = classify_failure(22, "bootstrap failed");
-                assert_eq!(t, "Update Failed");
-                assert!(b.contains("rolled back"));
-                let (_, b) = classify_failure(24, "admin XPC missing");
-                assert!(b.contains("rolled back"));
-                let (_, b) = classify_failure(10, "move aside failed");
-                assert!(b.contains("previous version is still active"));
-                let (_, b) = classify_failure(50, "catastrophe");
-                assert!(b.contains("Reinstall"));
-            }
-        }
-    }
-
-    /// First-launch setup + per-user LaunchAgent management.
+    /// First-launch setup and managed per-user agent registration.
     ///
     /// Two responsibilities:
     ///   * **System side** — signed bundles register the bundled
     ///     LaunchDaemon through `SMAppService`.
-    ///   * **User side** (no auth) — write a per-user LaunchAgent plist
-    ///     pointing at this tray binary's absolute path, so launchd
-    ///     auto-starts us at next login.
+    ///   * **User side** — register the bundled LaunchAgent through
+    ///     `SMAppService.agent(plistName:)` in the current login session.
     mod install {
         use super::*;
-        use std::path::{Path, PathBuf};
 
-        /// macOS LaunchDaemon plist destination (system).
-        const SYSTEM_PLIST: &str = "/Library/LaunchDaemons/com.gitopolis.screentimed.plist";
         /// IPC socket — used purely as a liveness probe.
         const SOCKET_PATH: &str = "/var/run/screentimed.sock";
+
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        pub enum DaemonLifecycleState {
+            NotRegistered,
+            RequiresApproval,
+            EnabledHealthy,
+            EnabledMissingSocket,
+            EnabledMissingAdminEndpoint,
+        }
 
         /// Returns true iff the daemon is currently accepting connections.
         /// Cheap; no privileges required. The connection is closed
@@ -1971,30 +1433,90 @@ mod imp {
             std::os::unix::net::UnixStream::connect(SOCKET_PATH).is_ok()
         }
 
+        pub fn daemon_lifecycle_state() -> Result<DaemonLifecycleState> {
+            let status = super::service_management::daemon_status()?;
+            let socket_reachable = daemon_socket_reachable();
+            let admin_reachable = socket_reachable && admin_control_reachable();
+            Ok(classify_daemon_lifecycle(
+                status,
+                socket_reachable,
+                admin_reachable,
+            ))
+        }
+
+        fn classify_daemon_lifecycle(
+            status: super::service_management::Status,
+            socket_reachable: bool,
+            admin_reachable: bool,
+        ) -> DaemonLifecycleState {
+            use super::service_management::Status;
+
+            match status {
+                Status::NotRegistered | Status::NotFound | Status::Unknown(_) => {
+                    DaemonLifecycleState::NotRegistered
+                }
+                Status::RequiresApproval => DaemonLifecycleState::RequiresApproval,
+                Status::Enabled if !socket_reachable => DaemonLifecycleState::EnabledMissingSocket,
+                Status::Enabled if !admin_reachable => {
+                    DaemonLifecycleState::EnabledMissingAdminEndpoint
+                }
+                Status::Enabled => DaemonLifecycleState::EnabledHealthy,
+            }
+        }
+
         /// Returns true if the signed admin XPC control plane is usable.
         /// Any daemon-level response, including Unauthorized for a
         /// non-admin user, proves the Mach service is registered and the
         /// Rust handler received the request.
         pub fn admin_control_reachable() -> bool {
-            match AdminClient::send_with_timeout(
-                AdminRequest::GetEnforcementState,
-                Duration::from_secs(2),
-            ) {
-                Ok(_) => true,
-                Err(e) => {
-                    tracing::debug!(error = %e, "admin XPC health check failed");
-                    false
+            for attempt in 1..=3 {
+                match AdminClient::send_with_timeout(
+                    AdminRequest::GetDaemonInfo,
+                    Duration::from_secs(1),
+                ) {
+                    Ok(AdminResponse::DaemonInfo { .. } | AdminResponse::Unauthorized { .. }) => {
+                        return true;
+                    }
+                    Ok(other) => {
+                        tracing::debug!(attempt, ?other, "unexpected admin XPC health response");
+                    }
+                    Err(e) => {
+                        tracing::debug!(attempt, error = %e, "admin XPC health check failed");
+                    }
+                }
+                if attempt < 3 {
+                    std::thread::sleep(Duration::from_millis(250));
                 }
             }
+            false
         }
 
-        /// Returns true iff the old system-side LaunchDaemon plist already
-        /// exists. If yes, the daemon is considered installed and any "not
-        /// reachable" condition is treated as transient so the subscribe
-        /// loop can keep retrying. New installs are registered through
-        /// ServiceManagement and do not write this plist from the tray.
-        pub fn system_plist_present() -> bool {
-            Path::new(SYSTEM_PLIST).exists()
+        pub fn ensure_user_agent(mtm: MainThreadMarker) {
+            match super::service_management::ensure_agent_registered() {
+                Ok(super::service_management::Status::Enabled) => {
+                    tracing::info!("SMAppService tray agent enabled");
+                }
+                Ok(super::service_management::Status::RequiresApproval) => {
+                    tracing::warn!("SMAppService tray agent requires approval");
+                    super::service_management::open_login_items_settings();
+                    alerts::message(
+                        mtm,
+                        "Login Startup Approval Needed",
+                        "Enable Konstantin in System Settings so its menu-bar app starts after login.",
+                    );
+                }
+                Ok(status) => {
+                    tracing::warn!(?status, "unexpected SMAppService tray-agent status");
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "SMAppService tray-agent registration failed");
+                    alerts::message(
+                        mtm,
+                        "Login Startup Setup Failed",
+                        &format!("macOS couldn't register Konstantin's login agent.\n\n{e}"),
+                    );
+                }
+            }
         }
 
         /// Show a Set-up dialog. If the user proceeds, run the
@@ -2036,6 +1558,26 @@ mod imp {
         }
 
         pub fn maybe_run_admin_control_repair(mtm: MainThreadMarker) {
+            match super::service_management::daemon_status() {
+                Ok(super::service_management::Status::RequiresApproval) => {
+                    super::service_management::open_login_items_settings();
+                    alerts::message(
+                        mtm,
+                        "Approval Needed",
+                        "Enable Konstantin in System Settings, then open Konstantin again.",
+                    );
+                    return;
+                }
+                Ok(super::service_management::Status::Enabled) => {}
+                Ok(status) => {
+                    tracing::warn!(?status, "admin XPC unavailable but daemon is not enabled");
+                    return;
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "could not inspect daemon registration for repair");
+                    return;
+                }
+            }
             match konstantin_tray::users::current_user_is_admin() {
                 Ok(true) => {
                     let _ = run_admin_control_repair(mtm);
@@ -2052,6 +1594,37 @@ mod imp {
                     );
                 }
             }
+        }
+
+        pub fn maybe_refresh_daemon_version(mtm: MainThreadMarker) {
+            let response =
+                AdminClient::send_with_timeout(AdminRequest::GetDaemonInfo, Duration::from_secs(2));
+            let running = match response {
+                Ok(AdminResponse::DaemonInfo { version }) => version,
+                Ok(AdminResponse::Unauthorized { .. }) => return,
+                Ok(other) => {
+                    tracing::warn!(?other, "unexpected daemon-info response");
+                    return;
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "could not query running daemon version");
+                    return;
+                }
+            };
+
+            let bundled = env!("CARGO_PKG_VERSION");
+            if running == bundled {
+                return;
+            }
+            tracing::info!(%running, %bundled, "refreshing daemon registration after bundle update");
+            if bundle::Paths::resolve()
+                .map(|p| p.source != bundle::Source::Bundle)
+                .unwrap_or(true)
+            {
+                tracing::warn!("refusing daemon-version refresh outside an app bundle");
+                return;
+            }
+            let _ = run_smappservice_repair(mtm);
         }
 
         fn run_admin_control_repair(mtm: MainThreadMarker) -> bool {
@@ -2091,7 +1664,7 @@ mod imp {
                 "Setting Up Konstantin",
                 "Registering Konstantin's background service…",
                 "konstantin-smappservice-register",
-                super::service_management::register_daemon,
+                register_and_verify_daemon,
             );
 
             match result {
@@ -2135,7 +1708,7 @@ mod imp {
                 "Repairing Konstantin",
                 "Refreshing Konstantin's background service…",
                 "konstantin-smappservice-repair",
-                super::service_management::refresh_daemon_registration,
+                refresh_and_verify_daemon,
             );
 
             match result {
@@ -2178,90 +1751,87 @@ mod imp {
             }
         }
 
-        /// Idempotent. Writes `~/Library/LaunchAgents/com.gitopolis.konstantin-tray.plist`
-        /// pointing at `current_exe()`. Skips the write if the existing
-        /// content is already correct. Does NOT bootstrap — the tray is
-        /// already running, and a bootstrap would race-spawn a sibling
-        /// instance.
-        pub fn ensure_user_launchagent() -> anyhow::Result<()> {
-            let exe = std::env::current_exe()?;
-            let home = std::env::var("HOME").map_err(|_| anyhow::anyhow!("HOME not set"))?;
-            let home = PathBuf::from(home);
-            let agents_dir = home.join("Library/LaunchAgents");
-            std::fs::create_dir_all(&agents_dir)?;
-            std::fs::create_dir_all(home.join("Library/Logs"))?;
-            let dst = agents_dir.join("com.gitopolis.konstantin-tray.plist");
-            let want = build_user_launchagent_plist(&exe, &home);
+        fn register_and_verify_daemon() -> Result<super::service_management::Status> {
+            let status = super::service_management::register_daemon()?;
+            verify_enabled_daemon(status)
+        }
 
-            if let Ok(have) = std::fs::read_to_string(&dst) {
-                if have == want {
-                    return Ok(());
-                }
+        fn refresh_and_verify_daemon() -> Result<super::service_management::Status> {
+            let status = super::service_management::refresh_daemon_registration()?;
+            verify_enabled_daemon(status)
+        }
+
+        fn verify_enabled_daemon(
+            status: super::service_management::Status,
+        ) -> Result<super::service_management::Status> {
+            if status != super::service_management::Status::Enabled {
+                return Ok(status);
             }
-            std::fs::write(&dst, want)?;
-            tracing::info!(path = %dst.display(), "wrote user LaunchAgent plist");
-            Ok(())
+
+            let deadline = Instant::now() + Duration::from_secs(15);
+            loop {
+                if daemon_socket_reachable() {
+                    if let Ok(AdminResponse::DaemonInfo { version }) =
+                        AdminClient::send_with_timeout(
+                            AdminRequest::GetDaemonInfo,
+                            Duration::from_secs(1),
+                        )
+                    {
+                        if version == env!("CARGO_PKG_VERSION") {
+                            return Ok(status);
+                        }
+                    }
+                }
+                if Instant::now() >= deadline {
+                    anyhow::bail!(
+                        "registered daemon did not expose the expected socket, version, and admin endpoint"
+                    );
+                }
+                std::thread::sleep(Duration::from_millis(250));
+            }
         }
 
-        pub(super) fn build_user_launchagent_plist(tray_exe: &Path, home: &Path) -> String {
-            let exe = xml_escape(&tray_exe.display().to_string());
-            let stdout = xml_escape(
-                &home
-                    .join("Library/Logs/konstantin-tray.out.log")
-                    .display()
-                    .to_string(),
-            );
-            let stderr = xml_escape(
-                &home
-                    .join("Library/Logs/konstantin-tray.err.log")
-                    .display()
-                    .to_string(),
-            );
-            format!(
-                r#"<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>com.gitopolis.konstantin-tray</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>{exe}</string>
-    </array>
-    <key>RunAtLoad</key>
-    <true/>
-    <key>KeepAlive</key>
-    <false/>
-    <key>LimitLoadToSessionType</key>
-    <string>Aqua</string>
-    <key>StandardOutPath</key>
-    <string>{stdout}</string>
-    <key>StandardErrorPath</key>
-    <string>{stderr}</string>
-</dict>
-</plist>
-"#
-            )
-        }
+        #[cfg(test)]
+        mod tests {
+            use super::*;
+            use crate::imp::service_management::Status;
 
-        pub(super) fn xml_escape(s: &str) -> String {
-            s.replace('&', "&amp;")
-                .replace('<', "&lt;")
-                .replace('>', "&gt;")
-                .replace('"', "&quot;")
-                .replace('\'', "&apos;")
+            #[test]
+            fn classifies_daemon_lifecycle_states() {
+                assert_eq!(
+                    classify_daemon_lifecycle(Status::NotRegistered, false, false),
+                    DaemonLifecycleState::NotRegistered
+                );
+                assert_eq!(
+                    classify_daemon_lifecycle(Status::RequiresApproval, false, false),
+                    DaemonLifecycleState::RequiresApproval
+                );
+                assert_eq!(
+                    classify_daemon_lifecycle(Status::Enabled, false, false),
+                    DaemonLifecycleState::EnabledMissingSocket
+                );
+                assert_eq!(
+                    classify_daemon_lifecycle(Status::Enabled, true, false),
+                    DaemonLifecycleState::EnabledMissingAdminEndpoint
+                );
+                assert_eq!(
+                    classify_daemon_lifecycle(Status::Enabled, true, true),
+                    DaemonLifecycleState::EnabledHealthy
+                );
+            }
         }
     }
 
     /// Native settings window. Replaces the previous "open the TOML in
     /// a text editor" flow with an AppKit window listing every real
-    /// local user, with per-user daily-limit and tray-autostart
-    /// controls plus an editable warn-thresholds field at the top.
+    /// local user, with per-user daily-limit controls plus an editable
+    /// warn-thresholds field at the top.
     ///
     /// Configure Open and Save use the daemon's signed admin XPC control
     /// plane. The root daemon reads/writes `/etc/screentimed/config.toml`,
-    /// probes other users' LaunchAgent state, applies tray-autostart
-    /// changes, and reloads itself after a successful save.
+    /// writes the root-owned configuration and reloads itself after a
+    /// successful save. Tray startup is user-scoped SMAppService state
+    /// and is deliberately not administered across accounts here.
     ///
     /// Other config keys (`enforcement`, `default_policy`,
     /// `kill_switch_path`, paths, `tick_seconds`) are round-tripped
@@ -2281,7 +1851,6 @@ mod imp {
         };
         use objc2_foundation::{NSData, NSPoint, NSRect, NSSize};
         use std::cell::RefCell;
-        use std::path::PathBuf;
 
         thread_local! {
             /// At most one configure window at a time. Re-opening just
@@ -2306,11 +1875,6 @@ mod imp {
             user: LocalUser,
             limit_check: Retained<NSButton>,
             minutes_field: Retained<NSTextField>,
-            autostart_check: Retained<NSButton>,
-            /// Snapshot of `<home>/Library/LaunchAgents/...plist`
-            /// existence at window-open time. Used to compute the diff
-            /// on save.
-            autostart_initial: bool,
         }
 
         define_class!(
@@ -2333,12 +1897,6 @@ mod imp {
                             }
                         }
                     });
-                }
-
-                #[unsafe(method(toggleAutostart:))]
-                fn toggle_autostart_action(&self, _sender: Option<&AnyObject>) {
-                    // Stored state is read straight from the checkbox at
-                    // save time; nothing else to update on click.
                 }
 
                 #[unsafe(method(saveTapped:))]
@@ -2394,31 +1952,16 @@ mod imp {
                 return;
             }
 
-            let probes: Vec<TrayAutostartProbe> = users_list
-                .iter()
-                .map(|u| TrayAutostartProbe {
-                    username: u.username.clone(),
-                    home: u.home.clone(),
-                })
-                .collect();
             let open_response = super::progress::run_with_panel(
                 mtm,
                 "Open Configuration",
                 "Reading /etc/screentimed/config.toml…",
                 "konstantin-config-open",
-                move || {
-                    AdminClient::send(AdminRequest::GetConfig {
-                        autostart_probes: probes,
-                    })
-                },
+                move || AdminClient::send(AdminRequest::GetConfig),
             );
 
-            let (config_text, autostart_states) = match open_response {
-                Ok(AdminResponse::Config {
-                    toml,
-                    tray_autostart,
-                    ..
-                }) => (toml, tray_autostart),
+            let config_text = match open_response {
+                Ok(AdminResponse::Config { toml, .. }) => toml,
                 Ok(AdminResponse::Unauthorized { reason }) => {
                     super::alerts::message(mtm, "Administrator required.", &reason);
                     return;
@@ -2450,8 +1993,7 @@ mod imp {
             };
 
             let initial_thresholds = current_thresholds(&config_value);
-            let user_initials =
-                collect_user_settings(&users_list, &config_value, &autostart_states);
+            let user_initials = collect_user_settings(&users_list, &config_value);
 
             let controller = ConfigController::new(mtm);
             let built = build_window(
@@ -2516,18 +2058,12 @@ mod imp {
         struct InitialUserSetting {
             limited: bool,
             minutes: u32,
-            autostart: bool,
         }
 
         fn collect_user_settings(
             users: &[LocalUser],
             cfg: &toml::Value,
-            autostart_states: &[TrayAutostartState],
         ) -> Vec<InitialUserSetting> {
-            let autostart_by_user: std::collections::HashMap<&str, bool> = autostart_states
-                .iter()
-                .map(|s| (s.username.as_str(), s.enabled))
-                .collect();
             let users_table = cfg
                 .as_table()
                 .and_then(|t| t.get("users"))
@@ -2545,10 +2081,6 @@ mod imp {
                     InitialUserSetting {
                         limited: entry.is_some(),
                         minutes,
-                        autostart: autostart_by_user
-                            .get(u.username.as_str())
-                            .copied()
-                            .unwrap_or(false),
                     }
                 })
                 .collect()
@@ -2665,8 +2197,6 @@ mod imp {
                     user: user.clone(),
                     limit_check: built_row.limit_check,
                     minutes_field: built_row.minutes_field,
-                    autostart_check: built_row.autostart_check,
-                    autostart_initial: init.autostart,
                 });
                 y_top += ROW_HEIGHT + ROW_GAP;
             }
@@ -2698,7 +2228,6 @@ mod imp {
             container: Retained<NSView>,
             limit_check: Retained<NSButton>,
             minutes_field: Retained<NSTextField>,
-            autostart_check: Retained<NSButton>,
         }
 
         fn build_row(
@@ -2786,26 +2315,10 @@ mod imp {
             minutes_field.setPlaceholderString(Some(&NSString::from_str("min")));
             container.addSubview(&minutes_field);
 
-            // Autostart checkbox.
-            let autostart_check = make_checkbox(
-                mtm,
-                controller,
-                "Start at login",
-                sel!(toggleAutostart:),
-                index,
-                init.autostart,
-            );
-            autostart_check.setFrame(NSRect::new(
-                NSPoint::new(limit_x + 170.0, (ROW_HEIGHT - 22.0) / 2.0),
-                NSSize::new(140.0, 22.0),
-            ));
-            container.addSubview(&autostart_check);
-
             BuiltRow {
                 container,
                 limit_check,
                 minutes_field,
-                autostart_check,
             }
         }
 
@@ -2915,12 +2428,8 @@ mod imp {
         #[derive(Clone)]
         struct RowSnapshot {
             username: String,
-            uid: u32,
-            home: PathBuf,
             limited: bool,
             minutes: u32,
-            autostart_target: bool,
-            autostart_initial: bool,
         }
 
         struct Snapshot {
@@ -2943,19 +2452,6 @@ mod imp {
                 }
             };
 
-            let tray_autostart: Vec<TrayAutostartChange> = snapshot
-                .rows
-                .iter()
-                .filter(|row| row.autostart_target != row.autostart_initial)
-                .map(|row| TrayAutostartChange {
-                    username: row.username.clone(),
-                    uid: row.uid,
-                    home: row.home.clone(),
-                    enabled: row.autostart_target,
-                })
-                .collect();
-            let tray_exe = tray_exe();
-
             let outcome = super::progress::run_with_panel(
                 mtm,
                 "Saving Settings",
@@ -2964,8 +2460,6 @@ mod imp {
                 move || {
                     AdminClient::send(AdminRequest::SetConfig {
                         toml: new_config_text,
-                        tray_exe,
-                        tray_autostart,
                     })
                 },
             );
@@ -3003,7 +2497,6 @@ mod imp {
                     .iter()
                     .map(|r| {
                         let limited = r.limit_check.state() == NSControlStateValueOn;
-                        let autostart_target = r.autostart_check.state() == NSControlStateValueOn;
                         let minutes = r
                             .minutes_field
                             .stringValue()
@@ -3013,12 +2506,8 @@ mod imp {
                             .unwrap_or(0);
                         RowSnapshot {
                             username: r.user.username.clone(),
-                            uid: r.user.uid,
-                            home: r.user.home.clone(),
                             limited,
                             minutes,
-                            autostart_target,
-                            autostart_initial: r.autostart_initial,
                         }
                     })
                     .collect();
@@ -3099,15 +2588,8 @@ mod imp {
             toml::to_string_pretty(&value).map_err(|e| format!("serializing TOML: {e}"))
         }
 
-        fn tray_exe() -> PathBuf {
-            std::env::current_exe()
-                .unwrap_or_else(|_| PathBuf::from("/usr/local/bin/konstantin-tray"))
-        }
-
         #[cfg(test)]
         mod tests {
-            use std::path::Path;
-
             use super::*;
 
             #[test]
@@ -3139,12 +2621,8 @@ daily_limit_minutes = 30
                     thresholds: vec![15, 5, 1],
                     rows: vec![RowSnapshot {
                         username: "bob".to_string(),
-                        uid: 502,
-                        home: PathBuf::from("/Users/bob"),
                         limited: true,
                         minutes: 90,
-                        autostart_target: false,
-                        autostart_initial: false,
                     }],
                     config_value: cfg,
                 };
@@ -3174,32 +2652,12 @@ daily_limit_minutes = 30
                     thresholds: vec![],
                     rows: vec![RowSnapshot {
                         username: "alice".into(),
-                        uid: 501,
-                        home: PathBuf::from("/Users/alice"),
                         limited: true,
                         minutes: 0,
-                        autostart_target: false,
-                        autostart_initial: false,
                     }],
                     config_value: cfg,
                 };
                 assert!(build_new_config_toml(&snap).is_err());
-            }
-
-            #[test]
-            fn launchagent_plist_uses_user_log_paths() {
-                let body = super::super::install::build_user_launchagent_plist(
-                    Path::new("/Applications/Konstantin.app/Contents/MacOS/konstantin-tray"),
-                    Path::new("/Users/alice & bob"),
-                );
-
-                assert!(
-                    body.contains("/Users/alice &amp; bob/Library/Logs/konstantin-tray.out.log")
-                );
-                assert!(
-                    body.contains("/Users/alice &amp; bob/Library/Logs/konstantin-tray.err.log")
-                );
-                assert!(!body.contains("/tmp/konstantin-tray"));
             }
         }
     }

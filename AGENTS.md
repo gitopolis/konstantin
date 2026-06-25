@@ -52,7 +52,7 @@ and per response. `Subscribe` keeps the connection open and the daemon
 pushes `StatusUpdate` frames every tick (and on midnight rollover).
 See `docs/concepts.md` for the IPC narrative.
 
-## App bundle architecture (in progress)
+## App bundle architecture
 
 The end-user product is one `.app` bundle, distributed via Homebrew
 cask. Bundle layout:
@@ -62,10 +62,10 @@ Konstantin.app/Contents/
   Info.plist                                — LSUIElement=true (no Dock icon)
   MacOS/konstantin-tray                     — main bundle executable
   Library/LaunchDaemons/com.gitopolis.screentimed.plist
+  Library/LaunchAgents/com.gitopolis.konstantin-tray.plist
   Resources/
     screentimed                             — daemon binary run in place
                                               by SMAppService
-    konstantin-updater                      — root-owned update helper
     konstantin-status                       — diagnostic CLI
     config.example.toml
     AppIcon.icns
@@ -76,19 +76,17 @@ First-launch flow:
 1. Tray attempts `UnixStream::connect("/var/run/screentimed.sock")`.
    If it succeeds, the daemon is already running — proceed with normal
    subscribe.
-2. If the connect fails AND the legacy
-   `/Library/LaunchDaemons/com.gitopolis.screentimed.plist` is missing,
-   the tray puts up a "Set up Konstantin" alert. Packaged app runs
-   register the bundled LaunchDaemon with `SMAppService.daemon(plistName:)`.
+2. If the connect fails and the managed daemon is not enabled, the tray
+   puts up a "Set up Konstantin" alert and registers the bundled
+   LaunchDaemon with `SMAppService.daemon(plistName:)`.
    Dev-tree runs tell the developer to package `target/Konstantin.app`
    first instead of self-installing a development daemon.
-3. The per-user LaunchAgent is dropped into `~/Library/LaunchAgents/`
-   (no auth needed for that one).
+3. The tray registers its bundled per-user LaunchAgent with
+   `SMAppService.agent(plistName:)` in the current login session.
 
 Privileged menu actions go through the daemon's admin XPC control
 channel. The tray is only a signed UI client; the root daemon owns
-config writes, LaunchAgent changes, enforcement pause, reload, update
-install, and uninstall.
+config writes, enforcement pause, and reload.
 
 Daemon-running detection: try to connect to the socket. Cheap, no
 privileges, no `launchctl print` parsing. The worker thread's existing
@@ -161,9 +159,9 @@ These were Nikita's choices; revisit explicitly before changing them.
 
 7. **`.app` bundle is the canonical install path.** The bundle ships
    the daemon binary at `Contents/Resources/screentimed` and registers
-   the bundled LaunchDaemon through `SMAppService`. The tray no longer
-   creates new hand-placed `/Library/LaunchDaemons` installs. Legacy
-   files are still recognized and cleaned up by update/uninstall paths.
+   the bundled LaunchDaemon and tray LaunchAgent through `SMAppService`.
+   No application path creates or recognizes hand-placed launchd files
+   or copied executables.
 
 8. **Privilege model: signed admin XPC.** Day-to-day privileged actions
    are authorized by the root daemon over the admin XPC Mach service:
@@ -171,10 +169,10 @@ These were Nikita's choices; revisit explicitly before changing them.
    an allowed operator. No persistent privilege handle, no `SMJobBless`
    helper, and no tray-owned root shell scripts.
 
-9. **Menu actions are system-wide** (like Docker Desktop). Pause /
-   Unpause Enforcement, Reload Configuration, Configure, Update, and
-   Uninstall affect the one shared daemon/config. There is no per-user
-   mode.
+9. **Administrative menu actions are system-wide** (like Docker
+   Desktop). Pause / Unpause Enforcement, Reload Configuration, and
+   Configure affect the one shared daemon/config. There is no per-user
+   policy mode. Uninstall is owned by Homebrew.
 
 10. **Status item: `clock` SF Symbol always.** When connected the
     image is a template (menu bar tints it for light/dark); when
@@ -186,30 +184,12 @@ These were Nikita's choices; revisit explicitly before changing them.
     time; disconnected shows the gray glyph alone. Detection is the
     worker's `disconnected` flag, driven by socket-connect success.
 
-11. **Updates: GitHub Releases, sha256-verified, in-place.** The
-    `Check for Updates…` menu action calls
-    `api.github.com/repos/gitopolis/konstantin/releases/latest`,
-    looks up the asset matching the running architecture
-    (`Konstantin-<version>-<arch>.zip`), reads the SHA-256 from the
-    API's per-asset `digest` field (`"sha256:<hex>"` — the same hash
-    GitHub displays on the release page; we don't ship a separate
-    sidecar), streams the zip to a per-pid temp dir, verifies the
-    hash, then sends `AdminRequest::InstallUpdate` over admin XPC. The
-    daemon recomputes the digest, stages the bundle, validates it, and
-    launches a detached root `konstantin-updater` helper that swaps the
-    bundle in place at the resolved install location (NOT a hardcoded
-    `/Applications/...`). The helper self-rolls back if the new daemon
-    doesn't open `/var/run/screentimed.sock` within 20 seconds. Distinct
-    exit codes (10/11 → no state change, 20–23 → rollback already ran,
-    50 → catastrophic) drive matching alert messages. After a successful
-    install the running tray spawns the new tray binary out of the
-    freshly installed bundle and `terminate:`s itself.
-    Architecture mapping (`aarch64`→`arm64`, `x86_64`→`x86_64`) is
-    kept in `update::current_arch_label` — a single point of agreement
-    with release.yml's matrix `arch:` field. Only canonical URLs
-    matching the expected `releases/download/<tag>/<filename>` shape
-    are trusted. Dev-tree runs (`bundle::Source::DevTree`) refuse to
-    update — the operator runs `cargo build` instead.
+11. **Homebrew is the only package/update authority.** The app does
+    not download releases, replace its own bundle, or expose a
+    privileged update/rollback request. Homebrew owns checksums,
+    application replacement, version selection, and recovery. The tray
+    only reconciles ServiceManagement registration after the installed
+    bundle changes.
 
 ## What's already built (phases 1–7 + A1–A9)
 
@@ -254,7 +234,7 @@ These were Nikita's choices; revisit explicitly before changing them.
   `alerts::message` siblings.
 * **A4** — `actions::Controller` (NSObject subclass via
   `define_class!`) routes menu selectors such as pause/unpause,
-  reload, configure, open log, uninstall, and update.
+  reload, configure, open log, and uninstall guidance.
 * **A5** — state-driven UI: muted `clock` SF Symbol when
   `disconnected` (gray baked into the image via an
   `NSImageSymbolConfiguration` with `secondaryLabelColor`), the same
@@ -263,43 +243,25 @@ These were Nikita's choices; revisit explicitly before changing them.
   in `disconnected: true` so initial UI is honest.
 * **A6** — `bundle::Paths::resolve()` handles both real `.app` bundles
   and dev-tree (`target/<profile>/` + `packaging/`). Source labelled
-  in startup log. User LaunchAgent rewrite is bundle-only — running
-  `target/release/konstantin-tray` directly no longer poisons
-  `~/Library/LaunchAgents/` with a dev path.
-* **A7** — `Uninstall…` menu item: confirm → privileged teardown
-  (`launchctl bootout` + `rm` of system files) → user LaunchAgent
-  cleanup → `NSApplication::terminate`. The cask formula in the
-  separate tap repo (`github.com/gitopolis/homebrew-tap`,
-  `Casks/konstantin.rb`) carries matching `uninstall` + `zap` stanzas
-  for non-interactive `brew uninstall --zap`; the release workflow
-  auto-bumps version + sha256 there on each tag.
+  in startup logs and used to reject managed registration from a dev
+  tree.
+* **A7** — Homebrew owns uninstall. Its cask invokes the tray's hidden
+  deferred lifecycle mode while the bundle exists. The child retains
+  SMAppService handles, distinguishes upgrade/reinstall from removal by
+  observing the app bundle inode, and unregisters only on real removal.
+  `--zap` additionally deletes config, counters, logs, and the socket.
 * **A8** — security/UX hardening on top of A1–A7:
   * `/etc/screentimed/config.toml` is now mode 0600 root-owned at
     every write site. Other users on the machine can't see whose limits
     are configured.
-  * `Configure…` uses admin XPC: the daemon reads the root-owned config
-    and stats per-user LaunchAgent plists directly, so hardened homes do
-    not need an operator-owned `UiCache`.
-  * `Uninstall…` and `packaging/uninstall.sh` now `rm -rf
-    /var/db/screentimed/` (counter state). `/etc/screentimed/`
-    (config) is still preserved on uninstall; `--zap` still removes
-    both. Cask `uninstall` stanza updated to match.
+  * `Configure…` uses admin XPC for root-owned config reads/writes.
+    Tray-agent registration is user-scoped ServiceManagement state and
+    is not administered across accounts.
   * Post-password window-show uses
     `activateIgnoringOtherApps(true)` + `orderFrontRegardless()` so
     the Configure window actually steals focus from the previously
     frontmost app. `NSApplication::activate()` is cooperative on
     macOS 14+ and isn't sufficient for accessory apps.
-* **A9** — in-app updater (`mod update` + `Check for Updates…` menu
-  item). Driven by `env!("CARGO_PKG_VERSION")` (CI runs `cargo
-  set-version --workspace "$VERSION"` before each release build, so
-  the value baked into a tagged binary is always correct). The tray does
-  unprivileged release lookup/download/digest verification, then asks the
-  daemon to install through admin XPC and the detached root updater
-  helper. New deps: `ureq` (rustls-backed, blocking HTTP), `sha2`
-  (digest verification), `semver` (version comparison). Asset SHA-256 is
-  read straight from the GitHub API's per-asset `digest` field — no
-  sidecar files in the release. See decision #11 for the full design.
-
 Tests, unsafe-block count: both will drift. The CI signal is
 `cargo test --workspace` clean. Don't pin counts here — they
 incentivize the wrong thing.
@@ -364,15 +326,12 @@ Smoke-test without installing (no root). Use an ad-hoc config (e.g.
 at `/tmp/screentimed-smoketest.toml`, gitignored) — see
 `docs/concepts.md` for the full recipe.
 
-Uninstall:
+Uninstall the packaged application:
 
 ```sh
-sudo packaging/uninstall.sh                # daemon + binaries + tray for $SUDO_USER
-./packaging/uninstall-tray.sh              # tray-only, no root
+brew uninstall --cask konstantin
+brew uninstall --cask --zap konstantin     # also remove all product data
 ```
-
-`uninstall.sh` removes binaries / plists / socket / counter state but
-preserves `/etc/screentimed/` so configs survive reinstalls.
 
 ## Layout
 
@@ -393,10 +352,9 @@ konstantin/
 │                   src/bin/{status,tray}.rs            # konstantin-status + tray
 └── packaging/
     ├── com.gitopolis.screentimed.plist          # LaunchDaemon, runs as root
+    ├── com.gitopolis.konstantin-tray.plist      # per-user managed agent
     ├── config.example.toml
     ├── build-app.sh                             # app bundle builder
-    ├── uninstall.sh                             # system-side, requires sudo
-    ├── uninstall-tray.sh                        # tray-only, no sudo
     └── create-test-users.sh, delete-test-users.sh
 ```
 
@@ -407,8 +365,8 @@ konstantin/
   attribution, and admin XPC peer requirements. Local ad-hoc builds are
   useful for development but are not the production install path.
 * **Modern install path.** Real distribution uses
-  `SMAppService.daemon(plistName:)` with the bundled LaunchDaemon plist.
-  Hand-placed `/Library/LaunchDaemons/` files are legacy artifacts only.
+  `SMAppService.daemon(plistName:)` and `SMAppService.agent(plistName:)`
+  with bundled plists. The source tree has no hand-placed launchd path.
 * **Fast user switching.** `SCDynamicStoreCopyConsoleUser` reports
   only the foreground user, so backgrounded FUS users have their
   counters paused while another account is at the keyboard. State

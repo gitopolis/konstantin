@@ -8,21 +8,20 @@ on daily logged-in time and have macOS log them out when they hit it.
 
 It runs as a system service, so limits apply across reboots, fast
 user switching, and re-logins. There's no parental-controls profile,
-no MDM, and no online account. Everything lives on disk in two
-directories and can be removed with one menu click.
+no MDM, and no online account. Homebrew owns installation, updates,
+and removal.
 
 ## Screenshots
 
 
 The menu-bar app shows the current remaining time, daemon controls,
-configuration, update checks, logs, and uninstall.
+configuration, logs, and uninstall.
 
 ![Konstantin menu showing remaining time and daemon controls](assets/tray-menu.png)
 
 
 The configuration window lets an administrator choose which local
-accounts are limited, set daily budgets, and manage login startup for
-each user.
+accounts are limited and set daily budgets.
 ![Konstantin configuration window with per-user daily limits](assets/config-ui.png)
 
 ## What it does
@@ -52,17 +51,11 @@ each user.
 
 ## Install
 
-### Homebrew (preferred)
+### Homebrew
 
 ```sh
 brew install --cask gitopolis/tap/konstantin
 ```
-
-### Manual
-
-Download the latest `Konstantin-<version>-<arch>.zip` from the
-[Releases](https://github.com/gitopolis/konstantin/releases) page,
-unzip it, drag `Konstantin.app` into `/Applications`, and double-click.
 
 The release bundle is Developer ID signed and notarized.
 
@@ -108,24 +101,18 @@ Click the menu-bar icon to see:
   channel. For each local user account you can:
   * Toggle a daily limit on/off.
   * Set the limit in minutes.
-  * Toggle whether the menu-bar app starts at that user's login.
-  
   There's also a single field for the warning thresholds (e.g.
   `10, 2, 1`) shared across all users. Save writes through the daemon
   and reloads configuration.
 * `Open Log` — opens `/var/log/screentimed.log` for spot-checking.
-* `Check for Updates…` — fetches the latest release from GitHub. If a
-  newer version exists you'll be offered an `Update to X.Y.Z` button;
-  the in-app updater verifies the download against the SHA-256 that
-  GitHub publishes alongside each release asset, replaces the bundle,
-  restarts the daemon, and relaunches the menu-bar app. If anything
-  fails after the swap the previous version is restored automatically
-  with no manual rollback. If you click
-  `Later`, the menu item morphs to `Update to X.Y.Z` so you can
-  install whenever you're ready.
-* `Uninstall…` — removes the app, the daemon, and the per-user
-  counter state. Preserves your config so a reinstall picks up
-  the same settings.
+* `Uninstall…` — shows the Homebrew command that removes the app and
+  managed services. Use `--zap` for a complete data wipe.
+
+Homebrew owns application updates. Run:
+
+```sh
+brew upgrade --cask gitopolis/tap/konstantin
+```
 
 ## Counters and resets
 
@@ -204,15 +191,11 @@ discover whose limits are configured).
 | `/Applications/Konstantin.app` | The app bundle. |
 | `/Applications/Konstantin.app/Contents/Resources/screentimed` | Privileged background service for ServiceManagement installs. |
 | `/Applications/Konstantin.app/Contents/Library/LaunchDaemons/com.gitopolis.screentimed.plist` | Bundled daemon registration plist. |
-| `~/Library/LaunchAgents/com.gitopolis.konstantin-tray.plist` | Tells `launchd` to run the menu-bar app at your login. |
+| `/Applications/Konstantin.app/Contents/Library/LaunchAgents/com.gitopolis.konstantin-tray.plist` | Bundled per-user tray registration plist. |
 | `/etc/screentimed/config.toml` | Your settings. Mode 0600 root-owned. |
 | `/var/db/screentimed/state.json` | Per-user counters. |
 | `/var/log/screentimed.log` | Daemon log. |
 | `/etc/screentimed/disable` | Kill-switch file. Touch to disable enforcement live. |
-
-Older installs may still have `/usr/local/libexec/screentimed` and
-`/Library/LaunchDaemons/com.gitopolis.screentimed.plist`; uninstall and
-update paths still clean those up for compatibility.
 
 ## For developers
 
