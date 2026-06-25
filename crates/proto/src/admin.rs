@@ -17,55 +17,19 @@ pub const KEY_OK: &str = "ok";
 pub const KEY_PAYLOAD_JSON: &str = "payload_json";
 pub const KEY_ERROR: &str = "error";
 
-pub const PROTOCOL_VERSION: u64 = 1;
+pub const PROTOCOL_VERSION: u64 = 2;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum AdminRequest {
-    GetConfig {
-        autostart_probes: Vec<TrayAutostartProbe>,
-    },
-    ValidateConfig {
-        toml: String,
-    },
-    SetConfig {
-        toml: String,
-        tray_exe: PathBuf,
-        tray_autostart: Vec<TrayAutostartChange>,
-    },
+    GetConfig,
+    ValidateConfig { toml: String },
+    SetConfig { toml: String },
     ReloadDaemon,
+    GetDaemonInfo,
     GetEnforcementState,
-    SetEnforcementPaused {
-        paused: bool,
-    },
-    InstallUpdate {
-        zip_path: PathBuf,
-        expected_version: String,
-        expected_sha256: String,
-    },
-    Uninstall {
-        preserve_config: bool,
-    },
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct TrayAutostartProbe {
-    pub username: String,
-    pub home: PathBuf,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct TrayAutostartChange {
-    pub username: String,
-    pub uid: u32,
-    pub home: PathBuf,
-    pub enabled: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct TrayAutostartState {
-    pub username: String,
-    pub enabled: bool,
+    SetEnforcementPaused { paused: bool },
+    PrepareUninstall { preserve_config: bool },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -75,16 +39,14 @@ pub enum AdminResponse {
         toml: String,
         enforcement_paused: bool,
         kill_switch_path: PathBuf,
-        tray_autostart: Vec<TrayAutostartState>,
     },
     ValidationOk,
+    DaemonInfo {
+        version: String,
+    },
     EnforcementState {
         paused: bool,
         kill_switch_path: PathBuf,
-    },
-    UpdateInstallStarted {
-        result_path: PathBuf,
-        bundle_root: PathBuf,
     },
     Ok,
     Unauthorized {
@@ -93,13 +55,6 @@ pub enum AdminResponse {
     Error {
         message: String,
     },
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(tag = "status", rename_all = "snake_case")]
-pub enum UpdateInstallResult {
-    Succeeded,
-    Failed { code: i32, message: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -196,7 +151,7 @@ mod tests {
 
     #[test]
     fn rejects_unknown_protocol_version() {
-        let json = r#"{"version":2,"request_id":"abc","request":{"kind":"get_config","autostart_probes":[]}}"#;
+        let json = r#"{"version":3,"request_id":"abc","request":{"kind":"get_config"}}"#;
 
         let err = RequestEnvelope::from_json(json).unwrap_err();
 

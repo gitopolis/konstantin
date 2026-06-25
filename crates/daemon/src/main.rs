@@ -23,8 +23,6 @@ mod ipc;
 mod sessions;
 mod state;
 mod time;
-mod uninstall;
-mod update;
 
 use anyhow::{Context, Result};
 use std::path::PathBuf;
@@ -57,8 +55,6 @@ async fn main() -> Result<()> {
         tick_s = cfg.tick_seconds,
         "config loaded"
     );
-    record_bundle_marker();
-
     let state = Arc::new(Mutex::new(state::State::load(&cfg.state_path)));
 
     // Roll over immediately if the on-disk state belongs to a previous day.
@@ -130,33 +126,6 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-fn record_bundle_marker() {
-    if let Some(root) = infer_bundle_root_from_exe() {
-        if let Some(parent) = std::path::Path::new(uninstall::MARKER_PATH).parent() {
-            if let Err(e) = std::fs::create_dir_all(parent) {
-                warn!(error = %e, "could not create bundle marker directory");
-                return;
-            }
-        }
-        if let Err(e) = std::fs::write(uninstall::MARKER_PATH, format!("{}\n", root.display())) {
-            warn!(error = %e, path = uninstall::MARKER_PATH, "could not write bundle marker");
-        }
-    }
-}
-
-fn infer_bundle_root_from_exe() -> Option<PathBuf> {
-    let exe = std::env::current_exe().ok()?;
-    let resources = exe.parent()?;
-    if resources.file_name()? != "Resources" {
-        return None;
-    }
-    let contents = resources.parent()?;
-    if contents.file_name()? != "Contents" {
-        return None;
-    }
-    contents.parent().map(PathBuf::from)
-}
-
 /// Sleep until the next local midnight, fire the day rollover, persist,
 /// recompute. Recomputing each iteration (rather than adding 86400 s) is
 /// what keeps us correct across DST.
@@ -213,9 +182,6 @@ async fn run_ticker(
     iv.tick().await;
 
     let mut enforcer = enforcement::Enforcer::new();
-    let mut bundle_watcher =
-        uninstall::BundleWatcher::from_marker(std::path::Path::new(uninstall::MARKER_PATH));
-
     loop {
         iv.tick().await;
         let active = sessions::console_users();
@@ -242,13 +208,6 @@ async fn run_ticker(
         // last counter value is durable, and any live subscriber sees the
         // pre-kick state before the connection drops.
         enforcer.step(&cfg, &active, &snapshot.counters).await;
-
-        // Bundle-existence watch: if the operator drag-to-Trashed
-        // `Konstantin.app`, tear ourselves down so we stop enforcing
-        // limits with no UI. Does not return when it trips.
-        if bundle_watcher.tick() {
-            uninstall::self_uninstall();
-        }
     }
 }
 

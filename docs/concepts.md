@@ -208,17 +208,16 @@ Each subscriber's `compute_status` reads from the shared
 | `/etc/screentimed/disable`            | root | kill-switch (touch to disable enforcement) |
 | `/var/db/screentimed/state.json`      | root, 0600 (parent dir 0700) | per-user counters, persists across restarts |
 | `/var/run/screentimed.sock`           | root, 0666 | IPC socket; world-connectable, peer-creds-authenticated |
-| `/Library/LaunchDaemons/com.gitopolis.screentimed.plist` | root | LaunchDaemon plist |
-| `~/Library/LaunchAgents/com.gitopolis.konstantin-tray.plist` | user | per-user LaunchAgent plist |
+| `Konstantin.app/Contents/Library/LaunchDaemons/com.gitopolis.screentimed.plist` | app bundle | SMAppService daemon definition |
+| `Konstantin.app/Contents/Library/LaunchAgents/com.gitopolis.konstantin-tray.plist` | app bundle | SMAppService per-user tray definition |
 
-All five paths under `/etc` and `/var` are configurable; see
+The config, state, socket, and kill-switch paths are configurable; see
 [config.md](config.md).
 
-Uninstall (in-app `Uninstall…`, `packaging/uninstall.sh`, or
-`brew uninstall konstantin`) wipes `/var/db/screentimed/` along with
-the binaries and plists, but preserves `/etc/screentimed/` so a
-reinstall picks up your settings. Use `brew uninstall --zap konstantin`
-(or delete `/etc/screentimed/` by hand) for a full wipe.
+`brew uninstall --cask konstantin` unregisters both managed services,
+removes the app, and wipes `/var/db/screentimed/` while preserving
+`/etc/screentimed/` for reinstall. Use
+`brew uninstall --cask --zap konstantin` for a full data wipe.
 
 ## Threshold notifications
 
